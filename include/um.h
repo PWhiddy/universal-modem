@@ -25,7 +25,11 @@ typedef enum {
     UM_ERR_TRUNCATED = -5,
     UM_ERR_HEADER = -6,
     UM_ERR_CRC = -7,
-    UM_ERR_CAPACITY = -8
+    UM_ERR_CAPACITY = -8,
+    UM_ERR_TIMEOUT = -9,
+    UM_ERR_AUDIO = -10,
+    UM_ERR_UNSUPPORTED = -11,
+    UM_ERR_INTERRUPTED = -12
 } um_status;
 
 typedef enum {
@@ -150,6 +154,22 @@ typedef struct {
     float simulated_seconds;
 } um_distortion_ladder_result;
 
+typedef enum {
+    UM_LIVE_GATEWAY = 1,
+    UM_LIVE_CLIENT = 2
+} um_live_role;
+
+typedef struct {
+    um_live_role role;
+    const char *input_device;
+    const char *output_device;
+    size_t test_bytes;
+    size_t chunk_bytes;
+    unsigned retry_limit;
+    float discovery_interval_seconds;
+    int calibrate_high_quality;
+} um_live_audio_options;
+
 uint32_t um_crc32(const uint8_t *data, size_t length);
 uint16_t um_crc16(const uint8_t *data, size_t length);
 
@@ -192,6 +212,9 @@ int um_distortion_profile_get(size_t level, um_distortion_profile *profile);
 int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                            um_calibration_result *result,
                            um_log_callback logger, void *logger_context);
+size_t um_live_calibration_candidate_count(int high_quality);
+int um_live_calibration_candidate_get(int high_quality, size_t index,
+                                      um_modem_config *config);
 
 um_session_simulation_config um_session_simulation_default_config(void);
 int um_simulate_session(const um_session_simulation_config *config,
@@ -204,6 +227,11 @@ int um_run_calibration_distortion_ladder(
 int um_run_session_distortion_ladder(
     int high_quality, um_distortion_ladder_result *result,
     um_log_callback logger, void *logger_context);
+
+int um_audio_list_devices(um_log_callback logger, void *logger_context);
+um_live_audio_options um_live_audio_default_options(um_live_role role);
+int um_run_live_audio(const um_live_audio_options *options,
+                      um_log_callback logger, void *logger_context);
 
 const char *um_status_string(int status);
 

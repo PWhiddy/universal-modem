@@ -1,4 +1,5 @@
 #include "um.h"
+#include "../src/live_wire.h"
 #include "../src/um_internal.h"
 
 #include <math.h>
@@ -472,6 +473,136 @@ static void test_async_session_distortion_ladder(void)
     CHECK(last_passing.impairment_mask == UM_IMPAIR_ALL);
 }
 
+static void test_live_wire_protocol(void)
+{
+    uint8_t body[UM_LIVE_MAX_BODY];
+    uint8_t wire[UM_LIVE_MAX_WIRE];
+    uint8_t altered[UM_LIVE_MAX_WIRE];
+    size_t wire_length = 0u;
+    size_t i;
+    um_live_wire_message message;
+    ++tests_run;
+    for (i = 0u; i < sizeof(body); ++i) {
+        body[i] = (uint8_t)test_random();
+    }
+    CHECK(um_live_wire_encode(UM_WIRE_DATA, UINT32_C(0x1234abcd),
+                              UINT16_C(0xfedc), body, sizeof(body), wire,
+                              sizeof(wire), &wire_length) == UM_OK);
+    CHECK(wire_length == sizeof(wire));
+    CHECK(um_live_wire_decode(wire, wire_length, &message) == UM_OK);
+    CHECK(message.type == UM_WIRE_DATA);
+    CHECK(message.session_id == UINT32_C(0x1234abcd));
+    CHECK(message.sequence == UINT16_C(0xfedc));
+    CHECK(message.body_length == sizeof(body));
+    CHECK(memcmp(message.body, body, sizeof(body)) == 0);
+    {
+        um_modem_config config = um_modem_default_config();
+        float *samples = NULL;
+        size_t sample_count = 0u;
+        uint8_t decoded_wire[UM_LIVE_MAX_WIRE];
+        size_t decoded_length = 0u;
+        uint16_t decoded_sequence = 0u;
+        CHECK(um_modulate_frame(&config, wire, wire_length,
+                                UINT16_C(0xfedc), &samples,
+                                &sample_count) == UM_OK);
+        CHECK(um_demodulate_frame(&config, samples, sample_count,
+                                  decoded_wire, sizeof(decoded_wire),
+                                  &decoded_length, &decoded_sequence,
+                                  NULL) == UM_OK);
+        CHECK(decoded_sequence == UINT16_C(0xfedc));
+        CHECK(um_live_wire_decode(decoded_wire, decoded_length, &message) ==
+              UM_OK);
+        CHECK(message.body_length == sizeof(body));
+        CHECK(memcmp(message.body, body, sizeof(body)) == 0);
+        free(samples);
+    }
+
+    CHECK(um_live_wire_encode(UM_WIRE_DISCOVER, 1u, 2u, NULL, 0u, wire,
+                              UM_LIVE_WIRE_HEADER_SIZE, &wire_length) ==
+          UM_OK);
+    CHECK(wire_length == UM_LIVE_WIRE_HEADER_SIZE);
+    CHECK(um_live_wire_decode(wire, wire_length, &message) == UM_OK);
+    CHECK(message.body_length == 0u);
+    CHECK(um_live_wire_encode(UM_WIRE_DATA, 0u, 0u, body, sizeof(body), wire,
+                              sizeof(wire) - 1u, &wire_length) ==
+          UM_ERR_CAPACITY);
+    CHECK(um_live_wire_encode((um_live_wire_type)0, 0u, 0u, NULL, 0u, wire,
+                              sizeof(wire), &wire_length) == UM_ERR_ARGUMENT);
+
+    CHECK(um_live_wire_encode(UM_WIRE_ACK, 1u, 2u, NULL, 0u, wire,
+                              sizeof(wire), &wire_length) == UM_OK);
+    memcpy(altered, wire, wire_length);
+    altered[0] ^= 1u;
+    CHECK(um_live_wire_decode(altered, wire_length, &message) ==
+          UM_ERR_HEADER);
+    memcpy(altered, wire, wire_length);
+    altered[11] = 1u;
+    CHECK(um_live_wire_decode(altered, wire_length, &message) ==
+          UM_ERR_HEADER);
+}
+
+static void test_live_calibration_candidates(void)
+{
+    const size_t guarded_samples = 960u + 2400u;
+    const size_t slot_samples = UM_SAMPLE_RATE * 220u / 1000u;
+    const int quality_modes[] = {0, 1};
+    size_t mode;
+    ++tests_run;
+    for (mode = 0u; mode < sizeof(quality_modes) / sizeof(quality_modes[0]);
+         ++mode) {
+        size_t count = um_live_calibration_candidate_count(quality_modes[mode]);
+        unsigned qam_mask = 0u;
+        unsigned fec_mask = 0u;
+        unsigned prefix_mask = 0u;
+        unsigned window_mask = 0u;
+        size_t maximum_samples = 0u;
+        size_t candidate;
+        CHECK(count == (quality_modes[mode] == 0 ? 27u : 810u));
+        for (candidate = 0u; candidate < count; ++candidate) {
+            um_modem_config config;
+            uint8_t probe_wire[UM_LIVE_WIRE_HEADER_SIZE + 16u];
+            float *samples = NULL;
+            size_t sample_count = 0u;
+            CHECK(um_live_calibration_candidate_get(
+                      quality_modes[mode], candidate, &config) == UM_OK);
+            CHECK(um_modem_config_validate(&config) == UM_OK);
+            qam_mask |= 1u << (config.qam_bits / 2u);
+            fec_mask |= 1u << (unsigned)config.fec_rate;
+            prefix_mask |= config.cyclic_prefix == 16u ? 1u :
+                           config.cyclic_prefix == 32u ? 2u :
+                           config.cyclic_prefix == 64u ? 4u : 8u;
+            window_mask |= config.window_samples == 0u ? 1u :
+                           config.window_samples == 4u ? 2u :
+                           config.window_samples == 8u ? 4u : 8u;
+            memset(probe_wire, (int)(candidate & 0xffu), sizeof(probe_wire));
+            CHECK(um_modulate_frame(&config, probe_wire, sizeof(probe_wire),
+                                    (uint16_t)candidate, &samples,
+                                    &sample_count) == UM_OK);
+            CHECK(sample_count + guarded_samples < slot_samples);
+            if (sample_count > maximum_samples) {
+                maximum_samples = sample_count;
+            }
+            free(samples);
+        }
+        CHECK(qam_mask == 14u);
+        CHECK(fec_mask == 7u);
+        CHECK((prefix_mask & 7u) == 7u);
+        CHECK((window_mask & 4u) != 0u);
+        if (quality_modes[mode] != 0) {
+            CHECK(window_mask == 15u);
+        }
+        printf("live calibration %s candidates=%zu max-frame=%.1f ms\n",
+               quality_modes[mode] == 0 ? "default" : "high", count,
+               1000.0 * (double)maximum_samples / (double)UM_SAMPLE_RATE);
+        {
+            um_modem_config config;
+            CHECK(um_live_calibration_candidate_get(quality_modes[mode], count,
+                                                    &config) ==
+                  UM_ERR_ARGUMENT);
+        }
+    }
+}
+
 int main(void)
 {
     test_crc();
@@ -487,6 +618,8 @@ int main(void)
     test_boundary_window();
     test_rejects_noise();
     test_async_session_distortion_ladder();
+    test_live_wire_protocol();
+    test_live_calibration_candidates();
 
     if (failures != 0) {
         fprintf(stderr, "%d of %d tests failed\n", failures, tests_run);

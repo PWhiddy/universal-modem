@@ -12,14 +12,23 @@ static void usage(FILE *stream)
             "[--fec 1/2|2/3|3/4] [--noise LEVEL]\n"
             "  universal-modem --calibrate [--calib-high]\n"
             "  universal-modem --session-sim [--calib-high]\n"
-            "  universal-modem --audio --gateway\n"
-            "  universal-modem --audio --client\n");
+            "  universal-modem --list-audio\n"
+            "  universal-modem --audio --gateway [audio options]\n"
+            "  universal-modem --audio --client [audio options]\n"
+            "\nAudio options:\n"
+            "  --input-device ID    Capture device ID shown at startup\n"
+            "  --output-device ID   Playback device ID shown at startup\n"
+            "  --test-bytes N       Bytes sent in each direction (default 1024)\n"
+            "  --chunk-bytes N      Data bytes per acknowledged frame (default 128)\n"
+            "  --retries N          Attempts per test frame (default 4)\n"
+            "  --calib-high         Use the extended real-audio calibration\n");
 }
 
 static void print_log(void *context, const char *message)
 {
     FILE *stream = (FILE *)context;
     fprintf(stream, "%s\n", message);
+    fflush(stream);
 }
 
 static int run_calibration(int high_quality)
@@ -163,7 +172,13 @@ int main(int argc, char **argv)
     int high_quality = 0;
     int audio = 0;
     int endpoint = 0;
+    int list_audio = 0;
     int noise_was_set = 0;
+    const char *input_device = "default";
+    const char *output_device = "default";
+    size_t test_bytes = 1024u;
+    size_t chunk_bytes = 128u;
+    unsigned retries = 4u;
     int i;
 
     for (i = 1; i < argc; ++i) {
@@ -177,10 +192,51 @@ int main(int argc, char **argv)
             high_quality = 1;
         } else if (strcmp(argv[i], "--audio") == 0) {
             audio = 1;
+        } else if (strcmp(argv[i], "--list-audio") == 0) {
+            list_audio = 1;
         } else if (strcmp(argv[i], "--gateway") == 0) {
+            if (endpoint != 0) {
+                fprintf(stderr, "choose exactly one of --gateway or --client\n");
+                return 2;
+            }
             endpoint = 1;
         } else if (strcmp(argv[i], "--client") == 0) {
+            if (endpoint != 0) {
+                fprintf(stderr, "choose exactly one of --gateway or --client\n");
+                return 2;
+            }
             endpoint = 2;
+        } else if (strcmp(argv[i], "--input-device") == 0 && i + 1 < argc) {
+            input_device = argv[++i];
+        } else if (strcmp(argv[i], "--output-device") == 0 && i + 1 < argc) {
+            output_device = argv[++i];
+        } else if (strcmp(argv[i], "--test-bytes") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            unsigned long value = strtoul(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value == 0ul ||
+                value > UINT32_MAX) {
+                fprintf(stderr, "invalid test byte count\n");
+                return 2;
+            }
+            test_bytes = (size_t)value;
+        } else if (strcmp(argv[i], "--chunk-bytes") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            unsigned long value = strtoul(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value == 0ul ||
+                value > 512ul) {
+                fprintf(stderr, "chunk bytes must be between 1 and 512\n");
+                return 2;
+            }
+            chunk_bytes = (size_t)value;
+        } else if (strcmp(argv[i], "--retries") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            unsigned long value = strtoul(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value == 0ul ||
+                value > 100ul) {
+                fprintf(stderr, "retries must be between 1 and 100\n");
+                return 2;
+            }
+            retries = (unsigned)value;
         } else if (strcmp(argv[i], "--qam") == 0 && i + 1 < argc) {
             if (!parse_qam(argv[++i], &config.qam_bits)) {
                 fprintf(stderr, "invalid QAM order\n");
@@ -210,6 +266,11 @@ int main(int argc, char **argv)
         }
     }
 
+    if (list_audio != 0) {
+        int status = um_audio_list_devices(print_log, stdout);
+        return status == UM_OK ? 0 : 1;
+    }
+
     if (simulate != 0 && audio == 0 && endpoint == 0) {
         return run_simulation(config, noise);
     }
@@ -232,11 +293,31 @@ int main(int argc, char **argv)
         }
         return run_session_simulation(high_quality);
     }
-    if (audio != 0 && endpoint != 0 && simulate == 0) {
-        fprintf(stderr,
-                "The audio device and TUN transport are not connected yet; "
-                "the isolated modem core is available through --simulate.\n");
-        return 3;
+    if (audio != 0 && endpoint != 0 && simulate == 0 && calibrate == 0 &&
+        session_simulation == 0) {
+        um_live_audio_options options = um_live_audio_default_options(
+            endpoint == 1 ? UM_LIVE_GATEWAY : UM_LIVE_CLIENT);
+        int status;
+        if (noise_was_set != 0) {
+            fprintf(stderr, "--noise only applies to --simulate\n");
+            return 2;
+        }
+        options.input_device = input_device;
+        options.output_device = output_device;
+        options.test_bytes = test_bytes;
+        options.chunk_bytes = chunk_bytes;
+        options.retry_limit = retries;
+        options.calibrate_high_quality = high_quality;
+        status = um_run_live_audio(&options, print_log, stdout);
+        if (status == UM_ERR_INTERRUPTED) {
+            return 130;
+        }
+        if (status != UM_OK) {
+            fprintf(stderr, "real-audio session failed: %s\n",
+                    um_status_string(status));
+            return 1;
+        }
+        return 0;
     }
     usage(stderr);
     return 2;

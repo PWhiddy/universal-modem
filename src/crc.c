@@ -88,6 +88,14 @@ const char *um_status_string(int status)
         return "payload checksum mismatch";
     case UM_ERR_CAPACITY:
         return "output capacity too small";
+    case UM_ERR_TIMEOUT:
+        return "operation timed out";
+    case UM_ERR_AUDIO:
+        return "audio device error";
+    case UM_ERR_UNSUPPORTED:
+        return "unsupported on this system";
+    case UM_ERR_INTERRUPTED:
+        return "interrupted";
     default:
         return "unknown error";
     }
