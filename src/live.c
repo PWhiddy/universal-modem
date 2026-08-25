@@ -17,7 +17,7 @@
 #define LIVE_READ_CHUNK 960u
 #define LIVE_TX_PRE_SAMPLES 960u
 #define LIVE_TX_POST_SAMPLES 2400u
-#define LIVE_TURNAROUND_MS 80u
+#define LIVE_TURNAROUND_MS 120u
 #define LIVE_CALIBRATION_SETTLE_MS 160u
 #define LIVE_RECEIVER_ARM_MS 120u
 #define LIVE_VERIFY_TRIALS_DEFAULT 3u
@@ -2523,6 +2523,10 @@ static int client_session(live_context *context)
     if (status != UM_OK) {
         return status;
     }
+    /* From this point onward both peers have a session.  Any failure can
+     * leave their cached/calibrated mode state asymmetric, even when it
+     * occurs during the cache exchange before payload transfer begins. */
+    context->link_stage_started = 1;
     status = exchange_calibration_caches(context);
     if (status != UM_OK) {
         return status;
@@ -2657,6 +2661,7 @@ static int gateway_session(live_context *context)
     if (status != UM_OK) {
         return status;
     }
+    context->link_stage_started = 1;
     status = exchange_calibration_caches(context);
     if (status != UM_OK) {
         return status;
@@ -2849,13 +2854,15 @@ int um_run_live_audio(const um_live_audio_options *options,
     calibration_probe_budget = um_calibration_search_budget(
         options->calibrate_high_quality);
     live_log(&context,
-             "Live protocol=%u config-format=%u role=%s mode=%s "
-             "test-bytes=%zu chunk-bytes=%zu retries=%u",
+             "Live protocol=%u config-format=%u proxy-format=%u "
+             "handshake-bytes=%u role=%s mode=%s test-bytes=%zu "
+             "chunk-bytes=%zu retries=%u control-turnaround=%ums",
              UM_LIVE_PROTOCOL_VERSION, UM_LIVE_CONFIG_FORMAT_VERSION,
+             UM_LIVE_PROXY_FORMAT_VERSION, UM_LIVE_HANDSHAKE_BYTES,
              options->role == UM_LIVE_CLIENT ? "client" : "gateway",
              options->link_test != 0 ? "link-test" : "network-proxy",
              options->test_bytes, options->chunk_bytes,
-             options->retry_limit);
+             options->retry_limit, LIVE_TURNAROUND_MS);
     live_log(&context,
              "Bootstrap qam=%u fec=%s cp=%u window=%u repeats=%u training=%u "
              "sync=%.1fms band=%.0f-%.0fHz",

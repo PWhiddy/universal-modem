@@ -23,7 +23,7 @@ enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
 #define SIM_PROXY_PACKETS 5u
 
 /* CoreAudio capture callbacks can resume after AudioQueueStart returns. */
-#define SIM_CAPTURE_START_MS 60u
+#define SIM_CAPTURE_START_MS 110u
 
 typedef struct {
     pthread_mutex_t mutex;
