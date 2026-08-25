@@ -2,6 +2,7 @@
 #include "../src/live_wire.h"
 #include "../src/um_internal.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -547,8 +548,17 @@ static void test_room_reverb_and_clock_drift(void)
 static void test_default_calibration(void)
 {
     um_channel_config channel = um_channel_default_config();
+    um_modem_config balanced = um_modem_default_config();
     um_calibration_result result;
     ++tests_run;
+    CHECK(balanced.first_bin == 64u);
+    CHECK(balanced.last_bin == 362u);
+    CHECK(balanced.qam_bits == 2u);
+    CHECK(balanced.fec_rate == UM_FEC_RATE_2_3);
+    CHECK(balanced.cyclic_prefix == 1024u);
+    CHECK(balanced.sync_samples == 1536u);
+    CHECK(balanced.sync_gap == 2560u);
+    CHECK(balanced.symbol_repetitions == 1u);
     channel.leading_silence = 121u;
     channel.gain = 0.26f;
     channel.noise_stddev = 0.0015f;
@@ -998,7 +1008,8 @@ static void test_adaptive_calibration_search(void)
             um_modem_config config;
             um_calibration_step step;
             size_t candidate_id;
-            uint8_t probe_wire[UM_LIVE_WIRE_HEADER_SIZE + 16u];
+            uint8_t probe_wire[UM_LIVE_WIRE_HEADER_SIZE +
+                               UM_CALIBRATION_PROBE_BYTES];
             float *samples = NULL;
             size_t sample_count = 0u;
             next_status = um_calibration_search_next(
@@ -1023,8 +1034,14 @@ static void test_adaptive_calibration_search(void)
                 size_t parent = search.nodes[candidate_id].parent;
                 CHECK(parent < search.node_count);
                 CHECK(search.nodes[parent].passed != 0);
-                CHECK(config_difference_count(
-                          &config, &search.nodes[parent].config) == 1u);
+                if (step == UM_CALIB_STEP_DATA_DEFAULT) {
+                    um_modem_config balanced = um_modem_default_config();
+                    CHECK(parent == 0u);
+                    CHECK(config_difference_count(&config, &balanced) == 0u);
+                } else {
+                    CHECK(config_difference_count(
+                              &config, &search.nodes[parent].config) == 1u);
+                }
                 CHECK(step != UM_CALIB_STEP_BASELINE);
             }
             qam_mask |= 1u << (config.qam_bits / 2u);
@@ -1035,7 +1052,7 @@ static void test_adaptive_calibration_search(void)
             CHECK(um_modulate_frame(&config, probe_wire, sizeof(probe_wire),
                                     (uint16_t)candidate_id, &samples,
                                     &sample_count) == UM_OK);
-            CHECK(sample_count + guarded_samples < UM_SAMPLE_RATE);
+            CHECK(sample_count + guarded_samples < 2u * UM_SAMPLE_RATE);
             if (sample_count > maximum_samples) {
                 maximum_samples = sample_count;
             }
@@ -1043,22 +1060,29 @@ static void test_adaptive_calibration_search(void)
             CHECK(um_calibration_search_record(&search, candidate_id, 1) ==
                   UM_OK);
         }
+        printf("adaptive calibration %s budget=%zu generated=%zu "
+               "max-frame=%.1f ms steps=0x%x qam=0x%x fec=0x%x\n",
+               quality_modes[mode] == 0 ? "default" : "high", tested,
+               search.node_count,
+               1000.0 * (double)maximum_samples / (double)UM_SAMPLE_RATE,
+               step_mask, qam_mask, fec_mask);
         CHECK(tested == search.budget);
-        CHECK(qam_mask == 14u);
-        CHECK(fec_mask == 7u);
-        CHECK((step_mask & (1u << UM_CALIB_STEP_REPETITIONS)) != 0u);
+        CHECK((qam_mask & 6u) == 6u);
+        CHECK((fec_mask & 3u) == 3u);
+        if (quality_modes[mode] != 0) {
+            CHECK(qam_mask == 14u);
+            CHECK(fec_mask == 7u);
+        }
         CHECK((step_mask & (1u << UM_CALIB_STEP_QAM)) != 0u);
         CHECK((step_mask & (1u << UM_CALIB_STEP_FEC)) != 0u);
         CHECK((step_mask & (1u << UM_CALIB_STEP_PREFIX)) != 0u);
         CHECK((step_mask & (1u << UM_CALIB_STEP_HIGH_BAND)) != 0u);
-        CHECK((step_mask & (1u << UM_CALIB_STEP_LOW_BAND)) != 0u);
-        CHECK((step_mask & (1u << UM_CALIB_STEP_TRAINING)) != 0u);
-        printf("adaptive calibration %s budget=%zu generated=%zu "
-               "max-frame=%.1f ms steps=0x%x\n",
-               quality_modes[mode] == 0 ? "default" : "high", tested,
-               search.node_count,
-               1000.0 * (double)maximum_samples / (double)UM_SAMPLE_RATE,
-               step_mask);
+        CHECK((step_mask & (1u << UM_CALIB_STEP_DATA_DEFAULT)) != 0u);
+        if (quality_modes[mode] != 0) {
+            CHECK((step_mask & (1u << UM_CALIB_STEP_SYNC)) != 0u);
+            CHECK((step_mask & (1u << UM_CALIB_STEP_GAP)) != 0u);
+            CHECK((step_mask & (1u << UM_CALIB_STEP_WINDOW)) != 0u);
+        }
     }
 
     {
@@ -1087,8 +1111,90 @@ static void test_adaptive_calibration_search(void)
             }
         }
         CHECK(tested < search.budget);
-        CHECK(tested == 8u);
+        CHECK(tested == 9u);
         CHECK(search.passed_count == 1u);
+    }
+
+    {
+        um_calibration_search search;
+        unsigned qam_attempts = 0u;
+        unsigned qam_passes = 0u;
+        unsigned observed_qam_attempts = 0u;
+        unsigned widest_band = 0u;
+        unsigned shortest_prefix = UINT_MAX;
+        size_t tested = 0u;
+        int next_status;
+        CHECK(um_calibration_search_init(&search, 1) == UM_OK);
+        while (1) {
+            um_modem_config config;
+            um_calibration_step step;
+            size_t candidate_id;
+            int passed;
+            next_status = um_calibration_search_next(
+                &search, &candidate_id, &config, &step);
+            CHECK(next_status >= 0);
+            if (next_status <= 0) {
+                break;
+            }
+            ++tested;
+            passed = step != UM_CALIB_STEP_QAM;
+            if (step == UM_CALIB_STEP_QAM) {
+                ++observed_qam_attempts;
+            }
+            if (passed != 0 && config.last_bin > widest_band) {
+                widest_band = config.last_bin;
+            }
+            if (passed != 0 && config.cyclic_prefix < shortest_prefix) {
+                shortest_prefix = config.cyclic_prefix;
+            }
+            CHECK(um_calibration_search_record(&search, candidate_id,
+                                               passed) == UM_OK);
+        }
+        um_calibration_search_step_results(
+            &search, UM_CALIB_STEP_QAM, &qam_attempts, &qam_passes);
+        printf("adaptive learned failure: qam=%u/%u widest-bin=%u "
+               "shortest-prefix=%u probes=%zu\n",
+               qam_passes, qam_attempts, widest_band, shortest_prefix,
+               tested);
+        CHECK(tested == search.budget);
+        CHECK(qam_attempts == observed_qam_attempts);
+        CHECK(qam_attempts >= 1u);
+        CHECK(qam_attempts <= 2u);
+        CHECK(qam_passes == 0u);
+        CHECK(widest_band >= 512u);
+        CHECK(shortest_prefix <= 512u);
+    }
+
+    {
+        um_calibration_search search;
+        float scores[UM_CALIBRATION_SEARCH_MAX_NODES];
+        size_t ranked[5u];
+        size_t rank_count;
+        size_t index;
+        memset(&search, 0, sizeof(search));
+        for (index = 0u; index < UM_CALIBRATION_SEARCH_MAX_NODES; ++index) {
+            scores[index] = -1.0f;
+        }
+        search.node_count = 6u;
+        search.nodes[1].parent = 0u;
+        search.nodes[2].parent = 1u;
+        search.nodes[3].parent = 2u;
+        search.nodes[4].parent = 3u;
+        search.nodes[5].parent = 0u;
+        scores[0] = 1.0f;
+        scores[1] = 2.0f;
+        scores[2] = 3.0f;
+        scores[3] = 4.0f;
+        scores[4] = 5.0f;
+        scores[5] = 4.5f;
+        rank_count = um_calibration_rank_candidates(
+            &search, scores, ranked, sizeof(ranked) / sizeof(ranked[0]));
+        CHECK(rank_count == 5u);
+        CHECK(ranked[0] == 4u);
+        CHECK(ranked[1] == 3u);
+        CHECK(ranked[2] == 2u);
+        CHECK(ranked[3] == 1u);
+        CHECK(ranked[4] == 0u);
     }
 }
 

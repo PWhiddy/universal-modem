@@ -20,6 +20,7 @@
 #define UM_FEC_TAIL_BITS 6u
 #define UM_MAX_PAYLOAD 65535u
 #define UM_CALIBRATION_SEARCH_MAX_NODES 192u
+#define UM_CALIBRATION_PROBE_BYTES 128u
 
 typedef enum {
     UM_CALIB_STEP_BASELINE = 0,
@@ -33,7 +34,9 @@ typedef enum {
     UM_CALIB_STEP_GAP,
     UM_CALIB_STEP_TRAINING,
     UM_CALIB_STEP_NARROW_BAND,
-    UM_CALIB_STEP_WINDOW
+    UM_CALIB_STEP_WINDOW,
+    UM_CALIB_STEP_DATA_DEFAULT,
+    UM_CALIB_STEP_COUNT
 } um_calibration_step;
 
 typedef struct {
@@ -42,6 +45,7 @@ typedef struct {
     size_t parent;
     um_calibration_step step;
     int tested;
+    int recorded;
     int passed;
 } um_calibration_search_node;
 
@@ -125,6 +129,14 @@ int um_calibration_search_next(um_calibration_search *search,
                                um_calibration_step *step);
 int um_calibration_search_record(um_calibration_search *search,
                                  size_t candidate_id, int passed);
+void um_calibration_search_step_results(const um_calibration_search *search,
+                                        um_calibration_step step,
+                                        unsigned *attempts,
+                                        unsigned *passes);
+size_t um_calibration_rank_candidates(
+    const um_calibration_search *search,
+    const float scores[UM_CALIBRATION_SEARCH_MAX_NODES], size_t *ranked,
+    size_t ranked_capacity);
 const char *um_calibration_step_name(um_calibration_step step);
 float um_calibration_payload_rate(const um_modem_config *config,
                                   size_t payload_bytes);

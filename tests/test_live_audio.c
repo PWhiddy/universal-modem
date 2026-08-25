@@ -62,6 +62,7 @@ typedef struct {
     unsigned connected;
     unsigned calibrating;
     unsigned baseline_passes;
+    unsigned grounded_defaults;
     unsigned calibration_selections;
     unsigned baseline_selections;
     unsigned adaptive_upgrades;
@@ -98,6 +99,9 @@ static void test_log(void *context, const char *message)
     }
     if (strstr(message, "id=0 step=working-baseline PASS") != NULL) {
         ++run->baseline_passes;
+    }
+    if (strstr(message, "step=grounded-data-default") != NULL) {
+        ++run->grounded_defaults;
     }
     if (strstr(message, "calib selected") != NULL) {
         ++run->calibration_selections;
@@ -391,6 +395,7 @@ static int check_runner(const runner *run, int require_upgrade,
 {
     return run->status == UM_OK && run->connected == 1u &&
            run->calibrating == 2u && run->baseline_passes >= 1u &&
+           run->grounded_defaults >= 2u &&
            run->calibration_selections == 2u &&
            (require_upgrade == 0 || run->adaptive_upgrades >= 1u) &&
            (require_baseline == 0 || run->baseline_selections >= 1u) &&

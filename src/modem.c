@@ -101,15 +101,15 @@ um_modem_config um_modem_default_config(void)
     um_modem_config config;
     config.fft_size = UM_FFT_SIZE;
     config.first_bin = 64u;
-    config.last_bin = 512u;
-    config.cyclic_prefix = 768u;
+    config.last_bin = 362u;
+    config.cyclic_prefix = 1024u;
     config.window_samples = 64u;
-    config.sync_samples = UM_SYNC_SAMPLES;
-    config.sync_gap = UM_SYNC_GAP;
+    config.sync_samples = 1536u;
+    config.sync_gap = 2560u;
     config.training_symbols = UM_TRAINING_SYMBOLS;
     config.symbol_repetitions = 1u;
-    config.qam_bits = 4u;
-    config.fec_rate = UM_FEC_RATE_1_2;
+    config.qam_bits = 2u;
+    config.fec_rate = UM_FEC_RATE_2_3;
     return config;
 }
 
