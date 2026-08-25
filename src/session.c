@@ -70,10 +70,13 @@ static uint32_t wire_read_u32(const uint8_t *bytes)
 static um_modem_config bootstrap_config(void)
 {
     um_modem_config config = um_modem_default_config();
-    config.first_bin = 12u;
-    config.last_bin = 60u;
-    config.cyclic_prefix = 64u;
-    config.window_samples = 8u;
+    config.first_bin = 64u;
+    config.last_bin = 448u;
+    config.cyclic_prefix = 1024u;
+    config.window_samples = 96u;
+    config.sync_samples = UM_MAX_SYNC_SAMPLES;
+    config.sync_gap = 3072u;
+    config.training_symbols = UM_MAX_TRAINING_SYMBOLS;
     config.qam_bits = 2u;
     config.fec_rate = UM_FEC_RATE_1_2;
     return config;

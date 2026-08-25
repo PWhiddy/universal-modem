@@ -17,64 +17,62 @@ typedef struct {
 } viable_candidate;
 
 static const frequency_range default_ranges[] = {
-    {12u, 60u}, {16u, 72u}, {20u, 88u}
+    {48u, 362u}, {64u, 490u}, {128u, 640u}
 };
 
 static const frequency_range high_ranges[] = {
-    {8u, 48u},  {8u, 64u},   {10u, 76u}, {12u, 60u},
-    {12u, 84u}, {16u, 72u},  {16u, 96u}, {20u, 88u},
-    {20u, 104u}, {24u, 112u}
+    {48u, 320u}, {48u, 448u}, {48u, 576u}, {64u, 362u},
+    {64u, 490u}, {64u, 640u}, {96u, 448u}, {96u, 576u},
+    {128u, 640u}, {128u, 768u}
 };
 
 static const unsigned qam_options[] = {2u, 4u, 6u};
-static const unsigned default_prefixes[] = {16u, 32u, 64u};
-static const unsigned high_prefixes[] = {8u, 16u, 24u, 32u, 48u, 64u, 96u};
-static const unsigned default_windows[] = {8u};
-static const unsigned high_windows[] = {0u, 4u, 8u, 16u};
+static const unsigned default_prefixes[] = {384u, 768u, 1024u};
+static const unsigned high_prefixes[] = {256u, 384u, 512u, 640u,
+                                         768u, 896u, 1024u};
+static const unsigned default_windows[] = {64u};
+static const unsigned high_windows[] = {0u, 32u, 64u, 128u};
 static const um_fec_rate fec_options[] = {UM_FEC_RATE_1_2, UM_FEC_RATE_2_3,
                                           UM_FEC_RATE_3_4};
 
-/*
- * Use a balanced one-third fractional grid for live sweeps. Every option in
- * every dimension is retained while the deterministic acoustic schedule stays
- * near 15 seconds by default and several minutes in high-quality mode.
- */
-static size_t live_candidate_count_for_grid(const frequency_range *ranges,
-                                            size_t range_count,
-                                            const unsigned *prefixes,
-                                            size_t prefix_count,
-                                            const unsigned *windows,
-                                            size_t window_count)
+/* High-quality live calibration samples the full grid uniformly. */
+static size_t live_high_candidate_count(void)
 {
     size_t count = 0u;
+    size_t valid = 0u;
     size_t range_index;
     size_t qam_index;
     size_t prefix_index;
     size_t fec_index;
     size_t window_index;
-    for (range_index = 0u; range_index < range_count; ++range_index) {
+    for (range_index = 0u;
+         range_index < sizeof(high_ranges) / sizeof(high_ranges[0]);
+         ++range_index) {
         for (qam_index = 0u;
              qam_index < sizeof(qam_options) / sizeof(qam_options[0]);
              ++qam_index) {
-            for (prefix_index = 0u; prefix_index < prefix_count;
+            for (prefix_index = 0u;
+                 prefix_index < sizeof(high_prefixes) /
+                                    sizeof(high_prefixes[0]);
                  ++prefix_index) {
                 for (fec_index = 0u;
                      fec_index < sizeof(fec_options) / sizeof(fec_options[0]);
                      ++fec_index) {
-                    for (window_index = 0u; window_index < window_count;
+                    for (window_index = 0u;
+                         window_index < sizeof(high_windows) /
+                                            sizeof(high_windows[0]);
                          ++window_index) {
                         um_modem_config candidate = um_modem_default_config();
-                        size_t selector = range_index + qam_index +
-                                          prefix_index + fec_index +
-                                          window_index;
-                        candidate.first_bin = ranges[range_index].first_bin;
-                        candidate.last_bin = ranges[range_index].last_bin;
+                        candidate.first_bin = high_ranges[range_index].first_bin;
+                        candidate.last_bin = high_ranges[range_index].last_bin;
                         candidate.qam_bits = qam_options[qam_index];
-                        candidate.cyclic_prefix = prefixes[prefix_index];
+                        candidate.cyclic_prefix = high_prefixes[prefix_index];
                         candidate.fec_rate = fec_options[fec_index];
-                        candidate.window_samples = windows[window_index];
-                        if (selector % 3u == 0u &&
-                            um_modem_config_validate(&candidate) == UM_OK) {
+                        candidate.window_samples = high_windows[window_index];
+                        if (um_modem_config_validate(&candidate) != UM_OK) {
+                            continue;
+                        }
+                        if (valid++ % 27u == 0u) {
                             ++count;
                         }
                     }
@@ -88,18 +86,9 @@ static size_t live_candidate_count_for_grid(const frequency_range *ranges,
 size_t um_live_calibration_candidate_count(int high_quality)
 {
     if (high_quality != 0) {
-        return live_candidate_count_for_grid(
-            high_ranges, sizeof(high_ranges) / sizeof(high_ranges[0]),
-            high_prefixes,
-            sizeof(high_prefixes) / sizeof(high_prefixes[0]), high_windows,
-            sizeof(high_windows) / sizeof(high_windows[0]));
+        return live_high_candidate_count();
     }
-    return live_candidate_count_for_grid(
-        default_ranges, sizeof(default_ranges) / sizeof(default_ranges[0]),
-        default_prefixes,
-        sizeof(default_prefixes) / sizeof(default_prefixes[0]),
-        default_windows,
-        sizeof(default_windows) / sizeof(default_windows[0]));
+    return 9u;
 }
 
 int um_live_calibration_candidate_get(int high_quality, size_t index,
@@ -125,6 +114,7 @@ int um_live_calibration_candidate_get(int high_quality, size_t index,
                               : sizeof(default_windows) /
                                     sizeof(default_windows[0]);
     size_t current = 0u;
+    size_t selected_index = 0u;
     size_t range_index;
     size_t qam_index;
     size_t prefix_index;
@@ -132,6 +122,23 @@ int um_live_calibration_candidate_get(int high_quality, size_t index,
     size_t window_index;
     if (config == NULL) {
         return UM_ERR_ARGUMENT;
+    }
+    if (high_quality == 0) {
+        size_t range;
+        size_t qam;
+        if (index >= 9u) {
+            return UM_ERR_ARGUMENT;
+        }
+        range = index / 3u;
+        qam = index % 3u;
+        *config = um_modem_default_config();
+        config->first_bin = default_ranges[range].first_bin;
+        config->last_bin = default_ranges[range].last_bin;
+        config->qam_bits = qam_options[qam];
+        config->cyclic_prefix = default_prefixes[(range + qam) % 3u];
+        config->fec_rate = fec_options[(range + 2u * qam) % 3u];
+        config->window_samples = default_windows[0];
+        return um_modem_config_validate(config);
     }
     for (range_index = 0u; range_index < range_count; ++range_index) {
         for (qam_index = 0u;
@@ -145,20 +152,19 @@ int um_live_calibration_candidate_get(int high_quality, size_t index,
                     for (window_index = 0u; window_index < window_count;
                          ++window_index) {
                         um_modem_config candidate = um_modem_default_config();
-                        size_t selector = range_index + qam_index +
-                                          prefix_index + fec_index +
-                                          window_index;
                         candidate.first_bin = ranges[range_index].first_bin;
                         candidate.last_bin = ranges[range_index].last_bin;
                         candidate.qam_bits = qam_options[qam_index];
                         candidate.cyclic_prefix = prefixes[prefix_index];
                         candidate.fec_rate = fec_options[fec_index];
                         candidate.window_samples = windows[window_index];
-                        if (selector % 3u != 0u ||
-                            um_modem_config_validate(&candidate) != UM_OK) {
+                        if (um_modem_config_validate(&candidate) != UM_OK) {
                             continue;
                         }
-                        if (current++ == index) {
+                        if (current++ % 27u != 0u) {
+                            continue;
+                        }
+                        if (selected_index++ == index) {
                             *config = candidate;
                             return UM_OK;
                         }
@@ -351,6 +357,11 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                         candidate.cyclic_prefix = prefixes[prefix_index];
                         candidate.fec_rate = fec_options[fec_index];
                         candidate.window_samples = windows[window_index];
+                        if (high_quality == 0 &&
+                            (range_index + qam_index + prefix_index +
+                             fec_index + window_index) % 3u != 0u) {
+                            continue;
+                        }
                         if (um_modem_config_validate(&candidate) != UM_OK) {
                             continue;
                         }

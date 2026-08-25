@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define UM_SAMPLE_RATE 48000u
-#define UM_FFT_SIZE 256u
+#define UM_FFT_SIZE 2048u
 
 typedef struct {
     float re;
@@ -44,6 +44,9 @@ typedef struct {
     unsigned last_bin;
     unsigned cyclic_prefix;
     unsigned window_samples;
+    unsigned sync_samples;
+    unsigned sync_gap;
+    unsigned training_symbols;
     unsigned qam_bits;
     um_fec_rate fec_rate;
 } um_modem_config;
@@ -51,6 +54,9 @@ typedef struct {
 typedef struct {
     float sync_correlation;
     float signal_rms;
+    float input_peak;
+    float normalization_gain;
+    float clipped_sample_fraction;
     float noise_rms;
     float evm_rms;
     float estimated_snr_db;

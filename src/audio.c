@@ -107,6 +107,36 @@ static int configure_pcm(snd_pcm_t *pcm)
     return status < 0 ? UM_ERR_AUDIO : UM_OK;
 }
 
+static void log_pcm_identity(snd_pcm_t *pcm, const char *direction,
+                             um_log_callback logger, void *logger_context)
+{
+    snd_pcm_info_t *info = NULL;
+    const char *pcm_name = snd_pcm_name(pcm);
+    if (snd_pcm_info_malloc(&info) >= 0 && snd_pcm_info(pcm, info) >= 0) {
+        int card = snd_pcm_info_get_card(info);
+        audio_log(logger, logger_context,
+                  "Opened audio %s: pcm=%s card=%d device=%u name=%s",
+                  direction, pcm_name != NULL ? pcm_name : "unknown", card,
+                  snd_pcm_info_get_device(info),
+                  snd_pcm_info_get_name(info) != NULL
+                      ? snd_pcm_info_get_name(info)
+                      : "unknown");
+        if (card < 0) {
+            audio_log(logger, logger_context,
+                      "  ALSA plugin routing hides the physical %s; use an "
+                      "explicit plughw:/hw: device ID if this is ambiguous",
+                      direction);
+        }
+    } else {
+        audio_log(logger, logger_context,
+                  "Opened audio %s: pcm=%s (physical route not reported)",
+                  direction, pcm_name != NULL ? pcm_name : "unknown");
+    }
+    if (info != NULL) {
+        snd_pcm_info_free(info);
+    }
+}
+
 int um_audio_open(um_audio **audio, const char *input_device,
                   const char *output_device, um_log_callback logger,
                   void *logger_context)
@@ -144,6 +174,7 @@ int um_audio_open(um_audio **audio, const char *input_device,
         um_audio_close(opened);
         return UM_ERR_AUDIO;
     }
+    log_pcm_identity(opened->capture, "input", logger, logger_context);
     status = snd_pcm_open(&opened->playback, output_device,
                           SND_PCM_STREAM_PLAYBACK, 0);
     if (status < 0) {
@@ -158,6 +189,7 @@ int um_audio_open(um_audio **audio, const char *input_device,
         um_audio_close(opened);
         return UM_ERR_AUDIO;
     }
+    log_pcm_identity(opened->playback, "output", logger, logger_context);
     (void)snd_pcm_nonblock(opened->capture, 1);
     status = snd_pcm_prepare(opened->capture);
     if (status >= 0) {

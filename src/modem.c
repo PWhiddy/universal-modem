@@ -25,14 +25,88 @@ static size_t divide_round_up(size_t numerator, size_t denominator)
     return numerator / denominator + (numerator % denominator != 0u ? 1u : 0u);
 }
 
+static int normalize_capture(const float *samples, size_t sample_count,
+                             float **normalized, float *input_rms,
+                             float *input_peak, float *normalization_gain,
+                             float *clipped_fraction)
+{
+    const size_t block_samples = 256u;
+    const double target_rms = 0.20;
+    double sum = 0.0;
+    double maximum_block_energy = 0.0;
+    double mean;
+    double gain = 1.0;
+    float peak = 0.0f;
+    size_t clipped = 0u;
+    float *output;
+    size_t start;
+    size_t i;
+
+    output = (float *)malloc((sample_count == 0u ? 1u : sample_count) *
+                             sizeof(*output));
+    if (output == NULL) {
+        return UM_ERR_MEMORY;
+    }
+    for (i = 0u; i < sample_count; ++i) {
+        float absolute = fabsf(samples[i]);
+        sum += samples[i];
+        if (absolute > peak) {
+            peak = absolute;
+        }
+        if (absolute >= 0.999f) {
+            ++clipped;
+        }
+    }
+    mean = sample_count != 0u ? sum / (double)sample_count : 0.0;
+    for (start = 0u; start < sample_count; start += block_samples) {
+        size_t count = sample_count - start;
+        double block_energy = 0.0;
+        if (count > block_samples) {
+            count = block_samples;
+        }
+        for (i = 0u; i < count; ++i) {
+            double value = (double)samples[start + i] - mean;
+            block_energy += value * value;
+        }
+        if (count != 0u) {
+            block_energy /= (double)count;
+        }
+        if (block_energy > maximum_block_energy) {
+            maximum_block_energy = block_energy;
+        }
+    }
+    if (maximum_block_energy > 1.0e-20) {
+        gain = target_rms / sqrt(maximum_block_energy);
+        if (gain < 1.0e-4) {
+            gain = 1.0e-4;
+        } else if (gain > 1.0e4) {
+            gain = 1.0e4;
+        }
+    }
+    for (i = 0u; i < sample_count; ++i) {
+        output[i] = (float)(((double)samples[i] - mean) * gain);
+    }
+    *normalized = output;
+    *input_rms = (float)sqrt(maximum_block_energy);
+    *input_peak = peak;
+    *normalization_gain = (float)gain;
+    *clipped_fraction = sample_count != 0u
+                            ? (float)clipped / (float)sample_count
+                            : 0.0f;
+    return UM_OK;
+}
+
 um_modem_config um_modem_default_config(void)
 {
     um_modem_config config;
     config.fft_size = UM_FFT_SIZE;
-    config.first_bin = 16u;
-    config.last_bin = 72u;
-    config.cyclic_prefix = 32u;
-    config.window_samples = 8u;
+    config.first_bin = 64u;
+    config.last_bin = 512u;
+    config.cyclic_prefix = 768u;
+    config.window_samples = 64u;
+    config.sync_samples = UM_SYNC_SAMPLES;
+    config.sync_gap = UM_SYNC_GAP;
+    config.training_symbols = UM_TRAINING_SYMBOLS;
     config.qam_bits = 4u;
     config.fec_rate = UM_FEC_RATE_1_2;
     return config;
@@ -47,6 +121,11 @@ int um_modem_config_validate(const um_modem_config *config)
         config->cyclic_prefix < 8u ||
         config->cyclic_prefix > config->fft_size / 2u ||
         config->window_samples > config->cyclic_prefix ||
+        config->sync_samples < 512u ||
+        config->sync_samples > UM_MAX_SYNC_SAMPLES ||
+        config->sync_gap > UM_SAMPLE_RATE / 5u ||
+        config->training_symbols < 2u ||
+        config->training_symbols > UM_MAX_TRAINING_SYMBOLS ||
         (config->qam_bits != 2u && config->qam_bits != 4u &&
          config->qam_bits != 6u) ||
         (config->fec_rate != UM_FEC_RATE_1_2 &&
@@ -73,17 +152,29 @@ size_t um_modem_data_carriers(const um_modem_config *config)
     return count;
 }
 
-static void make_sync(float *sync)
+static void make_sync(float *sync, size_t sync_samples)
 {
     size_t i;
     float phase = 0.0f;
-    const float start_frequency = 1800.0f;
-    const float end_frequency = 18200.0f;
-    for (i = 0u; i < UM_SYNC_SAMPLES; ++i) {
-        float position = (float)i / (float)(UM_SYNC_SAMPLES - 1u);
+    const float start_frequency = 1500.0f;
+    const float end_frequency = 11500.0f;
+    const size_t taper_samples = sync_samples / 8u;
+    for (i = 0u; i < sync_samples; ++i) {
+        float position = (float)i / (float)(sync_samples - 1u);
         float frequency = start_frequency +
                           (end_frequency - start_frequency) * position;
-        float window = 0.5f - 0.5f * cosf(2.0f * UM_PI * position);
+        float window = 1.0f;
+        if (i < taper_samples) {
+            float angle = ((float)i + 0.5f) * UM_PI /
+                          (2.0f * (float)taper_samples);
+            float sine = sinf(angle);
+            window = sine * sine;
+        } else if (i + taper_samples >= sync_samples) {
+            float angle = ((float)(sync_samples - i) - 0.5f) * UM_PI /
+                          (2.0f * (float)taper_samples);
+            float sine = sinf(angle);
+            window = sine * sine;
+        }
         sync[i] = 0.55f * window * sinf(phase);
         phase += 2.0f * UM_PI * frequency / (float)UM_SAMPLE_RATE;
         if (phase > 2.0f * UM_PI) {
@@ -99,14 +190,22 @@ static int render_symbol(const um_modem_config *config,
     um_complex time[UM_FFT_SIZE];
     size_t hop = config->fft_size + config->cyclic_prefix;
     size_t extended = hop + config->window_samples;
-    size_t active = config->last_bin - config->first_bin + 1u;
-    float scale = 0.30f * (float)config->fft_size /
-                  sqrtf(2.0f * (float)active);
+    float scale = 1.0f;
+    float peak = 0.0f;
     size_t i;
 
     memcpy(time, frequency, sizeof(time));
     if (um_fft(time, config->fft_size, 1) != UM_OK) {
         return UM_ERR_ARGUMENT;
+    }
+    for (i = 0u; i < config->fft_size; ++i) {
+        float magnitude = fabsf(time[i].re);
+        if (magnitude > peak) {
+            peak = magnitude;
+        }
+    }
+    if (peak > 1.0e-12f) {
+        scale = 0.78f / peak;
     }
     for (i = 0u; i < extended; ++i) {
         size_t source;
@@ -141,13 +240,23 @@ static void set_conjugate_bin(um_complex *frequency, size_t fft_size,
     frequency[fft_size - bin] = um_cconj(value);
 }
 
+static um_complex known_training_value(const um_modem_config *config,
+                                       unsigned bin)
+{
+    float carrier = (float)(bin - config->first_bin);
+    float count = (float)(config->last_bin - config->first_bin + 1u);
+    float phase = UM_PI * carrier * carrier / count;
+    um_complex value = {cosf(phase), sinf(phase)};
+    return value;
+}
+
 static void make_training_frequency(const um_modem_config *config,
                                     um_complex *frequency)
 {
     unsigned bin;
     memset(frequency, 0, sizeof(*frequency) * config->fft_size);
     for (bin = config->first_bin; bin <= config->last_bin; ++bin) {
-        um_complex value = {known_sign(bin, 0u), 0.0f};
+        um_complex value = known_training_value(config, bin);
         set_conjugate_bin(frequency, config->fft_size, bin, value);
     }
 }
@@ -288,7 +397,7 @@ int um_modulate_frame(const um_modem_config *config,
     uint8_t *payload_coded = NULL;
     size_t encoded_count;
     float *output = NULL;
-    float sync[UM_SYNC_SAMPLES];
+    float sync[UM_MAX_SYNC_SAMPLES];
     um_complex frequency[UM_FFT_SIZE];
     size_t symbol;
     int status;
@@ -309,9 +418,10 @@ int um_modulate_frame(const um_modem_config *config,
     payload_symbol_bits = carriers * config->qam_bits;
     payload_symbols = divide_round_up(payload_fec_bits, payload_symbol_bits);
     payload_capacity = payload_symbols * payload_symbol_bits;
-    total_symbols = UM_TRAINING_SYMBOLS + header_symbols + payload_symbols;
+    total_symbols = config->training_symbols + header_symbols +
+                    payload_symbols;
     hop = config->fft_size + config->cyclic_prefix;
-    ofdm_start = UM_SYNC_LEAD + UM_SYNC_SAMPLES + UM_SYNC_GAP;
+    ofdm_start = UM_SYNC_LEAD + config->sync_samples + config->sync_gap;
     if (total_symbols > (SIZE_MAX - ofdm_start - config->window_samples - 64u) /
                             hop) {
         return UM_ERR_ARGUMENT;
@@ -336,13 +446,13 @@ int um_modulate_frame(const um_modem_config *config,
         status = UM_ERR_MEMORY;
         goto done;
     }
-    make_sync(sync);
-    for (symbol = 0u; symbol < UM_SYNC_SAMPLES; ++symbol) {
+    make_sync(sync, config->sync_samples);
+    for (symbol = 0u; symbol < config->sync_samples; ++symbol) {
         output[UM_SYNC_LEAD + symbol] = sync[symbol];
     }
 
     make_training_frequency(config, frequency);
-    for (symbol = 0u; symbol < UM_TRAINING_SYMBOLS; ++symbol) {
+    for (symbol = 0u; symbol < config->training_symbols; ++symbol) {
         status = render_symbol(config, frequency, output,
                                ofdm_start + symbol * hop);
         if (status != UM_OK) {
@@ -352,10 +462,10 @@ int um_modulate_frame(const um_modem_config *config,
     for (symbol = 0u; symbol < header_symbols; ++symbol) {
         size_t offset = symbol * header_symbol_bits;
         make_data_frequency(config, header_coded + offset, header_symbol_bits,
-                            2u, UM_TRAINING_SYMBOLS + symbol, frequency);
+                            2u, config->training_symbols + symbol, frequency);
         status = render_symbol(config, frequency, output,
                                ofdm_start +
-                                   (UM_TRAINING_SYMBOLS + symbol) * hop);
+                                   (config->training_symbols + symbol) * hop);
         if (status != UM_OK) {
             goto done;
         }
@@ -364,14 +474,31 @@ int um_modulate_frame(const um_modem_config *config,
         size_t offset = symbol * payload_symbol_bits;
         make_data_frequency(config, payload_coded + offset,
                             payload_symbol_bits, config->qam_bits,
-                            UM_TRAINING_SYMBOLS + header_symbols + symbol,
+                            config->training_symbols + header_symbols + symbol,
                             frequency);
         status = render_symbol(config, frequency, output,
                                ofdm_start +
-                                   (UM_TRAINING_SYMBOLS + header_symbols +
+                                   (config->training_symbols + header_symbols +
                                     symbol) * hop);
         if (status != UM_OK) {
             goto done;
+        }
+    }
+    {
+        float peak = 0.0f;
+        float gain = 1.0f;
+        size_t sample;
+        for (sample = ofdm_start; sample < count; ++sample) {
+            float magnitude = fabsf(output[sample]);
+            if (magnitude > peak) {
+                peak = magnitude;
+            }
+        }
+        if (peak > 0.90f) {
+            gain = 0.90f / peak;
+            for (sample = ofdm_start; sample < count; ++sample) {
+                output[sample] *= gain;
+            }
         }
     }
 
@@ -387,44 +514,153 @@ done:
     return status;
 }
 
-static int locate_sync(const float *samples, size_t sample_count,
+static int locate_sync(const um_modem_config *config, const float *samples,
+                       size_t sample_count,
                        size_t *location, float *correlation)
 {
-    float sync[UM_SYNC_SAMPLES];
+    float sync[UM_MAX_SYNC_SAMPLES];
+    um_complex *capture_spectrum = NULL;
+    um_complex *sync_spectrum = NULL;
+    size_t convolution_count;
+    size_t fft_count = 1u;
+    double sync_sum = 0.0;
     double sync_energy = 0.0;
+    double window_sum = 0.0;
+    double window_energy = 0.0;
     float best = 0.0f;
     size_t best_location = 0u;
     size_t start;
     size_t i;
+    int status = UM_OK;
 
-    if (sample_count < UM_SYNC_SAMPLES) {
+    if (sample_count < config->sync_samples) {
         return UM_ERR_TRUNCATED;
     }
-    make_sync(sync);
-    for (i = 0u; i < UM_SYNC_SAMPLES; ++i) {
-        sync_energy += (double)sync[i] * sync[i];
+    if (sample_count > SIZE_MAX - config->sync_samples + 1u) {
+        return UM_ERR_ARGUMENT;
     }
-    for (start = 0u; start + UM_SYNC_SAMPLES <= sample_count; ++start) {
-        double dot = 0.0;
-        double energy = 0.0;
+    convolution_count = sample_count + config->sync_samples - 1u;
+    while (fft_count < convolution_count) {
+        if (fft_count > SIZE_MAX / 2u) {
+            return UM_ERR_ARGUMENT;
+        }
+        fft_count <<= 1u;
+    }
+    capture_spectrum = (um_complex *)calloc(fft_count,
+                                             sizeof(*capture_spectrum));
+    sync_spectrum = (um_complex *)calloc(fft_count, sizeof(*sync_spectrum));
+    if (capture_spectrum == NULL || sync_spectrum == NULL) {
+        status = UM_ERR_MEMORY;
+        goto done;
+    }
+    make_sync(sync, config->sync_samples);
+    for (i = 0u; i < config->sync_samples; ++i) {
+        sync_sum += sync[i];
+    }
+    for (i = 0u; i < sample_count; ++i) {
+        capture_spectrum[i].re = samples[i];
+    }
+    for (i = 0u; i < config->sync_samples; ++i) {
+        double centered = (double)sync[i] -
+                          sync_sum / (double)config->sync_samples;
+        sync_spectrum[config->sync_samples - 1u - i].re = (float)centered;
+        sync_energy += centered * centered;
+        window_sum += samples[i];
+        window_energy += (double)samples[i] * samples[i];
+    }
+    status = um_fft(capture_spectrum, fft_count, 0);
+    if (status != UM_OK) {
+        goto done;
+    }
+    status = um_fft(sync_spectrum, fft_count, 0);
+    if (status != UM_OK) {
+        goto done;
+    }
+    for (i = 0u; i < fft_count; ++i) {
+        capture_spectrum[i] = um_cmul(capture_spectrum[i], sync_spectrum[i]);
+    }
+    status = um_fft(capture_spectrum, fft_count, 1);
+    if (status != UM_OK) {
+        goto done;
+    }
+    for (start = 0u; start + config->sync_samples <= sample_count; ++start) {
+        double variance = window_energy -
+                          window_sum * window_sum /
+                              (double)config->sync_samples;
+        double dot = capture_spectrum[start + config->sync_samples - 1u].re;
         float score;
-        for (i = 0u; i < UM_SYNC_SAMPLES; ++i) {
-            float value = samples[start + i];
-            dot += (double)value * sync[i];
-            energy += (double)value * value;
+        /*
+         * The FFT convolution has a small absolute round-off floor.  Capture
+         * normalization makes this threshold independent of microphone level;
+         * without it, numerically tiny silent windows can report impossible
+         * correlations and outrank the real chirp.
+         */
+        if (variance > (double)config->sync_samples * 1.0e-6) {
+            score = (float)(fabs(dot) / sqrt(variance * sync_energy));
+            if (score > best) {
+                best = score;
+                best_location = start;
+            }
         }
-        if (energy < 1.0e-18) {
-            continue;
-        }
-        score = (float)(fabs(dot) / sqrt(energy * sync_energy));
-        if (score > best) {
-            best = score;
-            best_location = start;
+        if (start + config->sync_samples < sample_count) {
+            double departing = samples[start];
+            double arriving = samples[start + config->sync_samples];
+            window_sum += arriving - departing;
+            window_energy += arriving * arriving - departing * departing;
         }
     }
     *location = best_location;
     *correlation = best;
-    return best >= 0.32f ? UM_OK : UM_ERR_SYNC;
+    {
+        float threshold = 0.10f + 4.3f / sqrtf((float)config->sync_samples);
+        if (threshold < 0.18f) {
+            threshold = 0.18f;
+        }
+        status = best >= threshold ? UM_OK : UM_ERR_SYNC;
+        if (status == UM_OK) {
+            size_t first = best_location > config->cyclic_prefix
+                               ? best_location - config->cyclic_prefix
+                               : 0u;
+            double local_sum = 0.0;
+            double local_energy = 0.0;
+            float path_threshold = best * 0.55f;
+            if (path_threshold < threshold) {
+                path_threshold = threshold;
+            }
+            for (i = 0u; i < config->sync_samples; ++i) {
+                local_sum += samples[first + i];
+                local_energy += (double)samples[first + i] *
+                                samples[first + i];
+            }
+            for (start = first; start <= best_location; ++start) {
+                double variance = local_energy -
+                                  local_sum * local_sum /
+                                      (double)config->sync_samples;
+                if (variance > (double)config->sync_samples * 1.0e-6) {
+                    double dot =
+                        capture_spectrum[start + config->sync_samples - 1u].re;
+                    float score =
+                        (float)(fabs(dot) / sqrt(variance * sync_energy));
+                    if (score >= path_threshold) {
+                        *location = start;
+                        break;
+                    }
+                }
+                if (start < best_location) {
+                    double departing = samples[start];
+                    double arriving = samples[start + config->sync_samples];
+                    local_sum += arriving - departing;
+                    local_energy += arriving * arriving -
+                                    departing * departing;
+                }
+            }
+        }
+    }
+
+done:
+    free(sync_spectrum);
+    free(capture_spectrum);
+    return status;
 }
 
 static int extract_fft(const um_modem_config *config, const float *samples,
@@ -443,37 +679,131 @@ static int extract_fft(const um_modem_config *config, const float *samples,
     return um_fft(frequency, config->fft_size, 0);
 }
 
-static um_complex phase_correction(const um_modem_config *config,
-                                   const um_complex *frequency,
-                                   const um_complex *channel,
-                                   size_t symbol_number)
+typedef struct {
+    float intercept;
+    float slope;
+    float confidence;
+    float amplitude;
+} phase_model;
+
+static phase_model estimate_phase_model(const um_modem_config *config,
+                                        const um_complex *frequency,
+                                        const um_complex *channel,
+                                        const float *reliability,
+                                        size_t symbol_number)
 {
-    um_complex sum = {0.0f, 0.0f};
+    float pilot_x[UM_FFT_SIZE];
+    um_complex pilot_value[UM_FFT_SIZE];
+    float pilot_magnitude[UM_FFT_SIZE];
+    float pilot_weight[UM_FFT_SIZE];
+    const float reference =
+        0.5f * (float)(config->first_bin + config->last_bin);
+    phase_model model = {0.0f, 0.0f, 0.0f, 1.0f};
+    size_t pilots = 0u;
+    float weight_sum = 0.0f;
+    float baseline_coherence = 0.0f;
+    float best_coherence = 0.0f;
+    um_complex best_sum = {0.0f, 0.0f};
     unsigned bin;
+    int timing_step;
+
     for (bin = config->first_bin; bin <= config->last_bin; ++bin) {
-        if (is_pilot(config, bin)) {
+        if (is_pilot(config, bin) && reliability[bin] > 1.0e-4f) {
             um_complex equalized = um_cdiv(frequency[bin], channel[bin]);
             float pilot = known_sign(bin, symbol_number);
-            sum.re += equalized.re * pilot;
-            sum.im += equalized.im * pilot;
+            float magnitude = sqrtf(um_cabs2(equalized));
+            if (magnitude <= 1.0e-8f) {
+                continue;
+            }
+            pilot_x[pilots] = (float)bin - reference;
+            pilot_value[pilots].re = equalized.re * pilot / magnitude;
+            pilot_value[pilots].im = equalized.im * pilot / magnitude;
+            pilot_magnitude[pilots] = magnitude;
+            pilot_weight[pilots] = reliability[bin];
+            weight_sum += reliability[bin];
+            ++pilots;
         }
     }
+    if (pilots == 0u || weight_sum <= 1.0e-8f) {
+        return model;
+    }
+    /*
+     * Search a physically bounded fractional timing displacement rather than
+     * unwrapping noisy pilot phases.  A slope is accepted only when it makes
+     * the pilots materially more coherent than a common-phase-only model.
+     */
+    for (timing_step = pilots >= 8u ? -64 : 0;
+         timing_step <= (pilots >= 8u ? 64 : 0); ++timing_step) {
+        float timing_samples = 0.5f * (float)timing_step;
+        float slope = -2.0f * UM_PI * timing_samples /
+                      (float)config->fft_size;
+        um_complex sum = {0.0f, 0.0f};
+        float coherence;
+        size_t pilot;
+        for (pilot = 0u; pilot < pilots; ++pilot) {
+            float phase = -slope * pilot_x[pilot];
+            um_complex correction = {cosf(phase), sinf(phase)};
+            sum = um_cadd(sum,
+                          um_cscale(um_cmul(pilot_value[pilot], correction),
+                                   pilot_weight[pilot]));
+        }
+        coherence = sqrtf(um_cabs2(sum)) / weight_sum;
+        if (timing_step == 0) {
+            baseline_coherence = coherence;
+        }
+        if (coherence > best_coherence) {
+            best_coherence = coherence;
+            best_sum = sum;
+            model.slope = slope;
+        }
+    }
+    if (pilots < 8u || best_coherence < baseline_coherence + 0.05f) {
+        um_complex sum = {0.0f, 0.0f};
+        size_t pilot;
+        for (pilot = 0u; pilot < pilots; ++pilot) {
+            sum = um_cadd(sum, um_cscale(pilot_value[pilot],
+                                         pilot_weight[pilot]));
+        }
+        model.slope = 0.0f;
+        best_sum = sum;
+        best_coherence = baseline_coherence;
+    }
+    model.intercept = atan2f(best_sum.im, best_sum.re);
+    model.confidence = best_coherence * best_coherence;
     {
-        float magnitude = sqrtf(um_cabs2(sum));
-        um_complex correction = {1.0f, 0.0f};
-        if (magnitude > 1.0e-12f) {
-            correction.re = sum.re / magnitude;
-            correction.im = -sum.im / magnitude;
+        double amplitude_sum = 0.0;
+        size_t pilot;
+        for (pilot = 0u; pilot < pilots; ++pilot) {
+            amplitude_sum += (double)pilot_weight[pilot] *
+                             pilot_magnitude[pilot];
         }
-        return correction;
+        model.amplitude = (float)(amplitude_sum / weight_sum);
+        if (model.amplitude < 0.05f) {
+            model.amplitude = 0.05f;
+        } else if (model.amplitude > 20.0f) {
+            model.amplitude = 20.0f;
+        }
     }
+    return model;
+}
+
+static um_complex phase_correction(const phase_model *model, unsigned bin,
+                                   const um_modem_config *config)
+{
+    float reference =
+        0.5f * (float)(config->first_bin + config->last_bin);
+    float phase = model->intercept + model->slope * ((float)bin - reference);
+    float gain = 1.0f / model->amplitude;
+    um_complex correction = {cosf(phase) * gain, -sinf(phase) * gain};
+    return correction;
 }
 
 static int demodulate_symbols(const um_modem_config *config,
                               const float *samples, size_t sample_count,
                               size_t first_start, size_t first_symbol_number,
                               size_t symbol_count, unsigned qam_bits,
-                              const um_complex *channel, float *soft,
+                              const um_complex *channel,
+                              const float *reliability, float *soft,
                               double *error_energy, double *ideal_energy)
 {
     size_t hop = config->fft_size + config->cyclic_prefix;
@@ -481,29 +811,35 @@ static int demodulate_symbols(const um_modem_config *config,
     size_t symbol;
     for (symbol = 0u; symbol < symbol_count; ++symbol) {
         um_complex frequency[UM_FFT_SIZE];
-        um_complex correction;
+        phase_model phase;
         unsigned bin;
         int status = extract_fft(config, samples, sample_count,
                                  first_start + symbol * hop, frequency);
         if (status != UM_OK) {
             return status;
         }
-        correction = phase_correction(config, frequency, channel,
-                                      first_symbol_number + symbol);
+        phase = estimate_phase_model(config, frequency, channel, reliability,
+                                     first_symbol_number + symbol);
         for (bin = config->first_bin; bin <= config->last_bin; ++bin) {
             if (!is_pilot(config, bin)) {
                 float symbol_soft[6];
                 uint8_t hard[6];
+                float symbol_reliability = phase.amplitude * phase.amplitude;
                 um_complex equalized = um_cmul(
-                    um_cdiv(frequency[bin], channel[bin]), correction);
+                    um_cdiv(frequency[bin], channel[bin]),
+                    phase_correction(&phase, bin, config));
                 um_complex nearest;
                 unsigned bit;
                 status = um_qam_soft_demod(equalized, qam_bits, symbol_soft);
                 if (status != UM_OK) {
                     return status;
                 }
+                if (symbol_reliability > 4.0f) {
+                    symbol_reliability = 4.0f;
+                }
                 for (bit = 0u; bit < qam_bits; ++bit) {
-                    soft[output++] = symbol_soft[bit];
+                    soft[output++] = symbol_soft[bit] * reliability[bin] *
+                                     phase.confidence * symbol_reliability;
                     hard[bit] = symbol_soft[bit] >= 0.0f ? 1u : 0u;
                 }
                 nearest = um_qam_map(hard, qam_bits);
@@ -559,13 +895,15 @@ int um_demodulate_frame(const um_modem_config *config,
                         size_t *payload_length, uint16_t *sequence,
                         um_rx_metrics *metrics)
 {
-    size_t sync_location;
-    float sync_correlation;
+    size_t sync_location = 0u;
+    float sync_correlation = 0.0f;
     size_t ofdm_start;
     size_t hop;
     size_t carriers;
     um_complex channel[UM_FFT_SIZE];
-    um_complex training[UM_TRAINING_SYMBOLS][UM_FFT_SIZE];
+    um_complex training[UM_MAX_TRAINING_SYMBOLS][UM_FFT_SIZE];
+    float training_noise[UM_FFT_SIZE];
+    float carrier_reliability[UM_FFT_SIZE];
     double signal_energy = 0.0;
     double noise_energy = 0.0;
     size_t training_values = 0u;
@@ -573,7 +911,7 @@ int um_demodulate_frame(const um_modem_config *config,
     unsigned bin;
     size_t header_fec_bits;
     size_t header_symbol_bits;
-    size_t header_symbols;
+    size_t header_symbols = 0u;
     size_t header_capacity;
     float *header_soft = NULL;
     uint8_t header[UM_HEADER_BYTES];
@@ -588,8 +926,11 @@ int um_demodulate_frame(const um_modem_config *config,
     size_t payload_start;
     double error_energy = 0.0;
     double ideal_energy = 0.0;
-    double total_sample_energy = 0.0;
-    size_t i;
+    float *normalized_samples = NULL;
+    float input_rms = 0.0f;
+    float input_peak = 0.0f;
+    float normalization_gain = 1.0f;
+    float clipped_fraction = 0.0f;
     int status;
 
     if (um_modem_config_validate(config) != UM_OK || samples == NULL ||
@@ -599,34 +940,92 @@ int um_demodulate_frame(const um_modem_config *config,
     if (metrics != NULL) {
         memset(metrics, 0, sizeof(*metrics));
     }
-    status = locate_sync(samples, sample_count, &sync_location,
-                         &sync_correlation);
+    status = normalize_capture(samples, sample_count, &normalized_samples,
+                               &input_rms, &input_peak,
+                               &normalization_gain, &clipped_fraction);
     if (status != UM_OK) {
         return status;
     }
+    samples = normalized_samples;
+    status = locate_sync(config, samples, sample_count, &sync_location,
+                         &sync_correlation);
+    if (status != UM_OK) {
+        goto done;
+    }
     hop = config->fft_size + config->cyclic_prefix;
-    ofdm_start = sync_location + UM_SYNC_SAMPLES + UM_SYNC_GAP;
+    ofdm_start = sync_location + config->sync_samples + config->sync_gap;
     carriers = um_modem_data_carriers(config);
 
     memset(channel, 0, sizeof(channel));
-    for (training_symbol = 0u; training_symbol < UM_TRAINING_SYMBOLS;
+    memset(training_noise, 0, sizeof(training_noise));
+    memset(carrier_reliability, 0, sizeof(carrier_reliability));
+    for (training_symbol = 0u;
+         training_symbol < config->training_symbols;
          ++training_symbol) {
         status = extract_fft(config, samples, sample_count,
                              ofdm_start + training_symbol * hop,
                              training[training_symbol]);
         if (status != UM_OK) {
-            return status;
+            goto done;
         }
     }
     for (bin = config->first_bin; bin <= config->last_bin; ++bin) {
-        float sign = known_sign(bin, 0u);
-        um_complex mean = um_cscale(
-            um_cadd(training[0][bin], training[1][bin]), 0.5f * sign);
-        um_complex difference = um_csub(training[0][bin], training[1][bin]);
-        channel[bin] = mean;
+        um_complex known = known_training_value(config, bin);
+        um_complex mean = {0.0f, 0.0f};
+        double residual_energy = 0.0;
+        for (training_symbol = 0u;
+             training_symbol < config->training_symbols; ++training_symbol) {
+            mean = um_cadd(mean, training[training_symbol][bin]);
+        }
+        mean = um_cscale(mean, 1.0f / (float)config->training_symbols);
+        channel[bin] = um_cmul(mean, um_cconj(known));
+        for (training_symbol = 0u;
+             training_symbol < config->training_symbols; ++training_symbol) {
+            um_complex expected = um_cmul(channel[bin], known);
+            um_complex residual =
+                um_csub(training[training_symbol][bin], expected);
+            residual_energy += um_cabs2(residual);
+        }
+        training_noise[bin] =
+            (float)(residual_energy /
+                    (double)(config->training_symbols - 1u));
         signal_energy += um_cabs2(mean);
-        noise_energy += 0.5 * um_cabs2(difference);
+        noise_energy += training_noise[bin];
         ++training_values;
+    }
+    {
+        double average_noise = training_values != 0u
+                                   ? noise_energy / (double)training_values
+                                   : 0.0;
+        double maximum_signal = 0.0;
+        double floor_power;
+        for (bin = config->first_bin; bin <= config->last_bin; ++bin) {
+            double power = um_cabs2(channel[bin]);
+            if (power > maximum_signal) {
+                maximum_signal = power;
+            }
+        }
+        floor_power = average_noise * 0.25 + maximum_signal * 1.0e-8;
+        for (bin = config->first_bin; bin <= config->last_bin; ++bin) {
+            unsigned first = bin > config->first_bin + 3u
+                                 ? bin - 3u
+                                 : config->first_bin;
+            unsigned last = bin + 3u < config->last_bin
+                                ? bin + 3u
+                                : config->last_bin;
+            double local_noise = 0.0;
+            unsigned neighbor;
+            for (neighbor = first; neighbor <= last; ++neighbor) {
+                local_noise += training_noise[neighbor];
+            }
+            local_noise /= (double)(last - first + 1u);
+            {
+                double snr = um_cabs2(channel[bin]) /
+                             (local_noise + floor_power + 1.0e-20);
+                carrier_reliability[bin] =
+                    (float)(snr / (snr + 4.0));
+            }
+        }
     }
 
     header_fec_bits = um_fec_encoded_bits(UM_HEADER_BITS, UM_FEC_RATE_1_2);
@@ -635,12 +1034,15 @@ int um_demodulate_frame(const um_modem_config *config,
     header_capacity = header_symbols * header_symbol_bits;
     header_soft = (float *)malloc(header_capacity * sizeof(*header_soft));
     if (header_soft == NULL) {
-        return UM_ERR_MEMORY;
+        status = UM_ERR_MEMORY;
+        goto done;
     }
     status = demodulate_symbols(
         config, samples, sample_count,
-        ofdm_start + UM_TRAINING_SYMBOLS * hop, UM_TRAINING_SYMBOLS,
-        header_symbols, 2u, channel, header_soft, &error_energy,
+        ofdm_start + config->training_symbols * hop,
+        config->training_symbols,
+        header_symbols, 2u, channel, carrier_reliability, header_soft,
+        &error_energy,
         &ideal_energy);
     if (status != UM_OK) {
         goto done;
@@ -678,11 +1080,12 @@ int um_demodulate_frame(const um_modem_config *config,
         goto done;
     }
     payload_start = ofdm_start +
-                    (UM_TRAINING_SYMBOLS + header_symbols) * hop;
+                    (config->training_symbols + header_symbols) * hop;
     status = demodulate_symbols(
         config, samples, sample_count, payload_start,
-        UM_TRAINING_SYMBOLS + header_symbols, payload_symbols,
-        config->qam_bits, channel, payload_soft, &error_energy,
+        config->training_symbols + header_symbols, payload_symbols,
+        config->qam_bits, channel, carrier_reliability, payload_soft,
+        &error_energy,
         &ideal_energy);
     if (status != UM_OK) {
         goto done;
@@ -701,15 +1104,12 @@ int um_demodulate_frame(const um_modem_config *config,
 
 done:
     if (metrics != NULL) {
-        for (i = 0u; i < sample_count; ++i) {
-            total_sample_energy += (double)samples[i] * samples[i];
-        }
         metrics->sync_correlation = sync_correlation;
         metrics->frame_start = sync_location;
-        metrics->signal_rms = sample_count != 0u
-                                  ? (float)sqrt(total_sample_energy /
-                                                (double)sample_count)
-                                  : 0.0f;
+        metrics->signal_rms = input_rms;
+        metrics->input_peak = input_peak;
+        metrics->normalization_gain = normalization_gain;
+        metrics->clipped_sample_fraction = clipped_fraction;
         metrics->noise_rms = training_values != 0u
                                  ? (float)sqrt(noise_energy /
                                                (double)training_values)
@@ -721,10 +1121,11 @@ done:
         metrics->evm_rms = ideal_energy > 0.0
                                ? (float)sqrt(error_energy / ideal_energy)
                                : 0.0f;
-        metrics->ofdm_symbols = UM_TRAINING_SYMBOLS + header_symbols +
+        metrics->ofdm_symbols = config->training_symbols + header_symbols +
                                 (status == UM_OK ? decoded_payload_symbols : 0u);
     }
     free(payload_soft);
     free(header_soft);
+    free(normalized_samples);
     return status;
 }
