@@ -5,196 +5,357 @@
 #include <string.h>
 
 typedef struct {
-    unsigned first_bin;
-    unsigned last_bin;
-} frequency_range;
-
-typedef struct {
     um_modem_config config;
+    size_t candidate_id;
     float score;
     float payload_bps;
     float evm_rms;
     int baseline;
 } viable_candidate;
 
-static const frequency_range default_ranges[] = {
-    {48u, 362u}, {64u, 490u}, {128u, 640u}
-};
+#define CALIBRATION_DEFAULT_BUDGET 12u
+#define CALIBRATION_HIGH_BUDGET 64u
 
-static const frequency_range high_ranges[] = {
-    {48u, 320u}, {48u, 448u}, {48u, 576u}, {64u, 362u},
-    {64u, 490u}, {64u, 640u}, {96u, 448u}, {96u, 576u},
-    {128u, 640u}, {128u, 768u}
-};
-
-static const unsigned qam_options[] = {2u, 4u, 6u};
-static const unsigned default_prefixes[] = {384u, 768u, 1024u};
-static const unsigned high_prefixes[] = {256u, 384u, 512u, 640u,
-                                         768u, 896u, 1024u};
-static const unsigned default_windows[] = {64u};
-static const unsigned high_windows[] = {0u, 32u, 64u, 128u};
-static const um_fec_rate fec_options[] = {UM_FEC_RATE_1_2, UM_FEC_RATE_2_3,
-                                          UM_FEC_RATE_3_4};
-
-/* High-quality live calibration samples the full grid uniformly. */
-static size_t live_high_candidate_count(void)
+static size_t divide_round_up(size_t value, size_t divisor)
 {
-    size_t count = 0u;
-    size_t valid = 0u;
-    size_t range_index;
-    size_t qam_index;
-    size_t prefix_index;
-    size_t fec_index;
-    size_t window_index;
-    for (range_index = 0u;
-         range_index < sizeof(high_ranges) / sizeof(high_ranges[0]);
-         ++range_index) {
-        for (qam_index = 0u;
-             qam_index < sizeof(qam_options) / sizeof(qam_options[0]);
-             ++qam_index) {
-            for (prefix_index = 0u;
-                 prefix_index < sizeof(high_prefixes) /
-                                    sizeof(high_prefixes[0]);
-                 ++prefix_index) {
-                for (fec_index = 0u;
-                     fec_index < sizeof(fec_options) / sizeof(fec_options[0]);
-                     ++fec_index) {
-                    for (window_index = 0u;
-                         window_index < sizeof(high_windows) /
-                                            sizeof(high_windows[0]);
-                         ++window_index) {
-                        um_modem_config candidate = um_modem_default_config();
-                        candidate.first_bin = high_ranges[range_index].first_bin;
-                        candidate.last_bin = high_ranges[range_index].last_bin;
-                        candidate.qam_bits = qam_options[qam_index];
-                        candidate.cyclic_prefix = high_prefixes[prefix_index];
-                        candidate.fec_rate = fec_options[fec_index];
-                        candidate.window_samples = high_windows[window_index];
-                        if (um_modem_config_validate(&candidate) != UM_OK) {
-                            continue;
-                        }
-                        if (valid++ % 27u == 0u) {
-                            ++count;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return count;
+    return value / divisor + (value % divisor != 0u ? 1u : 0u);
 }
 
-size_t um_live_calibration_candidate_count(int high_quality)
+static int config_equal(const um_modem_config *left,
+                        const um_modem_config *right)
 {
-    if (high_quality != 0) {
-        return 1u + live_high_candidate_count();
-    }
-    return 10u;
+    return left->fft_size == right->fft_size &&
+           left->first_bin == right->first_bin &&
+           left->last_bin == right->last_bin &&
+           left->cyclic_prefix == right->cyclic_prefix &&
+           left->window_samples == right->window_samples &&
+           left->sync_samples == right->sync_samples &&
+           left->sync_gap == right->sync_gap &&
+           left->training_symbols == right->training_symbols &&
+           left->symbol_repetitions == right->symbol_repetitions &&
+           left->qam_bits == right->qam_bits &&
+           left->fec_rate == right->fec_rate;
 }
 
-int um_live_calibration_candidate_get(int high_quality, size_t index,
-                                      um_modem_config *config)
+float um_calibration_payload_rate(const um_modem_config *config,
+                                  size_t payload_bytes)
 {
-    const frequency_range *ranges = high_quality != 0 ? high_ranges
-                                                       : default_ranges;
-    size_t range_count = high_quality != 0
-                             ? sizeof(high_ranges) / sizeof(high_ranges[0])
-                             : sizeof(default_ranges) /
-                                   sizeof(default_ranges[0]);
-    const unsigned *prefixes = high_quality != 0 ? high_prefixes
-                                                  : default_prefixes;
-    size_t prefix_count = high_quality != 0
-                              ? sizeof(high_prefixes) /
-                                    sizeof(high_prefixes[0])
-                              : sizeof(default_prefixes) /
-                                    sizeof(default_prefixes[0]);
-    const unsigned *windows = high_quality != 0 ? high_windows
-                                                 : default_windows;
-    size_t window_count = high_quality != 0
-                              ? sizeof(high_windows) / sizeof(high_windows[0])
-                              : sizeof(default_windows) /
-                                    sizeof(default_windows[0]);
-    size_t current = 0u;
-    size_t selected_index = 0u;
-    size_t range_index;
-    size_t qam_index;
-    size_t prefix_index;
-    size_t fec_index;
-    size_t window_index;
-    if (config == NULL) {
-        return UM_ERR_ARGUMENT;
-    }
-    /* Candidate zero is the non-negotiable working baseline. */
-    if (index == 0u) {
-        *config = um_modem_robust_config();
-        return um_modem_config_validate(config);
-    }
-    --index;
-    if (high_quality == 0) {
-        size_t range;
-        size_t qam;
-        if (index >= 9u) {
-            return UM_ERR_ARGUMENT;
-        }
-        range = index / 3u;
-        qam = index % 3u;
-        *config = um_modem_default_config();
-        config->first_bin = default_ranges[range].first_bin;
-        config->last_bin = default_ranges[range].last_bin;
-        config->qam_bits = qam_options[qam];
-        config->cyclic_prefix = default_prefixes[(range + qam) % 3u];
-        config->fec_rate = fec_options[(range + 2u * qam) % 3u];
-        config->window_samples = default_windows[0];
-        return um_modem_config_validate(config);
-    }
-    for (range_index = 0u; range_index < range_count; ++range_index) {
-        for (qam_index = 0u;
-             qam_index < sizeof(qam_options) / sizeof(qam_options[0]);
-             ++qam_index) {
-            for (prefix_index = 0u; prefix_index < prefix_count;
-                 ++prefix_index) {
-                for (fec_index = 0u;
-                     fec_index < sizeof(fec_options) / sizeof(fec_options[0]);
-                     ++fec_index) {
-                    for (window_index = 0u; window_index < window_count;
-                         ++window_index) {
-                        um_modem_config candidate = um_modem_default_config();
-                        candidate.first_bin = ranges[range_index].first_bin;
-                        candidate.last_bin = ranges[range_index].last_bin;
-                        candidate.qam_bits = qam_options[qam_index];
-                        candidate.cyclic_prefix = prefixes[prefix_index];
-                        candidate.fec_rate = fec_options[fec_index];
-                        candidate.window_samples = windows[window_index];
-                        if (um_modem_config_validate(&candidate) != UM_OK) {
-                            continue;
-                        }
-                        if (current++ % 27u != 0u) {
-                            continue;
-                        }
-                        if (selected_index++ == index) {
-                            *config = candidate;
-                            return UM_OK;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return UM_ERR_ARGUMENT;
-}
-
-static float fec_ratio(um_fec_rate rate)
-{
-    switch (rate) {
-    case UM_FEC_RATE_1_2:
-        return 0.5f;
-    case UM_FEC_RATE_2_3:
-        return 2.0f / 3.0f;
-    case UM_FEC_RATE_3_4:
-        return 0.75f;
-    default:
+    size_t carriers;
+    size_t header_bits;
+    size_t payload_bits;
+    size_t header_symbols;
+    size_t payload_symbols;
+    size_t total_symbols;
+    size_t sample_count;
+    if (um_modem_config_validate(config) != UM_OK || payload_bytes == 0u ||
+        payload_bytes > UM_MAX_PAYLOAD) {
         return 0.0f;
     }
+    carriers = um_modem_data_carriers(config);
+    header_bits = um_fec_encoded_bits(UM_HEADER_BITS, UM_FEC_RATE_1_2);
+    payload_bits = um_fec_encoded_bits(payload_bytes * 8u, config->fec_rate);
+    header_symbols = divide_round_up(header_bits, carriers * 2u);
+    payload_symbols =
+        divide_round_up(payload_bits, carriers * config->qam_bits);
+    total_symbols = config->training_symbols +
+                    (header_symbols + payload_symbols) *
+                        config->symbol_repetitions;
+    sample_count = UM_SYNC_LEAD + config->sync_samples + config->sync_gap +
+                   total_symbols *
+                       (config->fft_size + config->cyclic_prefix) +
+                   config->window_samples + 64u;
+    return (float)(payload_bytes * 8u) * (float)UM_SAMPLE_RATE /
+           (float)sample_count;
+}
+
+size_t um_calibration_search_budget(int high_quality)
+{
+    return high_quality != 0 ? CALIBRATION_HIGH_BUDGET
+                             : CALIBRATION_DEFAULT_BUDGET;
+}
+
+const char *um_calibration_step_name(um_calibration_step step)
+{
+    switch (step) {
+    case UM_CALIB_STEP_BASELINE:
+        return "working-baseline";
+    case UM_CALIB_STEP_REPETITIONS:
+        return "fewer-repetitions";
+    case UM_CALIB_STEP_QAM:
+        return "higher-qam";
+    case UM_CALIB_STEP_FEC:
+        return "higher-code-rate";
+    case UM_CALIB_STEP_PREFIX:
+        return "shorter-prefix";
+    case UM_CALIB_STEP_HIGH_BAND:
+        return "wider-high-band";
+    case UM_CALIB_STEP_LOW_BAND:
+        return "wider-low-band";
+    case UM_CALIB_STEP_SYNC:
+        return "shorter-sync";
+    case UM_CALIB_STEP_GAP:
+        return "shorter-settling-gap";
+    case UM_CALIB_STEP_TRAINING:
+        return "less-training";
+    case UM_CALIB_STEP_NARROW_BAND:
+        return "narrower-clean-band";
+    case UM_CALIB_STEP_WINDOW:
+        return "shorter-window";
+    default:
+        return "unknown";
+    }
+}
+
+static float search_step_bias(um_calibration_step step)
+{
+    switch (step) {
+    case UM_CALIB_STEP_REPETITIONS:
+        return 1.08f;
+    case UM_CALIB_STEP_QAM:
+        return 1.07f;
+    case UM_CALIB_STEP_FEC:
+        return 1.06f;
+    case UM_CALIB_STEP_HIGH_BAND:
+    case UM_CALIB_STEP_LOW_BAND:
+        return 1.04f;
+    case UM_CALIB_STEP_SYNC:
+    case UM_CALIB_STEP_GAP:
+        return 1.03f;
+    case UM_CALIB_STEP_PREFIX:
+    case UM_CALIB_STEP_TRAINING:
+        return 1.02f;
+    case UM_CALIB_STEP_NARROW_BAND:
+        return 0.85f;
+    case UM_CALIB_STEP_WINDOW:
+        return 0.98f;
+    default:
+        return 1.0f;
+    }
+}
+
+static int search_add(um_calibration_search *search, size_t parent,
+                      um_calibration_step step,
+                      const um_modem_config *config)
+{
+    size_t index;
+    if (um_modem_config_validate(config) != UM_OK) {
+        return UM_OK;
+    }
+    for (index = 0u; index < search->node_count; ++index) {
+        if (config_equal(config, &search->nodes[index].config) != 0) {
+            return UM_OK;
+        }
+    }
+    if (search->node_count == UM_CALIBRATION_SEARCH_MAX_NODES) {
+        /* The bounded frontier already contains more than either probe budget. */
+        return UM_OK;
+    }
+    index = search->node_count++;
+    search->nodes[index].config = *config;
+    search->nodes[index].priority =
+        um_calibration_payload_rate(config, 128u) * search_step_bias(step);
+    search->nodes[index].parent = parent;
+    search->nodes[index].step = step;
+    search->nodes[index].tested = 0;
+    search->nodes[index].passed = 0;
+    return UM_OK;
+}
+
+static unsigned next_lower_value(unsigned current, const unsigned *values,
+                                 size_t count)
+{
+    size_t index;
+    for (index = 0u; index < count; ++index) {
+        if (values[index] < current) {
+            return values[index];
+        }
+    }
+    return current;
+}
+
+static unsigned next_higher_value(unsigned current, const unsigned *values,
+                                  size_t count)
+{
+    size_t index;
+    for (index = 0u; index < count; ++index) {
+        if (values[index] > current) {
+            return values[index];
+        }
+    }
+    return current;
+}
+
+static int search_expand(um_calibration_search *search, size_t parent)
+{
+    static const unsigned prefix_values[] = {1024u, 896u, 768u, 640u,
+                                             512u, 384u, 256u, 128u};
+    static const unsigned high_values[] = {298u, 362u, 448u, 512u,
+                                           640u, 768u};
+    static const unsigned low_values[] = {128u, 96u, 64u, 48u};
+    static const unsigned narrow_values[] = {48u, 64u, 96u, 128u};
+    static const unsigned sync_values[] = {2048u, 1536u, 1024u};
+    static const unsigned gap_values[] = {3072u, 2560u, 2048u};
+    static const unsigned window_values[] = {96u, 64u, 32u, 0u};
+    const um_modem_config *base = &search->nodes[parent].config;
+    um_modem_config candidate;
+    unsigned value;
+    int status;
+
+#define ADD_CHANGED(field, changed_value, changed_step)                         \
+    do {                                                                        \
+        candidate = *base;                                                      \
+        candidate.field = (changed_value);                                      \
+        status = search_add(search, parent, (changed_step), &candidate);        \
+        if (status != UM_OK) {                                                  \
+            return status;                                                      \
+        }                                                                       \
+    } while (0)
+
+    if (base->symbol_repetitions > 1u) {
+        ADD_CHANGED(symbol_repetitions, base->symbol_repetitions - 1u,
+                    UM_CALIB_STEP_REPETITIONS);
+    }
+    if (base->qam_bits < 6u) {
+        ADD_CHANGED(qam_bits, base->qam_bits + 2u, UM_CALIB_STEP_QAM);
+    }
+    if (base->fec_rate < UM_FEC_RATE_3_4) {
+        ADD_CHANGED(fec_rate, (um_fec_rate)(base->fec_rate + 1),
+                    UM_CALIB_STEP_FEC);
+    }
+    value = next_lower_value(base->cyclic_prefix, prefix_values,
+                             sizeof(prefix_values) / sizeof(prefix_values[0]));
+    if (value != base->cyclic_prefix) {
+        ADD_CHANGED(cyclic_prefix, value, UM_CALIB_STEP_PREFIX);
+    }
+    value = next_higher_value(base->last_bin, high_values,
+                              search->high_quality != 0
+                                  ? sizeof(high_values) / sizeof(high_values[0])
+                                  : 4u);
+    if (value != base->last_bin) {
+        ADD_CHANGED(last_bin, value, UM_CALIB_STEP_HIGH_BAND);
+    }
+    value = next_lower_value(base->first_bin, low_values,
+                             sizeof(low_values) / sizeof(low_values[0]));
+    if (value != base->first_bin) {
+        ADD_CHANGED(first_bin, value, UM_CALIB_STEP_LOW_BAND);
+    }
+    if (base->training_symbols > 3u) {
+        ADD_CHANGED(training_symbols, base->training_symbols - 1u,
+                    UM_CALIB_STEP_TRAINING);
+    }
+    if (search->high_quality != 0) {
+        value = next_lower_value(base->sync_samples, sync_values,
+                                 sizeof(sync_values) /
+                                     sizeof(sync_values[0]));
+        if (value != base->sync_samples) {
+            ADD_CHANGED(sync_samples, value, UM_CALIB_STEP_SYNC);
+        }
+        value = next_lower_value(base->sync_gap, gap_values,
+                                 sizeof(gap_values) / sizeof(gap_values[0]));
+        if (value != base->sync_gap) {
+            ADD_CHANGED(sync_gap, value, UM_CALIB_STEP_GAP);
+        }
+        value = next_higher_value(
+            base->first_bin, narrow_values,
+            sizeof(narrow_values) / sizeof(narrow_values[0]));
+        if (value != base->first_bin && value < base->last_bin) {
+            ADD_CHANGED(first_bin, value, UM_CALIB_STEP_NARROW_BAND);
+        }
+        value = next_lower_value(base->window_samples, window_values,
+                                 sizeof(window_values) /
+                                     sizeof(window_values[0]));
+        if (value != base->window_samples) {
+            ADD_CHANGED(window_samples, value, UM_CALIB_STEP_WINDOW);
+        }
+    }
+#undef ADD_CHANGED
+    return UM_OK;
+}
+
+int um_calibration_search_init(um_calibration_search *search, int high_quality)
+{
+    um_modem_config baseline;
+    if (search == NULL) {
+        return UM_ERR_ARGUMENT;
+    }
+    memset(search, 0, sizeof(*search));
+    search->high_quality = high_quality != 0;
+    search->budget = um_calibration_search_budget(high_quality);
+    baseline = um_modem_robust_config();
+    return search_add(search, 0u, UM_CALIB_STEP_BASELINE, &baseline);
+}
+
+static int search_step_was_tested(const um_calibration_search *search,
+                                  um_calibration_step step)
+{
+    size_t index;
+    for (index = 0u; index < search->node_count; ++index) {
+        if (search->nodes[index].tested != 0 &&
+            search->nodes[index].step == step) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int um_calibration_search_next(um_calibration_search *search,
+                               size_t *candidate_id,
+                               um_modem_config *config,
+                               um_calibration_step *step)
+{
+    size_t best = SIZE_MAX;
+    size_t index;
+    if (search == NULL || candidate_id == NULL || config == NULL ||
+        step == NULL) {
+        return UM_ERR_ARGUMENT;
+    }
+    if (search->tested_count >= search->budget) {
+        return 0;
+    }
+    for (index = 0u; index < search->node_count; ++index) {
+        if (search->nodes[index].tested == 0) {
+            float priority =
+                search->nodes[index].priority *
+                (search_step_was_tested(search, search->nodes[index].step) != 0
+                     ? 1.0f
+                     : 100.0f);
+            float best_priority = 0.0f;
+            if (best != SIZE_MAX) {
+                best_priority = search->nodes[best].priority *
+                                (search_step_was_tested(
+                                     search, search->nodes[best].step) != 0
+                                     ? 1.0f
+                                     : 100.0f);
+            }
+            if (best == SIZE_MAX || priority > best_priority) {
+                best = index;
+            }
+        }
+    }
+    if (best == SIZE_MAX) {
+        return 0;
+    }
+    search->nodes[best].tested = 1;
+    ++search->tested_count;
+    *candidate_id = best;
+    *config = search->nodes[best].config;
+    *step = search->nodes[best].step;
+    return 1;
+}
+
+int um_calibration_search_record(um_calibration_search *search,
+                                 size_t candidate_id, int passed)
+{
+    if (search == NULL || candidate_id >= search->node_count ||
+        search->nodes[candidate_id].tested == 0) {
+        return UM_ERR_ARGUMENT;
+    }
+    search->nodes[candidate_id].passed = passed != 0;
+    if (passed == 0) {
+        return UM_OK;
+    }
+    ++search->passed_count;
+    return search_expand(search, candidate_id);
 }
 
 static const char *fec_name(um_fec_rate rate)
@@ -291,46 +452,55 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
 {
     uint8_t probe[32];
     uint8_t verification_probe[128];
-    size_t candidate_count = um_live_calibration_candidate_count(high_quality);
+    um_calibration_search search;
     viable_candidate *viable = NULL;
     size_t viable_count = 0u;
-    size_t candidate_index;
+    int search_status;
 
-    if (channel == NULL || result == NULL || candidate_count == 0u) {
+    if (channel == NULL || result == NULL) {
         return UM_ERR_ARGUMENT;
     }
     memset(result, 0, sizeof(*result));
     result->config = um_modem_robust_config();
     fill_probe(probe, sizeof(probe), UINT32_C(0xc001d00d));
-    viable = (viable_candidate *)malloc(candidate_count * sizeof(*viable));
+    search_status = um_calibration_search_init(&search, high_quality);
+    if (search_status != UM_OK) {
+        return search_status;
+    }
+    viable = (viable_candidate *)malloc(search.budget * sizeof(*viable));
     if (viable == NULL) {
         return UM_ERR_MEMORY;
     }
 
-    for (candidate_index = 0u; candidate_index < candidate_count;
-         ++candidate_index) {
+    while (1) {
         um_modem_config candidate;
+        um_calibration_step step;
+        size_t candidate_id;
         um_rx_metrics metrics;
         float duration = 0.0f;
         float payload_bps = 0.0f;
         float raw_bps;
         float quality;
         float score;
-        int baseline = candidate_index == 0u;
+        int baseline;
         int reliable;
         int status;
         char line[320];
 
-        status = um_live_calibration_candidate_get(
-            high_quality, candidate_index, &candidate);
-        if (status != UM_OK) {
+        search_status = um_calibration_search_next(
+            &search, &candidate_id, &candidate, &step);
+        if (search_status < 0) {
             free(viable);
-            return status;
+            return search_status;
         }
+        if (search_status == 0) {
+            break;
+        }
+        baseline = candidate_id == 0u;
         ++result->candidates_tested;
         memset(&metrics, 0, sizeof(metrics));
         status = try_candidate(
-            &candidate, channel, (uint32_t)result->candidates_tested, probe,
+            &candidate, channel, (uint32_t)candidate_id + 1u, probe,
             sizeof(probe), &duration, &payload_bps, &metrics);
         if (status == UM_ERR_MEMORY) {
             free(viable);
@@ -342,11 +512,7 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                         : um_modem_metrics_have_margin(&candidate, &metrics)) !=
                        0;
         result->estimated_seconds += duration;
-        raw_bps = (float)um_modem_data_carriers(&candidate) *
-                  (float)candidate.qam_bits * fec_ratio(candidate.fec_rate) *
-                  (float)UM_SAMPLE_RATE /
-                  ((float)(candidate.fft_size + candidate.cyclic_prefix) *
-                   (float)candidate.symbol_repetitions);
+        raw_bps = um_calibration_payload_rate(&candidate, 128u);
         quality = reliable != 0
                       ? 1.0f /
                             (1.0f + 4.0f * metrics.evm_rms * metrics.evm_rms)
@@ -362,6 +528,7 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
         if (reliable != 0) {
             ++result->candidates_viable;
             viable[viable_count].config = candidate;
+            viable[viable_count].candidate_id = candidate_id;
             viable[viable_count].score = score;
             viable[viable_count].payload_bps = payload_bps;
             viable[viable_count].evm_rms = metrics.evm_rms;
@@ -371,10 +538,13 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
         if (logger != NULL) {
             (void)snprintf(
                 line, sizeof(line),
-                "calib %zu%s band=%.0f-%.0fHz qam=%u cp=%.2fms fec=%s "
+                "calib %zu id=%zu step=%s%s band=%.0f-%.0fHz qam=%u "
+                "cp=%.2fms fec=%s "
                 "win=%u repeats=%u: %s snr=%.1fdB evm=%.3f "
                 "payload=%.0fbps score=%.0f",
-                result->candidates_tested, baseline != 0 ? " baseline" : "",
+                result->candidates_tested, candidate_id,
+                um_calibration_step_name(step),
+                baseline != 0 ? " baseline" : "",
                 (double)candidate.first_bin * (double)UM_SAMPLE_RATE /
                     (double)candidate.fft_size,
                 (double)candidate.last_bin * (double)UM_SAMPLE_RATE /
@@ -391,6 +561,12 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                 metrics.estimated_snr_db, metrics.evm_rms, payload_bps,
                 score);
             logger(logger_context, line);
+        }
+        search_status = um_calibration_search_record(
+            &search, candidate_id, reliable);
+        if (search_status != UM_OK) {
+            free(viable);
+            return search_status;
         }
         if (baseline != 0 && reliable == 0) {
             free(viable);
@@ -412,7 +588,8 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                 float duration = 0.0f;
                 float payload_bps = 0.0f;
                 uint32_t seed = UINT32_C(0x10000) +
-                                (uint32_t)(rank * verification_trials + trial);
+                                (uint32_t)(viable[rank].candidate_id * 17u +
+                                           trial);
                 int status;
                 int reliable;
                 char line[256];

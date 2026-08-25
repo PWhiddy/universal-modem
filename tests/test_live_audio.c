@@ -14,6 +14,9 @@
 
 enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
 
+/* CoreAudio capture callbacks can resume after AudioQueueStart returns. */
+#define SIM_CAPTURE_START_MS 60u
+
 typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t changed;
@@ -24,6 +27,9 @@ typedef struct {
     int capture_enabled[SIM_ENDPOINTS];
     um_channel_config channel[SIM_ENDPOINTS];
     uint32_t transmission;
+    int verify_drop_endpoint;
+    int verify_drop_armed;
+    unsigned verification_drops;
     int runners_done;
 } simulated_bus;
 
@@ -37,6 +43,9 @@ static simulated_bus bus = {
     {0, 0},
     {{0}, {0}},
     0u,
+    -1,
+    0,
+    0u,
     0
 };
 
@@ -49,11 +58,14 @@ typedef struct {
     um_live_audio_options options;
     int status;
     size_t log_count;
-    char logs[160][512];
+    char logs[256][512];
     unsigned connected;
     unsigned calibrating;
     unsigned baseline_passes;
+    unsigned calibration_selections;
     unsigned baseline_selections;
+    unsigned adaptive_upgrades;
+    unsigned verification_fallbacks;
     unsigned forward_transfer;
     unsigned reverse_transfer;
     unsigned completed;
@@ -84,12 +96,31 @@ static void test_log(void *context, const char *message)
     if (strstr(message, "state=CALIBRATING direction=") != NULL) {
         ++run->calibrating;
     }
-    if (strstr(message, "calib rx=1/10 PASS") != NULL) {
+    if (strstr(message, "id=0 step=working-baseline PASS") != NULL) {
         ++run->baseline_passes;
     }
-    if (strstr(message, "calib selected") != NULL &&
-        strstr(message, "index=0") != NULL) {
-        ++run->baseline_selections;
+    if (strstr(message, "calib selected") != NULL) {
+        ++run->calibration_selections;
+        if (strstr(message, "id=0") != NULL) {
+            ++run->baseline_selections;
+        } else {
+            ++run->adaptive_upgrades;
+        }
+    }
+    if (strstr(message,
+               "FAIL; trying safer ranked candidate") != NULL) {
+        ++run->verification_fallbacks;
+    }
+    if (strstr(message, "calib verify rank=1 id=") != NULL) {
+        int endpoint = run->options.role == UM_LIVE_CLIENT
+                           ? SIM_CLIENT
+                           : SIM_GATEWAY;
+        (void)pthread_mutex_lock(&bus.mutex);
+        if (bus.verify_drop_endpoint == endpoint &&
+            bus.verification_drops == 0u) {
+            bus.verify_drop_armed = 1;
+        }
+        (void)pthread_mutex_unlock(&bus.mutex);
     }
     if (strstr(message,
                "state=TEST_TRANSFER direction=client->gateway") != NULL) {
@@ -189,6 +220,14 @@ int um_audio_capture_enable(um_audio *audio, int enabled)
     if (audio == NULL) {
         return UM_ERR_ARGUMENT;
     }
+    if (enabled != 0) {
+        struct timespec start_delay = {
+            (time_t)(SIM_CAPTURE_START_MS / 1000u),
+            (long)(SIM_CAPTURE_START_MS % 1000u) * 1000000L
+        };
+        while (nanosleep(&start_delay, &start_delay) != 0 && errno == EINTR) {
+        }
+    }
     (void)pthread_mutex_lock(&bus.mutex);
     bus.capture_enabled[audio->endpoint] = enabled != 0;
     if (enabled == 0) {
@@ -261,6 +300,7 @@ int um_audio_write(um_audio *audio, const float *samples, size_t frame_count)
     size_t received_count = 0u;
     size_t needed;
     int peer;
+    int drop_write = 0;
     int status;
     if (audio == NULL || (frame_count != 0u && samples == NULL)) {
         return UM_ERR_ARGUMENT;
@@ -270,7 +310,16 @@ int um_audio_write(um_audio *audio, const float *samples, size_t frame_count)
     channel = bus.channel[audio->endpoint];
     channel.random_seed ^=
         ++bus.transmission * UINT32_C(0x9e3779b9);
+    if (bus.verify_drop_armed != 0 &&
+        bus.verify_drop_endpoint == audio->endpoint) {
+        bus.verify_drop_armed = 0;
+        ++bus.verification_drops;
+        drop_write = 1;
+    }
     (void)pthread_mutex_unlock(&bus.mutex);
+    if (drop_write != 0) {
+        return UM_OK;
+    }
     status = um_channel_apply(samples, frame_count, &channel, &received,
                               &received_count);
     if (status != UM_OK) {
@@ -337,16 +386,38 @@ static void print_logs(const runner *run)
     }
 }
 
-static int check_runner(const runner *run)
+static int check_runner(const runner *run, int require_upgrade,
+                        int require_baseline)
 {
     return run->status == UM_OK && run->connected == 1u &&
            run->calibrating == 2u && run->baseline_passes >= 1u &&
-           run->baseline_selections >= 2u && run->forward_transfer == 1u &&
+           run->calibration_selections == 2u &&
+           (require_upgrade == 0 || run->adaptive_upgrades >= 1u) &&
+           (require_baseline == 0 || run->baseline_selections >= 1u) &&
+           run->forward_transfer == 1u &&
            run->reverse_transfer == 1u && run->completed == 1u &&
            run->reconnecting == 0u;
 }
 
-int main(void)
+static void configure_runner(runner *run, const char *name,
+                             um_live_role role, const char *device)
+{
+    memset(run, 0, sizeof(*run));
+    run->name = name;
+    run->options = um_live_audio_default_options(role);
+    run->options.input_device = device;
+    run->options.output_device = device;
+    run->options.test_bytes = 256u;
+    run->options.chunk_bytes = 64u;
+    run->options.retry_limit = 5u;
+    run->options.discovery_interval_seconds = 0.4f;
+}
+
+static int run_pair(const char *label,
+                    const um_channel_config *client_to_gateway,
+                    const um_channel_config *gateway_to_client,
+                    int require_upgrade, int require_baseline,
+                    int inject_verification_fallback)
 {
     runner client;
     runner gateway;
@@ -356,29 +427,24 @@ int main(void)
     int timed_out = 0;
     int status;
 
-    memset(&client, 0, sizeof(client));
-    memset(&gateway, 0, sizeof(gateway));
-    client.name = "client";
-    gateway.name = "gateway";
-    client.options = um_live_audio_default_options(UM_LIVE_CLIENT);
-    gateway.options = um_live_audio_default_options(UM_LIVE_GATEWAY);
-    client.options.input_device = "sim-client";
-    client.options.output_device = "sim-client";
-    gateway.options.input_device = "sim-gateway";
-    gateway.options.output_device = "sim-gateway";
-    client.options.test_bytes = 256u;
-    gateway.options.test_bytes = 256u;
-    client.options.chunk_bytes = 64u;
-    gateway.options.chunk_bytes = 64u;
-    client.options.retry_limit = 5u;
-    gateway.options.retry_limit = 5u;
-    client.options.discovery_interval_seconds = 0.4f;
-    gateway.options.discovery_interval_seconds = 0.4f;
+    configure_runner(&client, "client", UM_LIVE_CLIENT, "sim-client");
+    configure_runner(&gateway, "gateway", UM_LIVE_GATEWAY, "sim-gateway");
 
     (void)pthread_mutex_lock(&bus.mutex);
-    bus.channel[SIM_CLIENT] = um_channel_recorded_v2_config(0u);
-    bus.channel[SIM_GATEWAY] = um_channel_recorded_v2_config(1u);
+    bus.channel[SIM_CLIENT] = *client_to_gateway;
+    bus.channel[SIM_GATEWAY] = *gateway_to_client;
+    bus.queued_count[SIM_CLIENT] = 0u;
+    bus.queued_count[SIM_GATEWAY] = 0u;
+    bus.opened[SIM_CLIENT] = 0;
+    bus.opened[SIM_GATEWAY] = 0;
+    bus.capture_enabled[SIM_CLIENT] = 0;
+    bus.capture_enabled[SIM_GATEWAY] = 0;
     bus.transmission = 0u;
+    bus.verify_drop_endpoint = inject_verification_fallback != 0
+                                   ? SIM_CLIENT
+                                   : -1;
+    bus.verify_drop_armed = 0;
+    bus.verification_drops = 0u;
     bus.runners_done = 0;
     (void)pthread_mutex_unlock(&bus.mutex);
 
@@ -425,22 +491,49 @@ int main(void)
     (void)pthread_join(client_thread, NULL);
     (void)pthread_join(gateway_thread, NULL);
 
-    if (timed_out != 0 || !check_runner(&client) ||
-        !check_runner(&gateway)) {
+    if (timed_out != 0 ||
+        !check_runner(&client, require_upgrade, require_baseline) ||
+        !check_runner(&gateway, require_upgrade, require_baseline) ||
+        (inject_verification_fallback != 0 &&
+         (bus.verification_drops != 1u ||
+          client.verification_fallbacks == 0u))) {
         fprintf(stderr,
-                "paired live simulation failed timeout=%d client=%s "
+                "%s paired live simulation failed timeout=%d client=%s "
                 "gateway=%s\n",
-                timed_out, um_status_string(client.status),
+                label, timed_out, um_status_string(client.status),
                 um_status_string(gateway.status));
         print_logs(&client);
         print_logs(&gateway);
         return 1;
     }
-    printf("paired live v2 simulation passed: connection, 2-way calibration, "
-           "256+256 bytes; baseline selections=%u/%u\n",
-           client.baseline_selections, gateway.baseline_selections);
+    printf("paired live %s passed: connection, adaptive 2-way calibration, "
+           "delayed capture restart, 256+256 bytes; upgrades=%u/%u "
+           "fallbacks=%u/%u verification-stepdowns=%u\n",
+           label, client.adaptive_upgrades, gateway.adaptive_upgrades,
+           client.baseline_selections, gateway.baseline_selections,
+           client.verification_fallbacks + gateway.verification_fallbacks);
+    return 0;
+}
+
+int main(void)
+{
+    um_channel_config v2_forward = um_channel_recorded_v2_config(0u);
+    um_channel_config v2_reverse = um_channel_recorded_v2_config(1u);
+    um_distortion_profile strong;
+    int status;
+
+    status = run_pair("v2-worse", &v2_forward, &v2_reverse, 1, 0, 1);
+    if (status == 0) {
+        if (um_distortion_profile_get(5u, &strong) != UM_OK) {
+            fprintf(stderr, "could not load baseline-fallback distortion\n");
+            status = 1;
+        } else {
+            status = run_pair("baseline-fallback", &strong.client_to_gateway,
+                              &strong.gateway_to_client, 0, 1, 0);
+        }
+    }
 
     free(bus.queued[SIM_CLIENT]);
     free(bus.queued[SIM_GATEWAY]);
-    return 0;
+    return status;
 }

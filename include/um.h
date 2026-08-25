@@ -230,9 +230,6 @@ int um_distortion_profile_get(size_t level, um_distortion_profile *profile);
 int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                            um_calibration_result *result,
                            um_log_callback logger, void *logger_context);
-size_t um_live_calibration_candidate_count(int high_quality);
-int um_live_calibration_candidate_get(int high_quality, size_t index,
-                                      um_modem_config *config);
 
 um_session_simulation_config um_session_simulation_default_config(void);
 int um_simulate_session(const um_session_simulation_config *config,

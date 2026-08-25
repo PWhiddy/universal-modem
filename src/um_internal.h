@@ -19,6 +19,40 @@
 #define UM_HEADER_BITS (UM_HEADER_BYTES * 8u)
 #define UM_FEC_TAIL_BITS 6u
 #define UM_MAX_PAYLOAD 65535u
+#define UM_CALIBRATION_SEARCH_MAX_NODES 192u
+
+typedef enum {
+    UM_CALIB_STEP_BASELINE = 0,
+    UM_CALIB_STEP_REPETITIONS,
+    UM_CALIB_STEP_QAM,
+    UM_CALIB_STEP_FEC,
+    UM_CALIB_STEP_PREFIX,
+    UM_CALIB_STEP_HIGH_BAND,
+    UM_CALIB_STEP_LOW_BAND,
+    UM_CALIB_STEP_SYNC,
+    UM_CALIB_STEP_GAP,
+    UM_CALIB_STEP_TRAINING,
+    UM_CALIB_STEP_NARROW_BAND,
+    UM_CALIB_STEP_WINDOW
+} um_calibration_step;
+
+typedef struct {
+    um_modem_config config;
+    float priority;
+    size_t parent;
+    um_calibration_step step;
+    int tested;
+    int passed;
+} um_calibration_search_node;
+
+typedef struct {
+    int high_quality;
+    size_t budget;
+    size_t node_count;
+    size_t tested_count;
+    size_t passed_count;
+    um_calibration_search_node nodes[UM_CALIBRATION_SEARCH_MAX_NODES];
+} um_calibration_search;
 
 static inline um_complex um_cadd(um_complex a, um_complex b)
 {
@@ -82,5 +116,17 @@ um_channel_config um_channel_recorded_v2_config(unsigned direction);
 int um_modem_metrics_have_baseline_margin(const um_rx_metrics *metrics);
 int um_modem_metrics_have_margin(const um_modem_config *config,
                                  const um_rx_metrics *metrics);
+size_t um_calibration_search_budget(int high_quality);
+int um_calibration_search_init(um_calibration_search *search,
+                               int high_quality);
+int um_calibration_search_next(um_calibration_search *search,
+                               size_t *candidate_id,
+                               um_modem_config *config,
+                               um_calibration_step *step);
+int um_calibration_search_record(um_calibration_search *search,
+                                 size_t candidate_id, int passed);
+const char *um_calibration_step_name(um_calibration_step step);
+float um_calibration_payload_rate(const um_modem_config *config,
+                                  size_t payload_bytes);
 
 #endif
