@@ -3,3 +3,5 @@
 test_modem
 test_live_audio
 universal-modem
+calibration.config
+calibration.config.tmp

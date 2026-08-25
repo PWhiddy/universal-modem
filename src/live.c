@@ -19,11 +19,13 @@
 #define LIVE_TURNAROUND_MS 80u
 #define LIVE_CALIBRATION_SETTLE_MS 160u
 #define LIVE_RECEIVER_ARM_MS 120u
-#define LIVE_VERIFY_TRIALS 3u
+#define LIVE_VERIFY_TRIALS_DEFAULT 3u
+#define LIVE_VERIFY_TRIALS_HIGH 5u
 #define LIVE_CALIBRATION_RANKS 5u
 #define LIVE_CONFIG_BYTES 17u
 #define LIVE_READY_BYTES (3u + LIVE_CONFIG_BYTES)
 #define LIVE_REPORT_ENTRY_BYTES (2u + LIVE_CONFIG_BYTES)
+#define LIVE_CACHE_BODY_BYTES (1u + LIVE_CONFIG_BYTES)
 
 typedef struct {
     um_live_audio_options options;
@@ -33,6 +35,8 @@ typedef struct {
     uint32_t session_id;
     um_modem_config client_to_gateway;
     um_modem_config gateway_to_client;
+    int have_client_to_gateway;
+    int have_gateway_to_client;
     float *receive_samples;
 } live_context;
 
@@ -128,6 +132,8 @@ static const char *wire_name(um_live_wire_type type)
         return "TURN";
     case UM_WIRE_COMPLETE:
         return "COMPLETE";
+    case UM_WIRE_CALIB_CACHE:
+        return "CALIB_CACHE";
     default:
         return "UNKNOWN";
     }
@@ -145,6 +151,12 @@ static const char *fec_name(um_fec_rate rate)
     default:
         return "?";
     }
+}
+
+static unsigned live_verification_trials(int high_quality)
+{
+    return high_quality != 0 ? LIVE_VERIFY_TRIALS_HIGH
+                             : LIVE_VERIFY_TRIALS_DEFAULT;
 }
 
 static void log_received_quality(live_context *context, const char *message,
@@ -197,9 +209,54 @@ static uint32_t read_u32(const uint8_t *bytes)
            ((uint32_t)bytes[2] << 8u) | bytes[3];
 }
 
+void um_live_handshake_body(uint8_t body[UM_LIVE_HANDSHAKE_BYTES])
+{
+    body[0] = UM_LIVE_PROTOCOL_VERSION;
+    body[1] = UM_LIVE_CONFIG_FORMAT_VERSION;
+    write_u16(&body[2], (uint16_t)UM_CALIBRATION_PROBE_BYTES);
+}
+
+int um_live_handshake_validate(const uint8_t *body, size_t body_length)
+{
+    if (body == NULL || body_length != UM_LIVE_HANDSHAKE_BYTES) {
+        return UM_ERR_UNSUPPORTED;
+    }
+    return body[0] == UM_LIVE_PROTOCOL_VERSION &&
+                   body[1] == UM_LIVE_CONFIG_FORMAT_VERSION &&
+                   read_u16(&body[2]) == UM_CALIBRATION_PROBE_BYTES
+               ? UM_OK
+               : UM_ERR_UNSUPPORTED;
+}
+
+static int validate_handshake_body(live_context *context, const char *frame,
+                                   const um_live_wire_message *message)
+{
+    unsigned protocol = 0u;
+    unsigned config_format = 0u;
+    unsigned probe_bytes = 0u;
+    if (message->body_length == UM_LIVE_HANDSHAKE_BYTES) {
+        protocol = message->body[0];
+        config_format = message->body[1];
+        probe_bytes = read_u16(&message->body[2]);
+        if (um_live_handshake_validate(message->body,
+                                       message->body_length) == UM_OK) {
+            return UM_OK;
+        }
+    }
+    live_log(context,
+             "Incompatible peer %s capability length=%zu protocol=%u "
+             "config-format=%u probe-bytes=%u; need protocol=%u "
+             "config-format=%u probe-bytes=%u. Rebuild both machines from "
+             "the same revision",
+             frame, message->body_length, protocol, config_format,
+             probe_bytes, UM_LIVE_PROTOCOL_VERSION,
+             UM_LIVE_CONFIG_FORMAT_VERSION, UM_CALIBRATION_PROBE_BYTES);
+    return UM_ERR_UNSUPPORTED;
+}
+
 static void encode_modem_config(const um_modem_config *config, uint8_t *bytes)
 {
-    bytes[0] = 1u;
+    bytes[0] = UM_LIVE_CONFIG_FORMAT_VERSION;
     write_u16(&bytes[1], (uint16_t)config->first_bin);
     write_u16(&bytes[3], (uint16_t)config->last_bin);
     write_u16(&bytes[5], (uint16_t)config->cyclic_prefix);
@@ -216,7 +273,7 @@ static int decode_modem_config(const uint8_t *bytes, size_t length,
                                um_modem_config *config)
 {
     if (bytes == NULL || config == NULL || length != LIVE_CONFIG_BYTES ||
-        bytes[0] != 1u) {
+        bytes[0] != UM_LIVE_CONFIG_FORMAT_VERSION) {
         return UM_ERR_HEADER;
     }
     memset(config, 0, sizeof(*config));
@@ -232,6 +289,36 @@ static int decode_modem_config(const uint8_t *bytes, size_t length,
     config->qam_bits = bytes[15];
     config->fec_rate = (um_fec_rate)bytes[16];
     return um_modem_config_validate(config) == UM_OK ? UM_OK : UM_ERR_HEADER;
+}
+
+static size_t encode_calibration_cache(
+    int available, const um_modem_config *config,
+    uint8_t body[LIVE_CACHE_BODY_BYTES])
+{
+    body[0] = available != 0 ? 1u : 0u;
+    if (available == 0) {
+        return 1u;
+    }
+    encode_modem_config(config, &body[1]);
+    return LIVE_CACHE_BODY_BYTES;
+}
+
+static int decode_calibration_cache(const um_live_wire_message *message,
+                                    int *available,
+                                    um_modem_config *config)
+{
+    if (message == NULL || available == NULL || config == NULL ||
+        message->body_length == 0u || message->body[0] > 1u) {
+        return UM_ERR_HEADER;
+    }
+    *available = message->body[0] != 0u;
+    if (*available == 0) {
+        return message->body_length == 1u ? UM_OK : UM_ERR_HEADER;
+    }
+    if (message->body_length != LIVE_CACHE_BODY_BYTES) {
+        return UM_ERR_HEADER;
+    }
+    return decode_modem_config(&message->body[1], LIVE_CONFIG_BYTES, config);
 }
 
 static int send_wire(live_context *context, const um_modem_config *config,
@@ -439,13 +526,17 @@ static int receive_calibration_ready(live_context *context,
             message->body_length >= 4u) {
             if (read_u16(message->body) == 0u && message->body[2] == 0u &&
                 message->body[3] != 0u) {
+                const char *reason =
+                    message->body[3] == 1u
+                        ? "baseline decode failed"
+                        : message->body[3] == 2u
+                              ? "baseline margin failed"
+                              : "no full-size robust mode passed";
                 live_log(context,
                          "calibration peer aborted at probe=%zu reason=%s",
-                         candidate + 1u,
-                         message->body[3] == 1u ? "baseline decode failed"
-                                                 : "baseline margin failed");
-                return message->body[3] == 1u ? UM_ERR_CRC
-                                              : UM_ERR_RELIABILITY;
+                         candidate + 1u, reason);
+                return message->body[3] == 2u ? UM_ERR_RELIABILITY
+                                              : UM_ERR_CRC;
             }
             return UM_OK;
         }
@@ -471,7 +562,9 @@ static uint32_t make_session_id(void)
 static int client_connect(live_context *context)
 {
     um_modem_config bootstrap = live_bootstrap_config();
+    uint8_t handshake[UM_LIVE_HANDSHAKE_BYTES];
     uint16_t attempt = 0u;
+    um_live_handshake_body(handshake);
     while (!live_interrupted) {
         um_live_wire_message message;
         um_rx_metrics metrics;
@@ -480,24 +573,33 @@ static int client_connect(live_context *context)
         live_log(context, "state=DISCOVERING tx=DISCOVER attempt=%u session=%08x",
                  (unsigned)attempt + 1u, context->session_id);
         status = send_wire(context, &bootstrap, UM_WIRE_DISCOVER, attempt,
-                           NULL, 0u, 1, NULL);
+                           handshake, sizeof(handshake), 1, NULL);
         if (status != UM_OK) {
             return status;
         }
         status = receive_expected(context, &bootstrap, UM_WIRE_OFFER, attempt,
                                   2200u, &message, &metrics);
         if (status == UM_OK) {
+            status = validate_handshake_body(context, "OFFER", &message);
+            if (status != UM_OK) {
+                return status;
+            }
             log_received_quality(context, "rx=OFFER", &metrics);
             sleep_milliseconds(LIVE_TURNAROUND_MS);
             live_log(context, "state=NEGOTIATING rx=OFFER tx=CONFIRM");
             status = send_wire(context, &bootstrap, UM_WIRE_CONFIRM, attempt,
-                               NULL, 0u, 1, NULL);
+                               handshake, sizeof(handshake), 1, NULL);
             if (status != UM_OK) {
                 return status;
             }
             status = receive_expected(context, &bootstrap, UM_WIRE_CONNECTED,
                                       attempt, 2500u, &message, &metrics);
             if (status == UM_OK) {
+                status = validate_handshake_body(context, "CONNECTED",
+                                                 &message);
+                if (status != UM_OK) {
+                    return status;
+                }
                 log_received_quality(context, "rx=CONNECTED", &metrics);
                 live_log(context, "state=CONNECTED handshake complete");
                 return UM_OK;
@@ -519,6 +621,8 @@ static int client_connect(live_context *context)
 static int gateway_connect(live_context *context)
 {
     um_modem_config bootstrap = live_bootstrap_config();
+    uint8_t handshake[UM_LIVE_HANDSHAKE_BYTES];
+    um_live_handshake_body(handshake);
     live_log(context, "state=LISTENING waiting for client DISCOVER");
     while (!live_interrupted) {
         um_live_wire_message message;
@@ -535,13 +639,18 @@ static int gateway_connect(live_context *context)
         if (message.type != UM_WIRE_DISCOVER) {
             continue;
         }
+        status = validate_handshake_body(context, "DISCOVER", &message);
+        if (status != UM_OK) {
+            return status;
+        }
         log_received_quality(context, "rx=DISCOVER", &metrics);
         context->session_id = message.session_id;
         sleep_milliseconds(LIVE_TURNAROUND_MS);
         live_log(context, "state=NEGOTIATING rx=DISCOVER tx=OFFER session=%08x",
                  context->session_id);
         status = send_wire(context, &bootstrap, UM_WIRE_OFFER,
-                           message.sequence, NULL, 0u, 1, NULL);
+                           message.sequence, handshake, sizeof(handshake), 1,
+                           NULL);
         if (status != UM_OK) {
             return status;
         }
@@ -552,10 +661,15 @@ static int gateway_connect(live_context *context)
                      um_status_string(status));
             continue;
         }
+        status = validate_handshake_body(context, "CONFIRM", &message);
+        if (status != UM_OK) {
+            return status;
+        }
         log_received_quality(context, "rx=CONFIRM", &metrics);
         sleep_milliseconds(LIVE_TURNAROUND_MS);
         status = send_wire(context, &bootstrap, UM_WIRE_CONNECTED,
-                           message.sequence, NULL, 0u, 1, NULL);
+                           message.sequence, handshake, sizeof(handshake), 1,
+                           NULL);
         if (status != UM_OK) {
             return status;
         }
@@ -586,9 +700,6 @@ static float live_candidate_score(const um_modem_config *config,
     float raw = um_calibration_payload_rate(config, 128u);
     float quality = 1.0f /
                     (1.0f + 4.0f * metrics->evm_rms * metrics->evm_rms);
-    if (config->window_samples == 0u) {
-        quality *= 0.94f;
-    }
     return raw * quality;
 }
 
@@ -623,6 +734,8 @@ static void log_calibration_search_results(
     unsigned band_passes;
     unsigned prefix_attempts;
     unsigned prefix_passes;
+    unsigned recovery_attempts;
+    unsigned recovery_passes;
     const char *qam_state;
     um_calibration_search_step_results(
         search, UM_CALIB_STEP_REPETITIONS, &repetition_attempts,
@@ -635,16 +748,21 @@ static void log_calibration_search_results(
                                        &band_attempts, &band_passes);
     um_calibration_search_step_results(search, UM_CALIB_STEP_PREFIX,
                                        &prefix_attempts, &prefix_passes);
+    um_calibration_search_step_results(
+        search, UM_CALIB_STEP_MORE_REPETITIONS, &recovery_attempts,
+        &recovery_passes);
     qam_state = qam_attempts != 0u && qam_passes == 0u
                     ? "(no-pass; deprioritized)"
                     : "";
     live_log(context,
              "calib search learned pass/try repetitions=%u/%u qam=%u/%u%s "
-             "fec=%u/%u high-band=%u/%u prefix=%u/%u",
+             "fec=%u/%u high-band=%u/%u prefix=%u/%u "
+             "recovery-repeats=%u/%u",
              repetition_passes, repetition_attempts, qam_passes,
              qam_attempts, qam_state,
              fec_passes, fec_attempts, band_passes, band_attempts,
-             prefix_passes, prefix_attempts);
+             prefix_passes, prefix_attempts, recovery_passes,
+             recovery_attempts);
 }
 
 static double live_calibration_primary_seconds(int high_quality)
@@ -719,6 +837,8 @@ static int calibration_sender(live_context *context, unsigned direction,
     um_live_wire_message message;
     size_t probe_number;
     int report_received = 0;
+    unsigned verification_trials = live_verification_trials(
+        context->options.calibrate_high_quality);
     int status;
     if (probe_budget == 0u || probe_budget > UINT16_MAX) {
         return UM_ERR_CONFIG;
@@ -754,7 +874,7 @@ static int calibration_sender(live_context *context, unsigned direction,
             break;
         }
         if (message.body_length != LIVE_READY_BYTES ||
-            message.body[2] > (uint8_t)UM_CALIB_STEP_DATA_DEFAULT) {
+            message.body[2] >= (uint8_t)UM_CALIB_STEP_COUNT) {
             return UM_ERR_HEADER;
         }
         candidate_id = read_u16(message.body);
@@ -839,11 +959,11 @@ static int calibration_sender(live_context *context, unsigned direction,
                          selected->fft_size,
                      (double)selected->last_bin * UM_SAMPLE_RATE /
                          selected->fft_size);
-            for (trial = 0u; trial < LIVE_VERIFY_TRIALS; ++trial) {
+            for (trial = 0u; trial < verification_trials; ++trial) {
                 uint8_t verify[128];
                 um_live_wire_message verify_result;
                 uint16_t verify_sequence =
-                    (uint16_t)(rank * LIVE_VERIFY_TRIALS + trial);
+                    (uint16_t)(rank * verification_trials + trial);
                 sleep_milliseconds(LIVE_TURNAROUND_MS);
                 fill_calibration_body(selected_candidate, trial + 1u,
                                       verify, sizeof(verify));
@@ -865,12 +985,12 @@ static int calibration_sender(live_context *context, unsigned direction,
                     live_log(context,
                              "calib verify rank=%zu trial=%u/%u FAIL; "
                              "trying safer ranked candidate",
-                             rank + 1u, trial + 1u, LIVE_VERIFY_TRIALS);
+                             rank + 1u, trial + 1u, verification_trials);
                     break;
                 }
                 live_log(context,
                          "calib verify rank=%zu trial=%u/%u PASS",
-                         rank + 1u, trial + 1u, LIVE_VERIFY_TRIALS);
+                         rank + 1u, trial + 1u, verification_trials);
             }
             if (verified != 0) {
                 live_log(context, "calib selected rank=%zu id=%zu",
@@ -891,6 +1011,7 @@ static int calibration_receiver(live_context *context, unsigned direction,
         live_calibration_control_config();
     um_calibration_search search;
     int high_quality;
+    unsigned verification_trials;
     size_t probe_budget;
     size_t probe_number = 0u;
     size_t usable = 0u;
@@ -910,6 +1031,7 @@ static int calibration_receiver(live_context *context, unsigned direction,
         return UM_ERR_HEADER;
     }
     high_quality = begin_message->body[1] != 0u;
+    verification_trials = live_verification_trials(high_quality);
     status = um_calibration_search_init(&search, high_quality);
     if (status != UM_OK) {
         return status;
@@ -953,7 +1075,7 @@ static int calibration_receiver(live_context *context, unsigned direction,
             return status;
         }
         memset(&metrics, 0, sizeof(metrics));
-        status = receive_wire(context, &config, context->session_id, 3000u,
+        status = receive_wire(context, &config, context->session_id, 4000u,
                               &probe, &metrics);
         if (status == UM_ERR_MEMORY || status == UM_ERR_AUDIO ||
             status == UM_ERR_INTERRUPTED) {
@@ -965,8 +1087,10 @@ static int calibration_receiver(live_context *context, unsigned direction,
             probe.body_length == sizeof(expected) &&
             memcmp(probe.body, expected, sizeof(expected)) == 0) {
             float score = live_candidate_score(&config, &metrics);
+            int robust_gate =
+                um_modem_config_uses_robust_gate(&config);
             int has_margin =
-                candidate_id == 0u
+                robust_gate != 0
                     ? um_modem_metrics_have_baseline_margin(&metrics)
                     : um_modem_metrics_have_margin(&config, &metrics);
             if (has_margin == 0) {
@@ -1007,7 +1131,7 @@ static int calibration_receiver(live_context *context, unsigned direction,
                          100.0 * (double)metrics.clipped_sample_fraction,
                          metrics.estimated_snr_db, metrics.evm_rms,
                          um_calibration_payload_rate(&config, 128u), score,
-                         candidate_id == 0u ? "crc+sync/snr" : "snr/evm");
+                         robust_gate != 0 ? "crc+sync/snr" : "snr/evm");
             }
         } else {
             if (status == UM_OK) {
@@ -1042,19 +1166,9 @@ static int calibration_receiver(live_context *context, unsigned direction,
         }
         ++probe_number;
         if (candidate_id == 0u && reliable == 0) {
-            int abort_status;
             live_log(context,
-                     status == UM_ERR_RELIABILITY
-                         ? "calib baseline lacks reliability margin; adaptive "
-                           "search stopped"
-                         : "calib baseline failed; adaptive search stopped");
-            abort_status = send_calibration_abort(
-                context, &bootstrap, direction, candidate_id,
-                status == UM_ERR_RELIABILITY ? 2u : 1u);
-            if (abort_status != UM_OK) {
-                return abort_status;
-            }
-            return status;
+                     "calib two-repeat baseline failed; trying stronger "
+                     "physical-repetition recovery");
         }
     }
     if (live_interrupted) {
@@ -1063,6 +1177,15 @@ static int calibration_receiver(live_context *context, unsigned direction,
     log_calibration_search_results(context, &search);
     rank_count = um_calibration_rank_candidates(
         &search, candidate_scores, ranked_ids, LIVE_CALIBRATION_RANKS);
+    if (rank_count == 0u) {
+        int abort_status;
+        live_log(context,
+                 "calib no full-size mode passed through four physical "
+                 "repetitions; adaptive search stopped");
+        abort_status = send_calibration_abort(context, &bootstrap, direction,
+                                              probe_number, 3u);
+        return abort_status == UM_OK ? UM_ERR_CRC : abort_status;
+    }
     {
         size_t rank;
         for (rank = 0u; rank < rank_count; ++rank) {
@@ -1098,25 +1221,25 @@ static int calibration_receiver(live_context *context, unsigned direction,
             unsigned trial;
             int verified = 1;
             *selected = ranked[rank].config;
-            for (trial = 0u; trial < LIVE_VERIFY_TRIALS; ++trial) {
+            for (trial = 0u; trial < verification_trials; ++trial) {
                 um_live_wire_message verify;
                 um_rx_metrics verify_metrics;
                 uint8_t expected[128];
                 uint8_t result_body[1] = {0u};
                 uint16_t verify_sequence =
-                    (uint16_t)(rank * LIVE_VERIFY_TRIALS + trial);
+                    (uint16_t)(rank * verification_trials + trial);
                 fill_calibration_body(ranked[rank].index, trial + 1u,
                                       expected, sizeof(expected));
                 memset(&verify_metrics, 0, sizeof(verify_metrics));
                 status = receive_wire(context, selected,
-                                      context->session_id, 2600u, &verify,
+                                      context->session_id, 4000u, &verify,
                                       &verify_metrics);
                 if (status == UM_OK &&
                     verify.type == UM_WIRE_CALIB_VERIFY &&
                     verify.sequence == verify_sequence &&
                     verify.body_length == sizeof(expected) &&
                     memcmp(verify.body, expected, sizeof(expected)) == 0 &&
-                    (ranked[rank].index == 0u
+                    (um_modem_config_uses_robust_gate(selected) != 0
                          ? um_modem_metrics_have_baseline_margin(
                                &verify_metrics)
                          : um_modem_metrics_have_margin(selected,
@@ -1141,7 +1264,7 @@ static int calibration_receiver(live_context *context, unsigned direction,
                     live_log(context,
                              "calib verify rank=%zu trial=%u/%u FAIL "
                              "status=%s sync=%.3f snr=%.1fdB evm=%.3f",
-                             rank + 1u, trial + 1u, LIVE_VERIFY_TRIALS,
+                             rank + 1u, trial + 1u, verification_trials,
                              um_status_string(status),
                              verify_metrics.sync_correlation,
                              verify_metrics.estimated_snr_db,
@@ -1150,7 +1273,7 @@ static int calibration_receiver(live_context *context, unsigned direction,
                 }
                 live_log(context,
                          "calib verify rank=%zu trial=%u/%u PASS",
-                         rank + 1u, trial + 1u, LIVE_VERIFY_TRIALS);
+                         rank + 1u, trial + 1u, verification_trials);
             }
             if (verified != 0) {
                 live_log(context,
@@ -1173,10 +1296,10 @@ static uint8_t test_byte(uint32_t seed, size_t offset)
 }
 
 static int send_test_data(live_context *context,
-                          const um_modem_config *config, size_t total,
+                          const um_modem_config *config,
+                          const um_modem_config *ack_config, size_t total,
                           size_t chunk_size, uint32_t seed, const char *label)
 {
-    um_modem_config bootstrap = live_bootstrap_config();
     size_t offset = 0u;
     uint16_t sequence = 0u;
     uint64_t started = monotonic_milliseconds();
@@ -1201,7 +1324,7 @@ static int send_test_data(live_context *context,
             if (status != UM_OK) {
                 return status;
             }
-            status = receive_expected(context, &bootstrap, UM_WIRE_ACK,
+            status = receive_expected(context, ack_config, UM_WIRE_ACK,
                                       sequence, 1800u, &ack, NULL);
             if (status == UM_OK) {
                 acknowledged = 1;
@@ -1230,11 +1353,11 @@ static int send_test_data(live_context *context,
 }
 
 static int receive_test_data(live_context *context,
-                             const um_modem_config *config, size_t total,
+                             const um_modem_config *config,
+                             const um_modem_config *ack_config, size_t total,
                              size_t chunk_size, uint32_t seed,
                              const char *label)
 {
-    um_modem_config bootstrap = live_bootstrap_config();
     size_t offset = 0u;
     uint16_t expected_sequence = 0u;
     unsigned misses = 0u;
@@ -1243,7 +1366,7 @@ static int receive_test_data(live_context *context,
         um_live_wire_message data;
         um_rx_metrics metrics;
         memset(&metrics, 0, sizeof(metrics));
-        int status = receive_wire(context, config, context->session_id, 2600u,
+        int status = receive_wire(context, config, context->session_id, 4000u,
                                   &data, &metrics);
         if (status != UM_OK) {
             if (++misses > context->options.retry_limit + 1u) {
@@ -1285,7 +1408,7 @@ static int receive_test_data(live_context *context,
             continue;
         }
         sleep_milliseconds(LIVE_TURNAROUND_MS);
-        status = send_wire(context, &bootstrap, UM_WIRE_ACK, data.sequence,
+        status = send_wire(context, ack_config, UM_WIRE_ACK, data.sequence,
                            NULL, 0u, 1, NULL);
         if (status != UM_OK) {
             return status;
@@ -1331,6 +1454,145 @@ static int send_control(live_context *context, um_live_wire_type type,
                      NULL);
 }
 
+static const char *direction_label(unsigned direction)
+{
+    return direction == 0u ? "client->gateway" : "gateway->client";
+}
+
+static void log_cached_config(live_context *context, const char *prefix,
+                              unsigned direction,
+                              const um_modem_config *config)
+{
+    live_log(context,
+             "%s direction=%s qam=%u fec=%s cp=%u window=%u repeats=%u "
+             "training=%u sync=%.1fms band=%.0f-%.0fHz",
+             prefix, direction_label(direction), 1u << config->qam_bits,
+             fec_name(config->fec_rate), config->cyclic_prefix,
+             config->window_samples, config->symbol_repetitions,
+             config->training_symbols,
+             1000.0 * (double)config->sync_samples / UM_SAMPLE_RATE,
+             (double)config->first_bin * UM_SAMPLE_RATE / config->fft_size,
+             (double)config->last_bin * UM_SAMPLE_RATE / config->fft_size);
+}
+
+static void load_local_calibration(live_context *context)
+{
+    const char *path = context->options.calibration_path;
+    um_modem_config config;
+    int found = 0;
+    int status;
+    unsigned direction = context->options.role == UM_LIVE_GATEWAY ? 0u : 1u;
+    if (path == NULL || *path == '\0') {
+        live_log(context,
+                 "Calibration cache disabled; local receive direction will "
+                 "calibrate");
+        return;
+    }
+    status = um_calibration_config_load(path, context->options.role, &config,
+                                        &found);
+    if (status != UM_OK) {
+        live_log(context,
+                 "Calibration cache '%s' is invalid or unreadable; ignoring "
+                 "it and recalibrating",
+                 path);
+        return;
+    }
+    if (found == 0) {
+        live_log(context,
+                 "Calibration cache '%s' not found; local receive direction "
+                 "will calibrate",
+                 path);
+        return;
+    }
+    if (direction == 0u) {
+        context->client_to_gateway = config;
+        context->have_client_to_gateway = 1;
+    } else {
+        context->gateway_to_client = config;
+        context->have_gateway_to_client = 1;
+    }
+    log_cached_config(context, "Loaded calibration cache", direction,
+                      &config);
+}
+
+static void save_local_calibration(live_context *context, unsigned direction,
+                                   const um_modem_config *config)
+{
+    const char *path = context->options.calibration_path;
+    int status;
+    if (direction == 0u) {
+        context->client_to_gateway = *config;
+        context->have_client_to_gateway = 1;
+    } else {
+        context->gateway_to_client = *config;
+        context->have_gateway_to_client = 1;
+    }
+    if (path == NULL || *path == '\0') {
+        return;
+    }
+    status = um_calibration_config_save(path, context->options.role, config);
+    if (status != UM_OK) {
+        live_log(context,
+                 "Could not write calibration cache '%s' (%s); continuing "
+                 "with the measured mode for this run",
+                 path, um_status_string(status));
+        return;
+    }
+    log_cached_config(context, "Saved calibration cache", direction, config);
+}
+
+static int exchange_calibration_caches(live_context *context)
+{
+    uint8_t body[LIVE_CACHE_BODY_BYTES];
+    um_live_wire_message message;
+    size_t body_length;
+    int status;
+    if (context->options.role == UM_LIVE_CLIENT) {
+        body_length = encode_calibration_cache(
+            context->have_gateway_to_client,
+            &context->gateway_to_client, body);
+        status = send_control(context, UM_WIRE_CALIB_CACHE, 1u, body,
+                              body_length);
+        if (status != UM_OK) {
+            return status;
+        }
+        status = receive_control(context, UM_WIRE_CALIB_CACHE, 0u, 3500u,
+                                 &message);
+        if (status != UM_OK) {
+            return status;
+        }
+        status = decode_calibration_cache(
+            &message, &context->have_client_to_gateway,
+            &context->client_to_gateway);
+    } else {
+        status = receive_control(context, UM_WIRE_CALIB_CACHE, 1u, 3500u,
+                                 &message);
+        if (status != UM_OK) {
+            return status;
+        }
+        status = decode_calibration_cache(
+            &message, &context->have_gateway_to_client,
+            &context->gateway_to_client);
+        if (status != UM_OK) {
+            return status;
+        }
+        body_length = encode_calibration_cache(
+            context->have_client_to_gateway,
+            &context->client_to_gateway, body);
+        status = send_control(context, UM_WIRE_CALIB_CACHE, 0u, body,
+                              body_length);
+    }
+    if (status != UM_OK) {
+        return status;
+    }
+    live_log(context,
+             "Calibration cache exchange client->gateway=%s "
+             "gateway->client=%s",
+             context->have_client_to_gateway != 0 ? "cached" : "calibrate",
+             context->have_gateway_to_client != 0 ? "cached" : "calibrate");
+    return UM_OK;
+}
+
 static int client_session(live_context *context)
 {
     um_live_wire_message message;
@@ -1344,20 +1606,38 @@ static int client_session(live_context *context)
     if (status != UM_OK) {
         return status;
     }
-    status = calibration_sender(context, 0u,
-                                &context->client_to_gateway);
+    status = exchange_calibration_caches(context);
     if (status != UM_OK) {
         return status;
     }
-    status = receive_control(context, UM_WIRE_CALIB_BEGIN, 1u, 3500u,
-                             &message);
-    if (status != UM_OK) {
-        return status;
+    if (context->have_client_to_gateway != 0) {
+        log_cached_config(context, "state=CALIBRATION_SKIPPED source=peer-cache",
+                          0u, &context->client_to_gateway);
+    } else {
+        status = calibration_sender(context, 0u,
+                                    &context->client_to_gateway);
+        if (status != UM_OK) {
+            return status;
+        }
+        context->have_client_to_gateway = 1;
     }
-    status = calibration_receiver(context, 1u, &message,
-                                  &context->gateway_to_client);
-    if (status != UM_OK) {
-        return status;
+    if (context->have_gateway_to_client != 0) {
+        log_cached_config(context,
+                          "state=CALIBRATION_SKIPPED source=local-cache", 1u,
+                          &context->gateway_to_client);
+    } else {
+        status = receive_control(context, UM_WIRE_CALIB_BEGIN, 1u, 3500u,
+                                 &message);
+        if (status != UM_OK) {
+            return status;
+        }
+        status = calibration_receiver(context, 1u, &message,
+                                      &context->gateway_to_client);
+        if (status != UM_OK) {
+            return status;
+        }
+        save_local_calibration(context, 1u,
+                               &context->gateway_to_client);
     }
     forward_seed = context->session_id ^ UINT32_C(0xc2a70001);
     reverse_seed = context->session_id ^ UINT32_C(0x6a2c0002);
@@ -1375,6 +1655,7 @@ static int client_session(live_context *context)
     }
     live_log(context, "state=TEST_TRANSFER direction=client->gateway");
     status = send_test_data(context, &context->client_to_gateway,
+                            &context->gateway_to_client,
                             context->options.test_bytes,
                             context->options.chunk_bytes, forward_seed,
                             "client->gateway");
@@ -1391,6 +1672,7 @@ static int client_session(live_context *context)
     }
     live_log(context, "state=TEST_TRANSFER direction=gateway->client");
     status = receive_test_data(context, &context->gateway_to_client,
+                               &context->client_to_gateway,
                                context->options.test_bytes,
                                context->options.chunk_bytes, reverse_seed,
                                "gateway->client");
@@ -1454,20 +1736,38 @@ static int gateway_session(live_context *context)
     if (status != UM_OK) {
         return status;
     }
-    status = receive_control(context, UM_WIRE_CALIB_BEGIN, 0u, 3500u,
-                             &message);
+    status = exchange_calibration_caches(context);
     if (status != UM_OK) {
         return status;
     }
-    status = calibration_receiver(context, 0u, &message,
-                                  &context->client_to_gateway);
-    if (status != UM_OK) {
-        return status;
+    if (context->have_client_to_gateway != 0) {
+        log_cached_config(context,
+                          "state=CALIBRATION_SKIPPED source=local-cache", 0u,
+                          &context->client_to_gateway);
+    } else {
+        status = receive_control(context, UM_WIRE_CALIB_BEGIN, 0u, 3500u,
+                                 &message);
+        if (status != UM_OK) {
+            return status;
+        }
+        status = calibration_receiver(context, 0u, &message,
+                                      &context->client_to_gateway);
+        if (status != UM_OK) {
+            return status;
+        }
+        save_local_calibration(context, 0u,
+                               &context->client_to_gateway);
     }
-    status = calibration_sender(context, 1u,
-                                &context->gateway_to_client);
-    if (status != UM_OK) {
-        return status;
+    if (context->have_gateway_to_client != 0) {
+        log_cached_config(context, "state=CALIBRATION_SKIPPED source=peer-cache",
+                          1u, &context->gateway_to_client);
+    } else {
+        status = calibration_sender(context, 1u,
+                                    &context->gateway_to_client);
+        if (status != UM_OK) {
+            return status;
+        }
+        context->have_gateway_to_client = 1;
     }
     status = receive_control(context, UM_WIRE_TEST_BEGIN, 0u, 3500u,
                              &message);
@@ -1491,6 +1791,7 @@ static int gateway_session(live_context *context)
     }
     live_log(context, "state=TEST_TRANSFER direction=client->gateway");
     status = receive_test_data(context, &context->client_to_gateway,
+                               &context->gateway_to_client,
                                test_bytes, chunk_bytes, forward_seed,
                                "client->gateway");
     if (status != UM_OK) {
@@ -1505,7 +1806,8 @@ static int gateway_session(live_context *context)
         return status;
     }
     live_log(context, "state=TEST_TRANSFER direction=gateway->client");
-    status = send_test_data(context, &context->gateway_to_client, test_bytes,
+    status = send_test_data(context, &context->gateway_to_client,
+                            &context->client_to_gateway, test_bytes,
                             chunk_bytes, reverse_seed, "gateway->client");
     if (status != UM_OK) {
         return status;
@@ -1550,6 +1852,7 @@ um_live_audio_options um_live_audio_default_options(um_live_role role)
     options.retry_limit = 4u;
     options.discovery_interval_seconds = 2.0f;
     options.calibrate_high_quality = 0;
+    options.calibration_path = "calibration.config";
     return options;
 }
 
@@ -1610,7 +1913,9 @@ int um_run_live_audio(const um_live_audio_options *options,
     calibration_probe_budget = um_calibration_search_budget(
         options->calibrate_high_quality);
     live_log(&context,
-             "Live role=%s test-bytes=%zu chunk-bytes=%zu retries=%u",
+             "Live protocol=%u config-format=%u role=%s test-bytes=%zu "
+             "chunk-bytes=%zu retries=%u",
+             UM_LIVE_PROTOCOL_VERSION, UM_LIVE_CONFIG_FORMAT_VERSION,
              options->role == UM_LIVE_CLIENT ? "client" : "gateway",
              options->test_bytes, options->chunk_bytes,
              options->retry_limit);
@@ -1644,12 +1949,16 @@ int um_run_live_audio(const um_live_audio_options *options,
              (double)UM_SAMPLE_RATE / data_default.fft_size);
     live_log(&context,
              "Local calibration mode=%s adaptive-max-probes=%zu "
-             "probe-bytes=%u receiver-driven "
+             "probe-bytes=%u verification-trials=%u "
+             "robust-recovery-repeats=2-%u receiver-driven "
              "all-pass-primary-estimate=%.1fs per direction",
              options->calibrate_high_quality != 0 ? "high" : "default",
              calibration_probe_budget, UM_CALIBRATION_PROBE_BYTES,
+             live_verification_trials(options->calibrate_high_quality),
+             UM_MAX_SYMBOL_REPETITIONS,
              live_calibration_primary_seconds(
                  options->calibrate_high_quality));
+    load_local_calibration(&context);
     while (!live_interrupted) {
         status = options->role == UM_LIVE_CLIENT ? client_session(&context)
                                                  : gateway_session(&context);

@@ -172,6 +172,26 @@ int um_modem_metrics_have_baseline_margin(const um_rx_metrics *metrics)
            metrics->estimated_snr_db >= 6.0f;
 }
 
+int um_modem_config_uses_robust_gate(const um_modem_config *config)
+{
+    um_modem_config robust;
+    if (config == NULL) {
+        return 0;
+    }
+    robust = um_modem_robust_config();
+    return config->fft_size == robust.fft_size &&
+           config->first_bin == robust.first_bin &&
+           config->last_bin == robust.last_bin &&
+           config->cyclic_prefix == robust.cyclic_prefix &&
+           config->window_samples == robust.window_samples &&
+           config->sync_samples == robust.sync_samples &&
+           config->sync_gap == robust.sync_gap &&
+           config->training_symbols == robust.training_symbols &&
+           config->symbol_repetitions >= robust.symbol_repetitions &&
+           config->qam_bits == robust.qam_bits &&
+           config->fec_rate == robust.fec_rate;
+}
+
 int um_modem_metrics_have_margin(const um_modem_config *config,
                                  const um_rx_metrics *metrics)
 {
@@ -182,8 +202,8 @@ int um_modem_metrics_have_margin(const um_modem_config *config,
     }
     switch (config->qam_bits) {
     case 2u:
-        minimum_snr = 8.0f;
-        maximum_evm = 0.42f;
+        minimum_snr = 10.0f;
+        maximum_evm = 0.40f;
         break;
     case 4u:
         minimum_snr = 15.0f;
@@ -198,7 +218,7 @@ int um_modem_metrics_have_margin(const um_modem_config *config,
     }
     if (config->fec_rate == UM_FEC_RATE_1_2) {
         minimum_snr -= 2.0f;
-        maximum_evm *= 1.10f;
+        maximum_evm *= 1.05f;
     } else if (config->fec_rate == UM_FEC_RATE_3_4) {
         minimum_snr += 2.0f;
         maximum_evm *= 0.90f;

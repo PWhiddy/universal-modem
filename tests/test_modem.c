@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 static int failures = 0;
 static int tests_run = 0;
@@ -806,6 +807,8 @@ static void test_control_symbol_power(void)
 static void test_reliability_margin(void)
 {
     um_modem_config config = um_modem_robust_config();
+    um_modem_config recovered = config;
+    um_modem_config optimized = config;
     um_rx_metrics metrics = {0};
 
     ++tests_run;
@@ -814,11 +817,22 @@ static void test_reliability_margin(void)
     metrics.evm_rms = 0.741f;
     CHECK(um_modem_metrics_have_baseline_margin(&metrics));
     CHECK(!um_modem_metrics_have_margin(&config, &metrics));
+    CHECK(um_modem_config_uses_robust_gate(&config));
+    recovered.symbol_repetitions = 3u;
+    CHECK(um_modem_config_uses_robust_gate(&recovered));
+    optimized.window_samples = 64u;
+    CHECK(!um_modem_config_uses_robust_gate(&optimized));
 
     metrics.sync_correlation = 0.54f;
     metrics.estimated_snr_db = 15.0f;
     metrics.evm_rms = 0.265f;
     CHECK(um_modem_metrics_have_margin(&config, &metrics));
+
+    metrics.estimated_snr_db = 12.0f;
+    metrics.evm_rms = 0.43f;
+    CHECK(!um_modem_metrics_have_margin(&optimized, &metrics));
+    metrics.evm_rms = 0.41f;
+    CHECK(um_modem_metrics_have_margin(&optimized, &metrics));
 
     config.qam_bits = 4u;
     CHECK(!um_modem_metrics_have_margin(&config, &metrics));
@@ -894,6 +908,7 @@ static void test_async_session_distortion_ladder(void)
 static void test_live_wire_protocol(void)
 {
     uint8_t body[UM_LIVE_MAX_BODY];
+    uint8_t capability[UM_LIVE_HANDSHAKE_BYTES];
     uint8_t wire[UM_LIVE_MAX_WIRE];
     uint8_t altered[UM_LIVE_MAX_WIRE];
     size_t wire_length = 0u;
@@ -947,6 +962,19 @@ static void test_live_wire_protocol(void)
     CHECK(um_live_wire_encode((um_live_wire_type)0, 0u, 0u, NULL, 0u, wire,
                               sizeof(wire), &wire_length) == UM_ERR_ARGUMENT);
 
+    um_live_handshake_body(capability);
+    CHECK(um_live_handshake_validate(capability, sizeof(capability)) ==
+          UM_OK);
+    CHECK(um_live_handshake_validate(capability, 0u) ==
+          UM_ERR_UNSUPPORTED);
+    capability[0] ^= 1u;
+    CHECK(um_live_handshake_validate(capability, sizeof(capability)) ==
+          UM_ERR_UNSUPPORTED);
+    um_live_handshake_body(capability);
+    capability[3] ^= 1u;
+    CHECK(um_live_handshake_validate(capability, sizeof(capability)) ==
+          UM_ERR_UNSUPPORTED);
+
     CHECK(um_live_wire_encode(UM_WIRE_ACK, 1u, 2u, NULL, 0u, wire,
                               sizeof(wire), &wire_length) == UM_OK);
     memcpy(altered, wire, wire_length);
@@ -982,6 +1010,66 @@ static unsigned config_difference_count(const um_modem_config *left,
     COUNT_DIFFERENCE(fec_rate);
 #undef COUNT_DIFFERENCE
     return differences;
+}
+
+static unsigned calibration_variant(const um_calibration_search_node *node)
+{
+    switch (node->step) {
+    case UM_CALIB_STEP_REPETITIONS:
+    case UM_CALIB_STEP_MORE_REPETITIONS:
+        return node->config.symbol_repetitions;
+    case UM_CALIB_STEP_QAM:
+        return node->config.qam_bits;
+    case UM_CALIB_STEP_FEC:
+        return (unsigned)node->config.fec_rate;
+    case UM_CALIB_STEP_PREFIX:
+        return node->config.cyclic_prefix;
+    case UM_CALIB_STEP_HIGH_BAND:
+        return node->config.last_bin;
+    case UM_CALIB_STEP_LOW_BAND:
+    case UM_CALIB_STEP_NARROW_BAND:
+        return node->config.first_bin;
+    case UM_CALIB_STEP_SYNC:
+        return node->config.sync_samples;
+    case UM_CALIB_STEP_GAP:
+        return node->config.sync_gap;
+    case UM_CALIB_STEP_TRAINING:
+        return node->config.training_symbols;
+    default:
+        return 0u;
+    }
+}
+
+static void test_calibration_config_file(void)
+{
+    char path[160];
+    um_modem_config saved = um_modem_default_config();
+    um_modem_config loaded;
+    FILE *file;
+    int found = 0;
+
+    ++tests_run;
+    (void)snprintf(path, sizeof(path),
+                   "/tmp/universal-modem-calibration-%ld.config",
+                   (long)getpid());
+    (void)remove(path);
+    CHECK(um_calibration_config_load(path, UM_LIVE_CLIENT, &loaded, &found) ==
+          UM_OK);
+    CHECK(found == 0);
+    CHECK(um_calibration_config_save(path, UM_LIVE_CLIENT, &saved) == UM_OK);
+    CHECK(um_calibration_config_load(path, UM_LIVE_CLIENT, &loaded, &found) ==
+          UM_OK);
+    CHECK(found == 1);
+    CHECK(config_difference_count(&saved, &loaded) == 0u);
+    CHECK(um_calibration_config_load(path, UM_LIVE_GATEWAY, &loaded, &found) ==
+          UM_ERR_CONFIG);
+    file = fopen(path, "w");
+    CHECK(file != NULL);
+    CHECK(fputs("format=1\nrole=client\n", file) >= 0);
+    CHECK(fclose(file) == 0);
+    CHECK(um_calibration_config_load(path, UM_LIVE_CLIENT, &loaded, &found) ==
+          UM_ERR_CONFIG);
+    CHECK(remove(path) == 0);
 }
 
 static void test_adaptive_calibration_search(void)
@@ -1020,6 +1108,7 @@ static void test_adaptive_calibration_search(void)
             }
             ++tested;
             CHECK(um_modem_config_validate(&config) == UM_OK);
+            CHECK(config.window_samples != 0u);
             CHECK(candidate_id < search.node_count);
             if (candidate_id == 0u) {
                 CHECK(step == UM_CALIB_STEP_BASELINE);
@@ -1041,6 +1130,15 @@ static void test_adaptive_calibration_search(void)
                 } else {
                     CHECK(config_difference_count(
                               &config, &search.nodes[parent].config) == 1u);
+                    if (step != UM_CALIB_STEP_NARROW_BAND &&
+                        step != UM_CALIB_STEP_MORE_REPETITIONS) {
+                        CHECK(um_calibration_payload_rate(
+                                  &config, UM_CALIBRATION_PROBE_BYTES) >
+                              um_calibration_payload_rate(
+                                  &search.nodes[parent].config,
+                                  UM_CALIBRATION_PROBE_BYTES) +
+                                  0.5f);
+                    }
                 }
                 CHECK(step != UM_CALIB_STEP_BASELINE);
             }
@@ -1066,7 +1164,8 @@ static void test_adaptive_calibration_search(void)
                search.node_count,
                1000.0 * (double)maximum_samples / (double)UM_SAMPLE_RATE,
                step_mask, qam_mask, fec_mask);
-        CHECK(tested == search.budget);
+        CHECK(tested <= search.budget);
+        CHECK(tested >= 12u);
         CHECK((qam_mask & 6u) == 6u);
         CHECK((fec_mask & 3u) == 3u);
         if (quality_modes[mode] != 0) {
@@ -1081,7 +1180,36 @@ static void test_adaptive_calibration_search(void)
         if (quality_modes[mode] != 0) {
             CHECK((step_mask & (1u << UM_CALIB_STEP_SYNC)) != 0u);
             CHECK((step_mask & (1u << UM_CALIB_STEP_GAP)) != 0u);
-            CHECK((step_mask & (1u << UM_CALIB_STEP_WINDOW)) != 0u);
+            CHECK(tested < search.budget);
+        }
+        {
+            size_t index;
+            for (index = 0u; index < search.node_count; ++index) {
+                size_t compare;
+                unsigned attempts = 0u;
+                int any_pass = 0;
+                const um_calibration_search_node *node =
+                    &search.nodes[index];
+                if (node->recorded == 0 ||
+                    node->step == UM_CALIB_STEP_BASELINE ||
+                    node->step == UM_CALIB_STEP_DATA_DEFAULT ||
+                    node->step == UM_CALIB_STEP_MORE_REPETITIONS) {
+                    continue;
+                }
+                for (compare = 0u; compare < search.node_count; ++compare) {
+                    const um_calibration_search_node *other =
+                        &search.nodes[compare];
+                    if (other->recorded != 0 && other->step == node->step &&
+                        calibration_variant(other) ==
+                            calibration_variant(node)) {
+                        ++attempts;
+                        any_pass |= other->passed;
+                    }
+                }
+                if (any_pass != 0) {
+                    CHECK(attempts <= 2u);
+                }
+            }
         }
     }
 
@@ -1111,7 +1239,8 @@ static void test_adaptive_calibration_search(void)
             }
         }
         CHECK(tested < search.budget);
-        CHECK(tested == 9u);
+        /* Baseline plus its seven rate-useful direct alternatives. */
+        CHECK(tested == 8u);
         CHECK(search.passed_count == 1u);
     }
 
@@ -1156,7 +1285,8 @@ static void test_adaptive_calibration_search(void)
                "shortest-prefix=%u probes=%zu\n",
                qam_passes, qam_attempts, widest_band, shortest_prefix,
                tested);
-        CHECK(tested == search.budget);
+        CHECK(tested <= search.budget);
+        CHECK(tested >= 24u);
         CHECK(qam_attempts == observed_qam_attempts);
         CHECK(qam_attempts >= 1u);
         CHECK(qam_attempts <= 2u);
@@ -1196,6 +1326,63 @@ static void test_adaptive_calibration_search(void)
         CHECK(ranked[3] == 1u);
         CHECK(ranked[4] == 0u);
     }
+
+    {
+        um_calibration_search search;
+        um_modem_config config;
+        um_calibration_step step;
+        size_t candidate_id;
+        CHECK(um_calibration_search_init(&search, 1) == UM_OK);
+        CHECK(um_calibration_search_next(&search, &candidate_id, &config,
+                                         &step) == 1);
+        CHECK(candidate_id == 0u);
+        CHECK(step == UM_CALIB_STEP_BASELINE);
+        CHECK(config_difference_count(&config,
+                                      &search.nodes[0].config) == 0u);
+        CHECK(um_calibration_search_record(&search, candidate_id, 0) ==
+              UM_OK);
+        CHECK(um_calibration_search_next(&search, &candidate_id, &config,
+                                         &step) == 1);
+        CHECK(step == UM_CALIB_STEP_MORE_REPETITIONS);
+        CHECK(config.symbol_repetitions == 3u);
+        CHECK(search.nodes[candidate_id].parent == 0u);
+        CHECK(um_calibration_search_record(&search, candidate_id, 0) ==
+              UM_OK);
+        CHECK(um_calibration_search_next(&search, &candidate_id, &config,
+                                         &step) == 1);
+        CHECK(step == UM_CALIB_STEP_MORE_REPETITIONS);
+        CHECK(config.symbol_repetitions == 4u);
+        CHECK(um_calibration_search_record(&search, candidate_id, 0) ==
+              UM_OK);
+        CHECK(um_calibration_search_next(&search, &candidate_id, &config,
+                                         &step) == 0);
+        CHECK(search.tested_count == 3u);
+        CHECK(search.passed_count == 0u);
+    }
+
+    {
+        um_calibration_search search;
+        um_modem_config config;
+        um_calibration_step step;
+        size_t candidate_id;
+        size_t recovery_id;
+        CHECK(um_calibration_search_init(&search, 1) == UM_OK);
+        CHECK(um_calibration_search_next(&search, &candidate_id, &config,
+                                         &step) == 1);
+        CHECK(um_calibration_search_record(&search, candidate_id, 0) ==
+              UM_OK);
+        CHECK(um_calibration_search_next(&search, &recovery_id, &config,
+                                         &step) == 1);
+        CHECK(step == UM_CALIB_STEP_MORE_REPETITIONS);
+        CHECK(config.symbol_repetitions == 3u);
+        CHECK(um_calibration_search_record(&search, recovery_id, 1) ==
+              UM_OK);
+        CHECK(um_calibration_search_next(&search, &candidate_id, &config,
+                                         &step) == 1);
+        CHECK(search.nodes[candidate_id].parent == recovery_id);
+        CHECK(search.nodes[recovery_id].passed != 0);
+        CHECK(step != UM_CALIB_STEP_MORE_REPETITIONS);
+    }
 }
 
 int main(void)
@@ -1220,6 +1407,7 @@ int main(void)
     test_rejects_noise();
     test_async_session_distortion_ladder();
     test_live_wire_protocol();
+    test_calibration_config_file();
     test_adaptive_calibration_search();
 
     if (failures != 0) {

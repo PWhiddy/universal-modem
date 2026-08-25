@@ -19,8 +19,11 @@
 #define UM_HEADER_BITS (UM_HEADER_BYTES * 8u)
 #define UM_FEC_TAIL_BITS 6u
 #define UM_MAX_PAYLOAD 65535u
-#define UM_CALIBRATION_SEARCH_MAX_NODES 192u
+#define UM_CALIBRATION_SEARCH_MAX_NODES 512u
 #define UM_CALIBRATION_PROBE_BYTES 128u
+#define UM_LIVE_PROTOCOL_VERSION 3u
+#define UM_LIVE_CONFIG_FORMAT_VERSION 1u
+#define UM_LIVE_HANDSHAKE_BYTES 4u
 
 typedef enum {
     UM_CALIB_STEP_BASELINE = 0,
@@ -34,8 +37,8 @@ typedef enum {
     UM_CALIB_STEP_GAP,
     UM_CALIB_STEP_TRAINING,
     UM_CALIB_STEP_NARROW_BAND,
-    UM_CALIB_STEP_WINDOW,
     UM_CALIB_STEP_DATA_DEFAULT,
+    UM_CALIB_STEP_MORE_REPETITIONS,
     UM_CALIB_STEP_COUNT
 } um_calibration_step;
 
@@ -118,6 +121,7 @@ size_t um_interleave_stride(size_t count);
 um_modem_config um_modem_robust_config(void);
 um_channel_config um_channel_recorded_v2_config(unsigned direction);
 int um_modem_metrics_have_baseline_margin(const um_rx_metrics *metrics);
+int um_modem_config_uses_robust_gate(const um_modem_config *config);
 int um_modem_metrics_have_margin(const um_modem_config *config,
                                  const um_rx_metrics *metrics);
 size_t um_calibration_search_budget(int high_quality);
@@ -137,6 +141,12 @@ size_t um_calibration_rank_candidates(
     const um_calibration_search *search,
     const float scores[UM_CALIBRATION_SEARCH_MAX_NODES], size_t *ranked,
     size_t ranked_capacity);
+void um_live_handshake_body(uint8_t body[UM_LIVE_HANDSHAKE_BYTES]);
+int um_live_handshake_validate(const uint8_t *body, size_t body_length);
+int um_calibration_config_load(const char *path, um_live_role role,
+                               um_modem_config *config, int *found);
+int um_calibration_config_save(const char *path, um_live_role role,
+                               const um_modem_config *config);
 const char *um_calibration_step_name(um_calibration_step step);
 float um_calibration_payload_rate(const um_modem_config *config,
                                   size_t payload_bytes);

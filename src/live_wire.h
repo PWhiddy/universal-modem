@@ -25,7 +25,8 @@ typedef enum {
     UM_WIRE_DATA = 12,
     UM_WIRE_ACK = 13,
     UM_WIRE_TURN = 14,
-    UM_WIRE_COMPLETE = 15
+    UM_WIRE_COMPLETE = 15,
+    UM_WIRE_CALIB_CACHE = 16
 } um_live_wire_type;
 
 typedef struct {

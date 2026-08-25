@@ -20,6 +20,7 @@ endif
 LIB_SOURCES := \
 	src/audio.c \
 	src/calibration.c \
+	src/calibration_config.c \
 	src/channel.c \
 	src/crc.c \
 	src/distortion.c \

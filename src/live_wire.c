@@ -33,7 +33,7 @@ int um_live_wire_encode(um_live_wire_type type, uint32_t session_id,
                         size_t wire_capacity, size_t *wire_length)
 {
     size_t length;
-    if (type < UM_WIRE_DISCOVER || type > UM_WIRE_COMPLETE ||
+    if (type < UM_WIRE_DISCOVER || type > UM_WIRE_CALIB_CACHE ||
         (body_length != 0u && body == NULL) || body_length > UM_LIVE_MAX_BODY ||
         wire == NULL || wire_length == NULL) {
         return UM_ERR_ARGUMENT;
@@ -64,7 +64,7 @@ int um_live_wire_decode(const uint8_t *wire, size_t wire_length,
         wire_length < UM_LIVE_WIRE_HEADER_SIZE ||
         wire[0] != UINT8_C(0x55) || wire[1] != UINT8_C(0x41) ||
         wire[2] != 1u || wire[3] < UM_WIRE_DISCOVER ||
-        wire[3] > UM_WIRE_COMPLETE) {
+        wire[3] > UM_WIRE_CALIB_CACHE) {
         return UM_ERR_HEADER;
     }
     body_length = read_u16(&wire[10]);

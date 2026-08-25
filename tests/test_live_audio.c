@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
 
@@ -30,6 +31,9 @@ typedef struct {
     int verify_drop_endpoint;
     int verify_drop_armed;
     unsigned verification_drops;
+    int baseline_drop_endpoint;
+    int baseline_drop_armed;
+    unsigned baseline_drops;
     int runners_done;
 } simulated_bus;
 
@@ -42,6 +46,9 @@ static simulated_bus bus = {
     {0, 0},
     {0, 0},
     {{0}, {0}},
+    0u,
+    -1,
+    0,
     0u,
     -1,
     0,
@@ -61,8 +68,12 @@ typedef struct {
     char logs[256][512];
     unsigned connected;
     unsigned calibrating;
-    unsigned baseline_passes;
-    unsigned grounded_defaults;
+    unsigned robust_passes;
+    unsigned recovery_probes;
+    unsigned cache_exchanges;
+    unsigned cache_skips;
+    unsigned cache_loads;
+    unsigned cache_saves;
     unsigned calibration_selections;
     unsigned baseline_selections;
     unsigned adaptive_upgrades;
@@ -97,11 +108,23 @@ static void test_log(void *context, const char *message)
     if (strstr(message, "state=CALIBRATING direction=") != NULL) {
         ++run->calibrating;
     }
-    if (strstr(message, "id=0 step=working-baseline PASS") != NULL) {
-        ++run->baseline_passes;
+    if (strstr(message, "gate=crc+sync/snr") != NULL) {
+        ++run->robust_passes;
     }
-    if (strstr(message, "step=grounded-data-default") != NULL) {
-        ++run->grounded_defaults;
+    if (strstr(message, "step=more-repetitions-recovery") != NULL) {
+        ++run->recovery_probes;
+    }
+    if (strstr(message, "Calibration cache exchange") != NULL) {
+        ++run->cache_exchanges;
+    }
+    if (strstr(message, "state=CALIBRATION_SKIPPED") != NULL) {
+        ++run->cache_skips;
+    }
+    if (strstr(message, "Loaded calibration cache") != NULL) {
+        ++run->cache_loads;
+    }
+    if (strstr(message, "Saved calibration cache") != NULL) {
+        ++run->cache_saves;
     }
     if (strstr(message, "calib selected") != NULL) {
         ++run->calibration_selections;
@@ -123,6 +146,16 @@ static void test_log(void *context, const char *message)
         if (bus.verify_drop_endpoint == endpoint &&
             bus.verification_drops == 0u) {
             bus.verify_drop_armed = 1;
+        }
+        (void)pthread_mutex_unlock(&bus.mutex);
+    }
+    if (run->options.role == UM_LIVE_GATEWAY &&
+        strstr(message,
+               "state=CALIBRATING direction=client->gateway") != NULL) {
+        (void)pthread_mutex_lock(&bus.mutex);
+        if (bus.baseline_drop_endpoint == SIM_CLIENT &&
+            bus.baseline_drops == 0u) {
+            bus.baseline_drop_armed = 1;
         }
         (void)pthread_mutex_unlock(&bus.mutex);
     }
@@ -320,6 +353,12 @@ int um_audio_write(um_audio *audio, const float *samples, size_t frame_count)
         ++bus.verification_drops;
         drop_write = 1;
     }
+    if (bus.baseline_drop_armed != 0 &&
+        bus.baseline_drop_endpoint == audio->endpoint) {
+        bus.baseline_drop_armed = 0;
+        ++bus.baseline_drops;
+        drop_write = 1;
+    }
     (void)pthread_mutex_unlock(&bus.mutex);
     if (drop_write != 0) {
         return UM_OK;
@@ -390,22 +429,21 @@ static void print_logs(const runner *run)
     }
 }
 
-static int check_runner(const runner *run, int require_upgrade,
-                        int require_baseline)
+static int check_runner(const runner *run, unsigned expected_calibrations)
 {
     return run->status == UM_OK && run->connected == 1u &&
-           run->calibrating == 2u && run->baseline_passes >= 1u &&
-           run->grounded_defaults >= 2u &&
-           run->calibration_selections == 2u &&
-           (require_upgrade == 0 || run->adaptive_upgrades >= 1u) &&
-           (require_baseline == 0 || run->baseline_selections >= 1u) &&
+           run->calibrating == expected_calibrations &&
+           run->calibration_selections == expected_calibrations &&
+           run->cache_exchanges == 1u &&
+           run->cache_skips == 2u - expected_calibrations &&
            run->forward_transfer == 1u &&
            run->reverse_transfer == 1u && run->completed == 1u &&
            run->reconnecting == 0u;
 }
 
 static void configure_runner(runner *run, const char *name,
-                             um_live_role role, const char *device)
+                             um_live_role role, const char *device,
+                             const char *calibration_path)
 {
     memset(run, 0, sizeof(*run));
     run->name = name;
@@ -416,13 +454,18 @@ static void configure_runner(runner *run, const char *name,
     run->options.chunk_bytes = 64u;
     run->options.retry_limit = 5u;
     run->options.discovery_interval_seconds = 0.4f;
+    run->options.calibration_path = calibration_path;
 }
 
 static int run_pair(const char *label,
                     const um_channel_config *client_to_gateway,
                     const um_channel_config *gateway_to_client,
                     int require_upgrade, int require_baseline,
-                    int inject_verification_fallback)
+                    int inject_verification_fallback,
+                    int inject_baseline_recovery,
+                    unsigned expected_calibrations,
+                    const char *client_calibration_path,
+                    const char *gateway_calibration_path)
 {
     runner client;
     runner gateway;
@@ -432,8 +475,10 @@ static int run_pair(const char *label,
     int timed_out = 0;
     int status;
 
-    configure_runner(&client, "client", UM_LIVE_CLIENT, "sim-client");
-    configure_runner(&gateway, "gateway", UM_LIVE_GATEWAY, "sim-gateway");
+    configure_runner(&client, "client", UM_LIVE_CLIENT, "sim-client",
+                     client_calibration_path);
+    configure_runner(&gateway, "gateway", UM_LIVE_GATEWAY, "sim-gateway",
+                     gateway_calibration_path);
 
     (void)pthread_mutex_lock(&bus.mutex);
     bus.channel[SIM_CLIENT] = *client_to_gateway;
@@ -450,6 +495,11 @@ static int run_pair(const char *label,
                                    : -1;
     bus.verify_drop_armed = 0;
     bus.verification_drops = 0u;
+    bus.baseline_drop_endpoint = inject_baseline_recovery != 0
+                                     ? SIM_CLIENT
+                                     : -1;
+    bus.baseline_drop_armed = 0;
+    bus.baseline_drops = 0u;
     bus.runners_done = 0;
     (void)pthread_mutex_unlock(&bus.mutex);
 
@@ -480,7 +530,7 @@ static int run_pair(const char *label,
 
     (void)pthread_mutex_lock(&bus.mutex);
     (void)clock_gettime(CLOCK_REALTIME, &deadline);
-    add_milliseconds(&deadline, 45000u);
+    add_milliseconds(&deadline, 60000u);
     while (bus.runners_done < 2) {
         status = pthread_cond_timedwait(&bus.changed, &bus.mutex, &deadline);
         if (status == ETIMEDOUT) {
@@ -497,11 +547,22 @@ static int run_pair(const char *label,
     (void)pthread_join(gateway_thread, NULL);
 
     if (timed_out != 0 ||
-        !check_runner(&client, require_upgrade, require_baseline) ||
-        !check_runner(&gateway, require_upgrade, require_baseline) ||
+        !check_runner(&client, expected_calibrations) ||
+        !check_runner(&gateway, expected_calibrations) ||
+        (expected_calibrations != 0u &&
+         (client.robust_passes + gateway.robust_passes <
+              expected_calibrations)) ||
+        (require_upgrade != 0 &&
+         client.adaptive_upgrades + gateway.adaptive_upgrades == 0u) ||
+        (require_baseline != 0 &&
+         client.baseline_selections + gateway.baseline_selections == 0u) ||
         (inject_verification_fallback != 0 &&
          (bus.verification_drops != 1u ||
-          client.verification_fallbacks == 0u))) {
+          client.verification_fallbacks + gateway.verification_fallbacks ==
+              0u)) ||
+        (inject_baseline_recovery != 0 &&
+         (bus.baseline_drops != 1u ||
+          client.recovery_probes + gateway.recovery_probes == 0u))) {
         fprintf(stderr,
                 "%s paired live simulation failed timeout=%d client=%s "
                 "gateway=%s\n",
@@ -513,10 +574,13 @@ static int run_pair(const char *label,
     }
     printf("paired live %s passed: connection, adaptive 2-way calibration, "
            "delayed capture restart, 256+256 bytes; upgrades=%u/%u "
-           "fallbacks=%u/%u verification-stepdowns=%u\n",
+           "fallbacks=%u/%u verification-stepdowns=%u calibrations=%u "
+           "cache-skips=%u recovery-probes=%u\n",
            label, client.adaptive_upgrades, gateway.adaptive_upgrades,
            client.baseline_selections, gateway.baseline_selections,
-           client.verification_fallbacks + gateway.verification_fallbacks);
+           client.verification_fallbacks + gateway.verification_fallbacks,
+           expected_calibrations, client.cache_skips + gateway.cache_skips,
+           client.recovery_probes + gateway.recovery_probes);
     return 0;
 }
 
@@ -525,19 +589,66 @@ int main(void)
     um_channel_config v2_forward = um_channel_recorded_v2_config(0u);
     um_channel_config v2_reverse = um_channel_recorded_v2_config(1u);
     um_distortion_profile strong;
+    um_modem_config cached;
+    char client_path[160];
+    char gateway_path[160];
+    int found;
     int status;
 
-    status = run_pair("v2-worse", &v2_forward, &v2_reverse, 1, 0, 1);
+    (void)snprintf(client_path, sizeof(client_path),
+                   "/tmp/universal-modem-live-client-%ld.config",
+                   (long)getpid());
+    (void)snprintf(gateway_path, sizeof(gateway_path),
+                   "/tmp/universal-modem-live-gateway-%ld.config",
+                   (long)getpid());
+    (void)remove(client_path);
+    (void)remove(gateway_path);
+
+    status = run_pair("v2-worse", &v2_forward, &v2_reverse, 0, 0, 1, 0,
+                      2u, client_path, gateway_path);
+    if (status == 0) {
+        found = 0;
+        if (um_calibration_config_load(client_path, UM_LIVE_CLIENT, &cached,
+                                       &found) != UM_OK ||
+            found == 0) {
+            fprintf(stderr, "client calibration cache was not saved\n");
+            status = 1;
+        }
+    }
+    if (status == 0) {
+        found = 0;
+        if (um_calibration_config_load(gateway_path, UM_LIVE_GATEWAY, &cached,
+                                       &found) != UM_OK ||
+            found == 0) {
+            fprintf(stderr, "gateway calibration cache was not saved\n");
+            status = 1;
+        }
+    }
+    if (status == 0) {
+        status = run_pair("both-cached", &v2_forward, &v2_reverse, 0, 0, 0,
+                          0, 0u, client_path, gateway_path);
+    }
+    if (status == 0) {
+        (void)remove(gateway_path);
+        status = run_pair("one-side-missing-recovery", &v2_forward,
+                          &v2_reverse, 0, 0, 0, 1, 1u, client_path,
+                          gateway_path);
+    }
     if (status == 0) {
         if (um_distortion_profile_get(5u, &strong) != UM_OK) {
             fprintf(stderr, "could not load baseline-fallback distortion\n");
             status = 1;
         } else {
+            (void)remove(client_path);
+            (void)remove(gateway_path);
             status = run_pair("baseline-fallback", &strong.client_to_gateway,
-                              &strong.gateway_to_client, 0, 1, 0);
+                              &strong.gateway_to_client, 0, 1, 0, 0, 2u,
+                              client_path, gateway_path);
         }
     }
 
+    (void)remove(client_path);
+    (void)remove(gateway_path);
     free(bus.queued[SIM_CLIENT]);
     free(bus.queued[SIM_GATEWAY]);
     return status;

@@ -186,6 +186,7 @@ typedef struct {
     unsigned retry_limit;
     float discovery_interval_seconds;
     int calibrate_high_quality;
+    const char *calibration_path;
 } um_live_audio_options;
 
 uint32_t um_crc32(const uint8_t *data, size_t length);

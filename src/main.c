@@ -21,7 +21,8 @@ static void usage(FILE *stream)
             "  --test-bytes N       Bytes sent in each direction (default 1024)\n"
             "  --chunk-bytes N      Data bytes per acknowledged frame (default 128)\n"
             "  --retries N          Attempts per test frame (default 4)\n"
-            "  --calib-high         Use the extended real-audio calibration\n");
+            "  --calib-high         Use the extended real-audio calibration\n"
+            "  calibration.config  Auto-loaded/saved; delete it to recalibrate\n");
 }
 
 static void print_log(void *context, const char *message)
