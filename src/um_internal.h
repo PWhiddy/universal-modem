@@ -14,6 +14,7 @@
 #define UM_TRAINING_SYMBOLS 3u
 #define UM_MAX_SYNC_SAMPLES 2048u
 #define UM_MAX_TRAINING_SYMBOLS 4u
+#define UM_MAX_SYMBOL_REPETITIONS 4u
 #define UM_HEADER_BYTES 16u
 #define UM_HEADER_BITS (UM_HEADER_BYTES * 8u)
 #define UM_FEC_TAIL_BITS 6u
@@ -75,5 +76,9 @@ void um_bytes_to_bits(const uint8_t *bytes, size_t byte_count, uint8_t *bits);
 void um_bits_to_bytes(const uint8_t *bits, size_t bit_count, uint8_t *bytes);
 size_t um_gcd_size(size_t a, size_t b);
 size_t um_interleave_stride(size_t count);
+
+um_modem_config um_modem_robust_config(void);
+int um_modem_metrics_have_margin(const um_modem_config *config,
+                                 const um_rx_metrics *metrics);
 
 #endif

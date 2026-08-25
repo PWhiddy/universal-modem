@@ -336,6 +336,62 @@ static void test_input_normalization(void)
     free(transmitted);
 }
 
+static void test_robust_low_level_colored_noise(void)
+{
+    um_modem_config config = um_modem_robust_config();
+    um_channel_config channel = um_channel_default_config();
+    uint8_t payload[128];
+    uint8_t decoded[sizeof(payload)];
+    float *transmitted = NULL;
+    float *received = NULL;
+    size_t transmitted_count = 0u;
+    size_t received_count = 0u;
+    size_t decoded_count = 0u;
+    uint16_t sequence = 0u;
+    um_rx_metrics metrics;
+    size_t i;
+
+    ++tests_run;
+    for (i = 0u; i < sizeof(payload); ++i) {
+        payload[i] = (uint8_t)test_random();
+    }
+    CHECK(config.first_bin == 64u);
+    CHECK(config.last_bin == 298u);
+    CHECK(config.symbol_repetitions == 2u);
+    CHECK(um_modulate_frame(&config, payload, sizeof(payload), 0x6c21u,
+                            &transmitted, &transmitted_count) == UM_OK);
+    channel.leading_silence = 839u;
+    channel.gain = 0.012f;
+    channel.noise_stddev = 0.0012f;
+    channel.echo_delay = 731u;
+    channel.echo_gain = 0.48f;
+    channel.random_seed = UINT32_C(0x2408e113);
+    CHECK(um_channel_apply(transmitted, transmitted_count, &channel,
+                           &received, &received_count) == UM_OK);
+    for (i = 0u; i < received_count; ++i) {
+        float time = (float)i / (float)UM_SAMPLE_RATE;
+        received[i] += 0.008f * sinf(2.0f * UM_PI * 117.0f * time) +
+                       0.003f * sinf(2.0f * UM_PI * 347.0f * time);
+    }
+    memset(&metrics, 0, sizeof(metrics));
+    CHECK(um_demodulate_frame(&config, received, received_count, decoded,
+                              sizeof(decoded), &decoded_count, &sequence,
+                              &metrics) == UM_OK);
+    CHECK(decoded_count == sizeof(payload));
+    CHECK(sequence == 0x6c21u);
+    CHECK(memcmp(decoded, payload, sizeof(payload)) == 0);
+    printf("robust low-level: peak=%.1f dBFS sync=%.3f snr=%.1f dB "
+           "evm=%.3f\n",
+           20.0 * log10((double)metrics.input_peak),
+           metrics.sync_correlation, metrics.estimated_snr_db,
+           metrics.evm_rms);
+    CHECK(metrics.input_peak < 0.03f);
+    CHECK(metrics.sync_correlation > 0.35f);
+    CHECK(metrics.ofdm_symbols > config.training_symbols);
+    free(received);
+    free(transmitted);
+}
+
 static void test_room_reverb_and_clock_drift(void)
 {
     static const unsigned delays[] = {0u, 127u, 361u, 593u, 731u};
@@ -540,6 +596,8 @@ static void test_boundary_window(void)
     float peak = 0.0f;
     float training_peak = 0.0f;
     double training_energy = 0.0;
+    double header_energy = 0.0;
+    double payload_energy = 0.0;
     size_t over_full_scale = 0u;
     size_t i;
     ++tests_run;
@@ -567,10 +625,17 @@ static void test_boundary_window(void)
     {
         size_t training_start = UM_SYNC_LEAD + windowed.sync_samples +
                                 windowed.sync_gap + windowed.cyclic_prefix;
+        size_t hop = windowed.fft_size + windowed.cyclic_prefix;
+        size_t header_start = training_start + windowed.training_symbols * hop;
+        size_t payload_start = header_start + hop;
         for (i = 0u; i < windowed.fft_size; ++i) {
             float value = windowed_samples[training_start + i];
             float magnitude = fabsf(value);
             training_energy += (double)value * value;
+            header_energy += (double)windowed_samples[header_start + i] *
+                             windowed_samples[header_start + i];
+            payload_energy += (double)windowed_samples[payload_start + i] *
+                              windowed_samples[payload_start + i];
             if (magnitude > training_peak) {
                 training_peak = magnitude;
             }
@@ -585,15 +650,88 @@ static void test_boundary_window(void)
                sqrt(training_energy / (double)windowed.fft_size),
            training_peak,
            sqrt(training_energy / (double)windowed.fft_size));
+    printf("symbol rms: training=%.3f header=%.3f payload=%.3f\n",
+           sqrt(training_energy / (double)windowed.fft_size),
+           sqrt(header_energy / (double)windowed.fft_size),
+           sqrt(payload_energy / (double)windowed.fft_size));
     CHECK(peak <= 0.901f);
     CHECK(over_full_scale == 0u);
     CHECK(training_peak /
               sqrt(training_energy / (double)windowed.fft_size) <
           2.5);
-    CHECK(sqrt(training_energy / (double)windowed.fft_size) > 0.30);
+    CHECK(fabs(sqrt(training_energy / (double)windowed.fft_size) - 0.24) <
+          0.005);
+    CHECK(sqrt(header_energy / (double)windowed.fft_size) > 0.20);
+    CHECK(sqrt(payload_energy / (double)windowed.fft_size) > 0.20);
     CHECK(windowed_leakage < plain_leakage);
     free(windowed_samples);
     free(plain_samples);
+}
+
+static double symbol_rms(const float *samples, size_t core, size_t fft_size)
+{
+    double energy = 0.0;
+    size_t i;
+    for (i = 0u; i < fft_size; ++i) {
+        energy += (double)samples[core + i] * samples[core + i];
+    }
+    return sqrt(energy / (double)fft_size);
+}
+
+static void test_control_symbol_power(void)
+{
+    um_modem_config config = um_modem_robust_config();
+    uint8_t payload[UM_LIVE_WIRE_HEADER_SIZE] = {0u};
+    float *samples = NULL;
+    size_t sample_count = 0u;
+    size_t hop = config.fft_size + config.cyclic_prefix;
+    size_t ofdm_start = UM_SYNC_LEAD + config.sync_samples + config.sync_gap;
+    size_t training_core = ofdm_start + config.cyclic_prefix;
+    size_t header_core = training_core + config.training_symbols * hop;
+    size_t payload_core =
+        header_core + config.symbol_repetitions * hop;
+    double training_level;
+    double header_level;
+    double payload_level;
+
+    ++tests_run;
+    CHECK(um_modulate_frame(&config, payload, sizeof(payload), 7u, &samples,
+                            &sample_count) == UM_OK);
+    CHECK(payload_core + config.fft_size <= sample_count);
+    training_level = symbol_rms(samples, training_core, config.fft_size);
+    header_level = symbol_rms(samples, header_core, config.fft_size);
+    payload_level = symbol_rms(samples, payload_core, config.fft_size);
+    printf("control symbol rms: training=%.3f header=%.3f payload=%.3f\n",
+           training_level, header_level, payload_level);
+    CHECK(training_level > 0.23 && training_level < 0.25);
+    CHECK(header_level > 0.20 && header_level < 0.25);
+    CHECK(payload_level > 0.20 && payload_level < 0.25);
+    CHECK(header_level / training_level > 0.83);
+    CHECK(payload_level / training_level > 0.83);
+    free(samples);
+}
+
+static void test_reliability_margin(void)
+{
+    um_modem_config config = um_modem_robust_config();
+    um_rx_metrics metrics = {0};
+
+    ++tests_run;
+    metrics.sync_correlation = 0.54f;
+    metrics.estimated_snr_db = 15.0f;
+    metrics.evm_rms = 0.265f;
+    CHECK(um_modem_metrics_have_margin(&config, &metrics));
+
+    config.qam_bits = 4u;
+    CHECK(!um_modem_metrics_have_margin(&config, &metrics));
+
+    config.qam_bits = 6u;
+    metrics.estimated_snr_db = 24.0f;
+    metrics.evm_rms = 0.060f;
+    CHECK(um_modem_metrics_have_margin(&config, &metrics));
+
+    metrics.sync_correlation = 0.20f;
+    CHECK(!um_modem_metrics_have_margin(&config, &metrics));
 }
 
 static void test_rejects_noise(void)
@@ -601,6 +739,8 @@ static void test_rejects_noise(void)
     um_modem_config config = um_modem_default_config();
     float noise[2500];
     uint8_t decoded[64];
+    float *long_noise = NULL;
+    size_t long_count = UM_SAMPLE_RATE * 2u;
     size_t decoded_count;
     uint16_t sequence;
     size_t i;
@@ -615,6 +755,22 @@ static void test_rejects_noise(void)
                                  sizeof(decoded), &decoded_count, &sequence,
                                  NULL);
     CHECK(status == UM_ERR_SYNC);
+    config = um_modem_robust_config();
+    long_noise = (float *)malloc(long_count * sizeof(*long_noise));
+    CHECK(long_noise != NULL);
+    for (i = 0u; i < long_count; ++i) {
+        float time = (float)i / (float)UM_SAMPLE_RATE;
+        long_noise[i] =
+            0.012f * sinf(2.0f * UM_PI * 117.0f * time) +
+            0.005f * sinf(2.0f * UM_PI * 347.0f * time) +
+            ((float)(test_random() & 0xffffu) / 32768.0f - 1.0f) *
+                0.003f;
+    }
+    status = um_demodulate_frame(&config, long_noise, long_count, decoded,
+                                 sizeof(decoded), &decoded_count, &sequence,
+                                 NULL);
+    CHECK(status == UM_ERR_SYNC);
+    free(long_noise);
 }
 
 static void test_async_session_distortion_ladder(void)
@@ -720,7 +876,7 @@ static void test_live_calibration_candidates(void)
         unsigned pair_masks[6] = {0u, 0u, 0u, 0u, 0u, 0u};
         size_t maximum_samples = 0u;
         size_t candidate;
-        CHECK(count == (quality_modes[mode] == 0 ? 9u : 94u));
+        CHECK(count == (quality_modes[mode] == 0 ? 10u : 95u));
         for (candidate = 0u; candidate < count; ++candidate) {
             um_modem_config config;
             uint8_t probe_wire[UM_LIVE_WIRE_HEADER_SIZE + 16u];
@@ -729,6 +885,15 @@ static void test_live_calibration_candidates(void)
             CHECK(um_live_calibration_candidate_get(
                       quality_modes[mode], candidate, &config) == UM_OK);
             CHECK(um_modem_config_validate(&config) == UM_OK);
+            if (candidate == 0u) {
+                CHECK(config.first_bin == 64u);
+                CHECK(config.last_bin == 298u);
+                CHECK(config.qam_bits == 2u);
+                CHECK(config.fec_rate == UM_FEC_RATE_1_2);
+                CHECK(config.cyclic_prefix == 1024u);
+                CHECK(config.training_symbols == 4u);
+                CHECK(config.symbol_repetitions == 2u);
+            }
             qam_mask |= 1u << (config.qam_bits / 2u);
             fec_mask |= 1u << (unsigned)config.fec_rate;
             prefix_mask |= config.cyclic_prefix == 384u ? 1u :
@@ -737,7 +902,7 @@ static void test_live_calibration_candidates(void)
             window_mask |= config.window_samples == 0u ? 1u :
                            config.window_samples == 32u ? 2u :
                            config.window_samples == 64u ? 4u : 8u;
-            if (quality_modes[mode] == 0) {
+            if (quality_modes[mode] == 0 && candidate != 0u) {
                 unsigned range = config.last_bin == 362u ? 0u :
                                  config.last_bin == 490u ? 1u : 2u;
                 unsigned qam = config.qam_bits / 2u - 1u;
@@ -796,11 +961,14 @@ int main(void)
     test_clean_frames();
     test_impaired_frames();
     test_input_normalization();
+    test_robust_low_level_colored_noise();
     test_room_reverb_and_clock_drift();
     test_default_calibration();
     test_distortion_profiles();
     test_calibration_distortion_ladder();
     test_boundary_window();
+    test_control_symbol_power();
+    test_reliability_margin();
     test_rejects_noise();
     test_async_session_distortion_ladder();
     test_live_wire_protocol();

@@ -86,9 +86,9 @@ static size_t live_high_candidate_count(void)
 size_t um_live_calibration_candidate_count(int high_quality)
 {
     if (high_quality != 0) {
-        return live_high_candidate_count();
+        return 1u + live_high_candidate_count();
     }
-    return 9u;
+    return 10u;
 }
 
 int um_live_calibration_candidate_get(int high_quality, size_t index,
@@ -123,6 +123,12 @@ int um_live_calibration_candidate_get(int high_quality, size_t index,
     if (config == NULL) {
         return UM_ERR_ARGUMENT;
     }
+    /* Candidate zero is the non-negotiable working baseline. */
+    if (index == 0u) {
+        *config = um_modem_robust_config();
+        return um_modem_config_validate(config);
+    }
+    --index;
     if (high_quality == 0) {
         size_t range;
         size_t qam;
@@ -348,6 +354,7 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                         float raw_bps;
                         float quality;
                         float score;
+                        int reliable;
                         int status;
                         char line[320];
 
@@ -375,15 +382,19 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                             fatal_status = status;
                             goto done;
                         }
+                        reliable = status == UM_OK &&
+                                   um_modem_metrics_have_margin(&candidate,
+                                                                &metrics) != 0;
                         result->estimated_seconds += duration;
                         raw_bps =
                             (float)um_modem_data_carriers(&candidate) *
                             (float)candidate.qam_bits *
                             fec_ratio(candidate.fec_rate) *
                             (float)UM_SAMPLE_RATE /
-                            (float)(candidate.fft_size +
-                                    candidate.cyclic_prefix);
-                        quality = status == UM_OK
+                            ((float)(candidate.fft_size +
+                                     candidate.cyclic_prefix) *
+                             (float)candidate.symbol_repetitions);
+                        quality = reliable != 0
                                       ? 1.0f /
                                             (1.0f + 4.0f * metrics.evm_rms *
                                                         metrics.evm_rms)
@@ -395,9 +406,15 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                         } else if (candidate.window_samples > 8u) {
                             quality *= 0.995f;
                         }
-                        score = (raw_bps < payload_bps ? raw_bps : payload_bps) *
-                                quality;
-                        if (status == UM_OK) {
+                        /*
+                         * The 32-byte probe is intentionally short, so its
+                         * measured frame throughput is dominated by sync and
+                         * training and makes QPSK tie with QAM-64.  Rank by
+                         * sustained coded carrier rate, then require the
+                         * longer independent verification frames to prove it.
+                         */
+                        score = raw_bps * quality;
+                        if (reliable != 0) {
                             ++result->candidates_viable;
                             viable[viable_count].config = candidate;
                             viable[viable_count].score = score;
@@ -423,8 +440,10 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                                     (double)UM_SAMPLE_RATE,
                                 fec_name(candidate.fec_rate),
                                 candidate.window_samples,
-                                status == UM_OK ? "pass" :
-                                                  um_status_string(status),
+                                reliable != 0
+                                    ? "pass"
+                                    : status == UM_OK ? "marginal"
+                                                      : um_status_string(status),
                                 metrics.estimated_snr_db, metrics.evm_rms,
                                 payload_bps, score);
                             logger(logger_context, line);
@@ -457,6 +476,7 @@ done:
                 uint32_t seed = UINT32_C(0x10000) +
                                 (uint32_t)(rank * verification_trials + trial);
                 int status;
+                int reliable;
                 char line[256];
                 fill_probe(verification_probe, sizeof(verification_probe),
                            seed ^ UINT32_C(0x6a09e667));
@@ -465,6 +485,9 @@ done:
                     &viable[rank].config, channel, seed, verification_probe,
                     sizeof(verification_probe), &duration, &payload_bps,
                     &metrics);
+                reliable = status == UM_OK &&
+                           um_modem_metrics_have_margin(
+                               &viable[rank].config, &metrics) != 0;
                 ++result->verification_frames;
                 result->estimated_seconds += duration;
                 if (logger != NULL) {
@@ -475,8 +498,10 @@ done:
                         rank + 1u, trial + 1u, verification_trials,
                         1u << viable[rank].config.qam_bits,
                         fec_name(viable[rank].config.fec_rate),
-                        status == UM_OK ? "pass" :
-                                          um_status_string(status),
+                        reliable != 0
+                            ? "pass"
+                            : status == UM_OK ? "marginal"
+                                              : um_status_string(status),
                         metrics.estimated_snr_db, metrics.evm_rms);
                     logger(logger_context, line);
                 }
@@ -484,7 +509,7 @@ done:
                     free(viable);
                     return status;
                 }
-                if (status != UM_OK) {
+                if (reliable == 0) {
                     break;
                 }
                 ++passes;

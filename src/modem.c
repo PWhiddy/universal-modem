@@ -107,6 +107,7 @@ um_modem_config um_modem_default_config(void)
     config.sync_samples = UM_SYNC_SAMPLES;
     config.sync_gap = UM_SYNC_GAP;
     config.training_symbols = UM_TRAINING_SYMBOLS;
+    config.symbol_repetitions = 1u;
     config.qam_bits = 4u;
     config.fec_rate = UM_FEC_RATE_1_2;
     return config;
@@ -126,6 +127,8 @@ int um_modem_config_validate(const um_modem_config *config)
         config->sync_gap > UM_SAMPLE_RATE / 5u ||
         config->training_symbols < 2u ||
         config->training_symbols > UM_MAX_TRAINING_SYMBOLS ||
+        config->symbol_repetitions < 1u ||
+        config->symbol_repetitions > UM_MAX_SYMBOL_REPETITIONS ||
         (config->qam_bits != 2u && config->qam_bits != 4u &&
          config->qam_bits != 6u) ||
         (config->fec_rate != UM_FEC_RATE_1_2 &&
@@ -135,6 +138,58 @@ int um_modem_config_validate(const um_modem_config *config)
     }
     carriers = um_modem_data_carriers(config);
     return carriers >= 8u ? UM_OK : UM_ERR_CONFIG;
+}
+
+um_modem_config um_modem_robust_config(void)
+{
+    um_modem_config config = um_modem_default_config();
+    config.first_bin = 64u;
+    config.last_bin = 298u;
+    config.cyclic_prefix = 1024u;
+    config.window_samples = 96u;
+    config.sync_samples = UM_MAX_SYNC_SAMPLES;
+    config.sync_gap = 3072u;
+    config.training_symbols = UM_MAX_TRAINING_SYMBOLS;
+    config.symbol_repetitions = 2u;
+    config.qam_bits = 2u;
+    config.fec_rate = UM_FEC_RATE_1_2;
+    return config;
+}
+
+int um_modem_metrics_have_margin(const um_modem_config *config,
+                                 const um_rx_metrics *metrics)
+{
+    float minimum_snr;
+    float maximum_evm;
+    if (config == NULL || metrics == NULL) {
+        return 0;
+    }
+    switch (config->qam_bits) {
+    case 2u:
+        minimum_snr = 8.0f;
+        maximum_evm = 0.42f;
+        break;
+    case 4u:
+        minimum_snr = 15.0f;
+        maximum_evm = 0.18f;
+        break;
+    case 6u:
+        minimum_snr = 21.0f;
+        maximum_evm = 0.085f;
+        break;
+    default:
+        return 0;
+    }
+    if (config->fec_rate == UM_FEC_RATE_1_2) {
+        minimum_snr -= 2.0f;
+        maximum_evm *= 1.10f;
+    } else if (config->fec_rate == UM_FEC_RATE_3_4) {
+        minimum_snr += 2.0f;
+        maximum_evm *= 0.90f;
+    }
+    return metrics->sync_correlation >= 0.30f &&
+           metrics->estimated_snr_db >= minimum_snr &&
+           metrics->evm_rms <= maximum_evm;
 }
 
 size_t um_modem_data_carriers(const um_modem_config *config)
@@ -190,8 +245,10 @@ static int render_symbol(const um_modem_config *config,
     um_complex time[UM_FFT_SIZE];
     size_t hop = config->fft_size + config->cyclic_prefix;
     size_t extended = hop + config->window_samples;
+    double energy = 0.0;
     float scale = 1.0f;
     float peak = 0.0f;
+    float rms;
     size_t i;
 
     memcpy(time, frequency, sizeof(time));
@@ -200,12 +257,24 @@ static int render_symbol(const um_modem_config *config,
     }
     for (i = 0u; i < config->fft_size; ++i) {
         float magnitude = fabsf(time[i].re);
+        energy += (double)time[i].re * time[i].re;
         if (magnitude > peak) {
             peak = magnitude;
         }
     }
-    if (peak > 1.0e-12f) {
-        scale = 0.78f / peak;
+    rms = (float)sqrt(energy / (double)config->fft_size);
+    if (rms > 1.0e-12f) {
+        /*
+         * Normalize acoustic power, not the single largest sample.  Pure peak
+         * normalization made short, high-crest control symbols more than
+         * 10 dB quieter than the low-crest training symbols that preceded
+         * them.  A fixed RMS target keeps training and data at comparable
+         * levels; the peak ceiling remains as a final anti-clipping guard.
+         */
+        scale = 0.24f / rms;
+        if (peak * scale > 0.88f) {
+            scale = 0.88f / peak;
+        }
     }
     for (i = 0u; i < extended; ++i) {
         size_t source;
@@ -325,12 +394,24 @@ static void build_header(const um_modem_config *config, size_t payload_length,
     header[2] = 1u;
     header[3] = (uint8_t)config->qam_bits;
     header[4] = (uint8_t)config->fec_rate;
-    header[5] = 0u;
+    header[5] = (uint8_t)config->symbol_repetitions;
     write_u16(&header[6], (uint16_t)payload_length);
     write_u16(&header[8], sequence);
     write_u32(&header[10], payload_crc);
     checksum = um_crc16(header, UM_HEADER_BYTES - 2u);
     write_u16(&header[14], checksum);
+}
+
+static uint8_t whitening_bit(size_t index, size_t raw_bits, um_fec_rate rate)
+{
+    uint32_t value = (uint32_t)index * UINT32_C(0x9e3779b1) ^
+                     (uint32_t)raw_bits * UINT32_C(0x85ebca6b) ^
+                     (uint32_t)rate * UINT32_C(0xc2b2ae35) ^
+                     UINT32_C(0x71d67fff);
+    value ^= value >> 16u;
+    value *= UINT32_C(0x7feb352d);
+    value ^= value >> 15u;
+    return (uint8_t)(value & 1u);
 }
 
 static int encode_block(const uint8_t *bytes, size_t byte_count,
@@ -343,6 +424,7 @@ static int encode_block(const uint8_t *bytes, size_t byte_count,
     uint8_t *coded = NULL;
     uint8_t *output = NULL;
     size_t actual = 0u;
+    size_t i;
     int status;
 
     if (capacity < fec_bits) {
@@ -359,6 +441,14 @@ static int encode_block(const uint8_t *bytes, size_t byte_count,
     status = um_fec_encode(bits, raw_bits, rate, coded, capacity, &actual);
     if (status != UM_OK) {
         goto done;
+    }
+    for (i = 0u; i < capacity; ++i) {
+        uint8_t whitening = whitening_bit(i, raw_bits, rate);
+        if (i < actual) {
+            coded[i] ^= whitening;
+        } else {
+            coded[i] = whitening;
+        }
     }
     status = um_interleave_bits(coded, output, capacity);
     if (status != UM_OK) {
@@ -388,6 +478,7 @@ int um_modulate_frame(const um_modem_config *config,
     size_t payload_symbol_bits;
     size_t payload_symbols = 0u;
     size_t payload_capacity;
+    size_t logical_data_symbols;
     size_t total_symbols;
     size_t hop;
     size_t ofdm_start;
@@ -400,6 +491,7 @@ int um_modulate_frame(const um_modem_config *config,
     float sync[UM_MAX_SYNC_SAMPLES];
     um_complex frequency[UM_FFT_SIZE];
     size_t symbol;
+    size_t repetition;
     int status;
 
     if (um_modem_config_validate(config) != UM_OK ||
@@ -418,8 +510,14 @@ int um_modulate_frame(const um_modem_config *config,
     payload_symbol_bits = carriers * config->qam_bits;
     payload_symbols = divide_round_up(payload_fec_bits, payload_symbol_bits);
     payload_capacity = payload_symbols * payload_symbol_bits;
-    total_symbols = config->training_symbols + header_symbols +
-                    payload_symbols;
+    logical_data_symbols = header_symbols + payload_symbols;
+    if (logical_data_symbols >
+        (SIZE_MAX - config->training_symbols) /
+            config->symbol_repetitions) {
+        return UM_ERR_ARGUMENT;
+    }
+    total_symbols = config->training_symbols +
+                    logical_data_symbols * config->symbol_repetitions;
     hop = config->fft_size + config->cyclic_prefix;
     ofdm_start = UM_SYNC_LEAD + config->sync_samples + config->sync_gap;
     if (total_symbols > (SIZE_MAX - ofdm_start - config->window_samples - 64u) /
@@ -463,11 +561,16 @@ int um_modulate_frame(const um_modem_config *config,
         size_t offset = symbol * header_symbol_bits;
         make_data_frequency(config, header_coded + offset, header_symbol_bits,
                             2u, config->training_symbols + symbol, frequency);
-        status = render_symbol(config, frequency, output,
-                               ofdm_start +
-                                   (config->training_symbols + symbol) * hop);
-        if (status != UM_OK) {
-            goto done;
+        for (repetition = 0u; repetition < config->symbol_repetitions;
+             ++repetition) {
+            size_t physical_symbol = config->training_symbols +
+                                     symbol * config->symbol_repetitions +
+                                     repetition;
+            status = render_symbol(config, frequency, output,
+                                   ofdm_start + physical_symbol * hop);
+            if (status != UM_OK) {
+                goto done;
+            }
         }
     }
     for (symbol = 0u; symbol < payload_symbols; ++symbol) {
@@ -476,12 +579,17 @@ int um_modulate_frame(const um_modem_config *config,
                             payload_symbol_bits, config->qam_bits,
                             config->training_symbols + header_symbols + symbol,
                             frequency);
-        status = render_symbol(config, frequency, output,
-                               ofdm_start +
-                                   (config->training_symbols + header_symbols +
-                                    symbol) * hop);
-        if (status != UM_OK) {
-            goto done;
+        for (repetition = 0u; repetition < config->symbol_repetitions;
+             ++repetition) {
+            size_t physical_symbol = config->training_symbols +
+                                     (header_symbols + symbol) *
+                                         config->symbol_repetitions +
+                                     repetition;
+            status = render_symbol(config, frequency, output,
+                                   ofdm_start + physical_symbol * hop);
+            if (status != UM_OK) {
+                goto done;
+            }
         }
     }
     {
@@ -520,6 +628,7 @@ static int locate_sync(const um_modem_config *config, const float *samples,
 {
     float sync[UM_MAX_SYNC_SAMPLES];
     um_complex *capture_spectrum = NULL;
+    um_complex *filtered_capture = NULL;
     um_complex *sync_spectrum = NULL;
     size_t convolution_count;
     size_t fft_count = 1u;
@@ -548,8 +657,11 @@ static int locate_sync(const um_modem_config *config, const float *samples,
     }
     capture_spectrum = (um_complex *)calloc(fft_count,
                                              sizeof(*capture_spectrum));
+    filtered_capture = (um_complex *)calloc(fft_count,
+                                            sizeof(*filtered_capture));
     sync_spectrum = (um_complex *)calloc(fft_count, sizeof(*sync_spectrum));
-    if (capture_spectrum == NULL || sync_spectrum == NULL) {
+    if (capture_spectrum == NULL || filtered_capture == NULL ||
+        sync_spectrum == NULL) {
         status = UM_ERR_MEMORY;
         goto done;
     }
@@ -564,9 +676,6 @@ static int locate_sync(const um_modem_config *config, const float *samples,
         double centered = (double)sync[i] -
                           sync_sum / (double)config->sync_samples;
         sync_spectrum[config->sync_samples - 1u - i].re = (float)centered;
-        sync_energy += centered * centered;
-        window_sum += samples[i];
-        window_energy += (double)samples[i] * samples[i];
     }
     status = um_fft(capture_spectrum, fft_count, 0);
     if (status != UM_OK) {
@@ -577,11 +686,49 @@ static int locate_sync(const um_modem_config *config, const float *samples,
         goto done;
     }
     for (i = 0u; i < fft_count; ++i) {
-        capture_spectrum[i] = um_cmul(capture_spectrum[i], sync_spectrum[i]);
+        size_t folded_bin = i <= fft_count / 2u ? i : fft_count - i;
+        float frequency = (float)folded_bin * (float)UM_SAMPLE_RATE /
+                          (float)fft_count;
+        float weight = 1.0f;
+        /*
+         * The synchronization chirp occupies 1.5--11.5 kHz.  Rumble, fan
+         * noise, and microphone DC below that band used to count against the
+         * normalized matched-filter score even though they could never
+         * correlate with the chirp.  Apply a zero-phase spectral gate with
+         * smooth guard bands before both the dot product and its normalization.
+         * Acquisition deliberately emphasizes the 1.25--8 kHz portion that
+         * survived the measured laptop-to-room path with the largest margin;
+         * the transmitted chirp can retain its wider occupied band.
+         */
+        if (frequency <= 750.0f || frequency >= 9000.0f) {
+            weight = 0.0f;
+        } else if (frequency < 1250.0f) {
+            float position = (frequency - 750.0f) / 500.0f;
+            float sine = sinf(0.5f * UM_PI * position);
+            weight = sine * sine;
+        } else if (frequency > 8000.0f) {
+            float position = (9000.0f - frequency) / 1000.0f;
+            float sine = sinf(0.5f * UM_PI * position);
+            weight = sine * sine;
+        }
+        filtered_capture[i] = um_cscale(capture_spectrum[i], weight);
+        sync_spectrum[i] = um_cscale(sync_spectrum[i], weight);
+        sync_energy += um_cabs2(sync_spectrum[i]) / (double)fft_count;
+        capture_spectrum[i] =
+            um_cmul(filtered_capture[i], sync_spectrum[i]);
+    }
+    status = um_fft(filtered_capture, fft_count, 1);
+    if (status != UM_OK) {
+        goto done;
     }
     status = um_fft(capture_spectrum, fft_count, 1);
     if (status != UM_OK) {
         goto done;
+    }
+    for (i = 0u; i < config->sync_samples; ++i) {
+        double value = filtered_capture[i].re;
+        window_sum += value;
+        window_energy += value * value;
     }
     for (start = 0u; start + config->sync_samples <= sample_count; ++start) {
         double variance = window_energy -
@@ -603,8 +750,8 @@ static int locate_sync(const um_modem_config *config, const float *samples,
             }
         }
         if (start + config->sync_samples < sample_count) {
-            double departing = samples[start];
-            double arriving = samples[start + config->sync_samples];
+            double departing = filtered_capture[start].re;
+            double arriving = filtered_capture[start + config->sync_samples].re;
             window_sum += arriving - departing;
             window_energy += arriving * arriving - departing * departing;
         }
@@ -628,9 +775,9 @@ static int locate_sync(const um_modem_config *config, const float *samples,
                 path_threshold = threshold;
             }
             for (i = 0u; i < config->sync_samples; ++i) {
-                local_sum += samples[first + i];
-                local_energy += (double)samples[first + i] *
-                                samples[first + i];
+                double value = filtered_capture[first + i].re;
+                local_sum += value;
+                local_energy += value * value;
             }
             for (start = first; start <= best_location; ++start) {
                 double variance = local_energy -
@@ -647,8 +794,9 @@ static int locate_sync(const um_modem_config *config, const float *samples,
                     }
                 }
                 if (start < best_location) {
-                    double departing = samples[start];
-                    double arriving = samples[start + config->sync_samples];
+                    double departing = filtered_capture[start].re;
+                    double arriving =
+                        filtered_capture[start + config->sync_samples].re;
                     local_sum += arriving - departing;
                     local_energy += arriving * arriving -
                                     departing * departing;
@@ -659,6 +807,7 @@ static int locate_sync(const um_modem_config *config, const float *samples,
 
 done:
     free(sync_spectrum);
+    free(filtered_capture);
     free(capture_spectrum);
     return status;
 }
@@ -807,49 +956,66 @@ static int demodulate_symbols(const um_modem_config *config,
                               double *error_energy, double *ideal_energy)
 {
     size_t hop = config->fft_size + config->cyclic_prefix;
+    size_t bits_per_symbol = um_modem_data_carriers(config) * qam_bits;
     size_t output = 0u;
     size_t symbol;
     for (symbol = 0u; symbol < symbol_count; ++symbol) {
-        um_complex frequency[UM_FFT_SIZE];
-        phase_model phase;
-        unsigned bin;
-        int status = extract_fft(config, samples, sample_count,
-                                 first_start + symbol * hop, frequency);
-        if (status != UM_OK) {
-            return status;
-        }
-        phase = estimate_phase_model(config, frequency, channel, reliability,
-                                     first_symbol_number + symbol);
-        for (bin = config->first_bin; bin <= config->last_bin; ++bin) {
-            if (!is_pilot(config, bin)) {
-                float symbol_soft[6];
-                uint8_t hard[6];
-                float symbol_reliability = phase.amplitude * phase.amplitude;
-                um_complex equalized = um_cmul(
-                    um_cdiv(frequency[bin], channel[bin]),
-                    phase_correction(&phase, bin, config));
-                um_complex nearest;
-                unsigned bit;
-                status = um_qam_soft_demod(equalized, qam_bits, symbol_soft);
-                if (status != UM_OK) {
-                    return status;
+        size_t repetition;
+        memset(soft + output, 0, bits_per_symbol * sizeof(*soft));
+        for (repetition = 0u;
+             repetition < config->symbol_repetitions; ++repetition) {
+            um_complex frequency[UM_FFT_SIZE];
+            phase_model phase;
+            size_t carrier_output = 0u;
+            unsigned bin;
+            int status = extract_fft(
+                config, samples, sample_count,
+                first_start +
+                    (symbol * config->symbol_repetitions + repetition) * hop,
+                frequency);
+            if (status != UM_OK) {
+                return status;
+            }
+            phase = estimate_phase_model(config, frequency, channel,
+                                         reliability,
+                                         first_symbol_number + symbol);
+            for (bin = config->first_bin; bin <= config->last_bin; ++bin) {
+                if (!is_pilot(config, bin)) {
+                    float symbol_soft[6];
+                    uint8_t hard[6];
+                    float symbol_reliability =
+                        phase.amplitude * phase.amplitude;
+                    um_complex equalized = um_cmul(
+                        um_cdiv(frequency[bin], channel[bin]),
+                        phase_correction(&phase, bin, config));
+                    um_complex nearest;
+                    unsigned bit;
+                    status =
+                        um_qam_soft_demod(equalized, qam_bits, symbol_soft);
+                    if (status != UM_OK) {
+                        return status;
+                    }
+                    if (symbol_reliability > 4.0f) {
+                        symbol_reliability = 4.0f;
+                    }
+                    for (bit = 0u; bit < qam_bits; ++bit) {
+                        soft[output + carrier_output + bit] +=
+                            symbol_soft[bit] * reliability[bin] *
+                            phase.confidence * symbol_reliability;
+                        hard[bit] = symbol_soft[bit] >= 0.0f ? 1u : 0u;
+                    }
+                    carrier_output += qam_bits;
+                    nearest = um_qam_map(hard, qam_bits);
+                    *error_energy +=
+                        (double)(equalized.re - nearest.re) *
+                            (equalized.re - nearest.re) +
+                        (double)(equalized.im - nearest.im) *
+                            (equalized.im - nearest.im);
+                    *ideal_energy += um_cabs2(nearest);
                 }
-                if (symbol_reliability > 4.0f) {
-                    symbol_reliability = 4.0f;
-                }
-                for (bit = 0u; bit < qam_bits; ++bit) {
-                    soft[output++] = symbol_soft[bit] * reliability[bin] *
-                                     phase.confidence * symbol_reliability;
-                    hard[bit] = symbol_soft[bit] >= 0.0f ? 1u : 0u;
-                }
-                nearest = um_qam_map(hard, qam_bits);
-                *error_energy += (double)(equalized.re - nearest.re) *
-                                     (equalized.re - nearest.re) +
-                                 (double)(equalized.im - nearest.im) *
-                                     (equalized.im - nearest.im);
-                *ideal_energy += um_cabs2(nearest);
             }
         }
+        output += bits_per_symbol;
     }
     return UM_OK;
 }
@@ -861,6 +1027,7 @@ static int decode_block(const float *interleaved, size_t capacity,
     size_t fec_bits = um_fec_encoded_bits(raw_bits, rate);
     float *ordered = NULL;
     uint8_t *decoded = NULL;
+    size_t i;
     int status;
 
     if (capacity < fec_bits) {
@@ -875,6 +1042,11 @@ static int decode_block(const float *interleaved, size_t capacity,
     status = um_deinterleave_soft(interleaved, ordered, capacity);
     if (status != UM_OK) {
         goto done;
+    }
+    for (i = 0u; i < capacity; ++i) {
+        if (whitening_bit(i, raw_bits, rate) != 0u) {
+            ordered[i] = -ordered[i];
+        }
     }
     status = um_fec_decode(ordered, fec_bits, raw_bits, rate, decoded,
                            raw_bits);
@@ -1054,7 +1226,8 @@ int um_demodulate_frame(const um_modem_config *config,
     }
     if (header[0] != UINT8_C(0x55) || header[1] != UINT8_C(0x4d) ||
         header[2] != 1u || header[3] != config->qam_bits ||
-        header[4] != (uint8_t)config->fec_rate || header[5] != 0u ||
+        header[4] != (uint8_t)config->fec_rate ||
+        header[5] != (uint8_t)config->symbol_repetitions ||
         read_u16(&header[14]) != um_crc16(header, UM_HEADER_BYTES - 2u)) {
         status = UM_ERR_HEADER;
         goto done;
@@ -1080,7 +1253,8 @@ int um_demodulate_frame(const um_modem_config *config,
         goto done;
     }
     payload_start = ofdm_start +
-                    (config->training_symbols + header_symbols) * hop;
+                    (config->training_symbols +
+                     header_symbols * config->symbol_repetitions) * hop;
     status = demodulate_symbols(
         config, samples, sample_count, payload_start,
         config->training_symbols + header_symbols, payload_symbols,
@@ -1121,8 +1295,11 @@ done:
         metrics->evm_rms = ideal_energy > 0.0
                                ? (float)sqrt(error_energy / ideal_energy)
                                : 0.0f;
-        metrics->ofdm_symbols = config->training_symbols + header_symbols +
-                                (status == UM_OK ? decoded_payload_symbols : 0u);
+        metrics->ofdm_symbols =
+            config->training_symbols +
+            (header_symbols +
+             (status == UM_OK ? decoded_payload_symbols : 0u)) *
+                config->symbol_repetitions;
     }
     free(payload_soft);
     free(header_soft);

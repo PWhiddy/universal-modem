@@ -47,6 +47,7 @@ typedef struct {
     unsigned sync_samples;
     unsigned sync_gap;
     unsigned training_symbols;
+    unsigned symbol_repetitions;
     unsigned qam_bits;
     um_fec_rate fec_rate;
 } um_modem_config;

@@ -159,28 +159,12 @@ static void log_received_quality(live_context *context, const char *message,
 
 static um_modem_config live_bootstrap_config(void)
 {
-    um_modem_config config = um_modem_default_config();
-    config.first_bin = 64u;
-    config.last_bin = 448u;
-    config.cyclic_prefix = 1024u;
-    config.window_samples = 96u;
-    config.sync_samples = UM_MAX_SYNC_SAMPLES;
-    config.sync_gap = 3072u;
-    config.training_symbols = UM_MAX_TRAINING_SYMBOLS;
-    config.qam_bits = 2u;
-    config.fec_rate = UM_FEC_RATE_1_2;
-    return config;
+    return um_modem_robust_config();
 }
 
 static um_modem_config live_calibration_control_config(void)
 {
-    um_modem_config config = live_bootstrap_config();
-    config.cyclic_prefix = 768u;
-    config.window_samples = 64u;
-    config.sync_samples = UM_SYNC_SAMPLES;
-    config.sync_gap = 1792u;
-    config.training_symbols = 2u;
-    return config;
+    return live_bootstrap_config();
 }
 
 static void write_u16(uint8_t *bytes, uint16_t value)
@@ -515,7 +499,8 @@ static float live_candidate_score(const um_modem_config *config,
                                                             : 0.75f;
     float raw = (float)um_modem_data_carriers(config) *
                 (float)config->qam_bits * rate * (float)UM_SAMPLE_RATE /
-                (float)(config->fft_size + config->cyclic_prefix);
+                ((float)(config->fft_size + config->cyclic_prefix) *
+                 (float)config->symbol_repetitions);
     float quality = 1.0f /
                     (1.0f + 4.0f * metrics->evm_rms * metrics->evm_rms);
     if (config->window_samples == 0u) {
@@ -641,11 +626,11 @@ static int calibration_sender(live_context *context, unsigned direction,
                            (uint16_t)candidate, probe, sizeof(probe), 1,
                            &duration);
         live_log(context,
-                 "calib tx=%zu/%zu qam=%u fec=%s cp=%u window=%u "
+                 "calib tx=%zu/%zu qam=%u fec=%s cp=%u window=%u repeats=%u "
                  "band=%.0f-%.0fHz duration=%.3fs",
                  candidate + 1u, candidate_count, 1u << config.qam_bits,
                  fec_name(config.fec_rate), config.cyclic_prefix,
-                 config.window_samples,
+                 config.window_samples, config.symbol_repetitions,
                  (double)config.first_bin * UM_SAMPLE_RATE / config.fft_size,
                  (double)config.last_bin * UM_SAMPLE_RATE / config.fft_size,
                  duration);
@@ -687,10 +672,11 @@ static int calibration_sender(live_context *context, unsigned direction,
             }
             live_log(context,
                      "calib verify rank=%zu index=%zu qam=%u fec=%s cp=%u "
-                     "window=%u band=%.0f-%.0fHz",
+                     "window=%u repeats=%u band=%.0f-%.0fHz",
                      rank + 1u, selected_candidate,
                      1u << selected->qam_bits, fec_name(selected->fec_rate),
                      selected->cyclic_prefix, selected->window_samples,
+                     selected->symbol_repetitions,
                      (double)selected->first_bin * UM_SAMPLE_RATE /
                          selected->fft_size,
                      (double)selected->last_bin * UM_SAMPLE_RATE /
@@ -750,6 +736,8 @@ static int calibration_receiver(live_context *context, unsigned direction,
     size_t usable = 0u;
     live_ranked_candidate ranked[LIVE_CALIBRATION_RANKS];
     size_t rank_count = 0u;
+    float baseline_score = 0.0f;
+    int baseline_usable = 0;
     int status;
     if (begin_message->body_length != 4u ||
         begin_message->body[0] != direction || begin_message->body[1] > 1u) {
@@ -790,15 +778,38 @@ static int calibration_receiver(live_context *context, unsigned direction,
             probe.body_length == sizeof(expected) &&
             memcmp(probe.body, expected, sizeof(expected)) == 0) {
             float score = live_candidate_score(&config, &metrics);
+            if (um_modem_metrics_have_margin(&config, &metrics) == 0) {
+                live_log(context,
+                         "calib rx=%zu/%zu MARGINAL qam=%u fec=%s "
+                         "repeats=%u sync=%.3f snr=%.1fdB evm=%.3f; "
+                         "excluded",
+                         candidate + 1u, expected_count,
+                         1u << config.qam_bits, fec_name(config.fec_rate),
+                         config.symbol_repetitions,
+                         metrics.sync_correlation, metrics.estimated_snr_db,
+                         metrics.evm_rms);
+                if (candidate == 0u) {
+                    live_log(context,
+                             "calib baseline lacks reliability margin; not "
+                             "testing faster modes");
+                    return UM_ERR_CRC;
+                }
+                continue;
+            }
             ++usable;
             live_rank_candidate(ranked, &rank_count, candidate, score);
+            if (candidate == 0u) {
+                baseline_score = score;
+                baseline_usable = 1;
+            }
             live_log(context,
                      "calib rx=%zu/%zu PASS qam=%u fec=%s cp=%u window=%u "
+                     "repeats=%u "
                      "band=%.0f-%.0fHz level=%.1fdBFS norm=%.2fx "
                      "clip=%.3f%% snr=%.1fdB evm=%.3f score=%.0f",
                      candidate + 1u, expected_count, 1u << config.qam_bits,
                      fec_name(config.fec_rate), config.cyclic_prefix,
-                     config.window_samples,
+                     config.window_samples, config.symbol_repetitions,
                      (double)config.first_bin * UM_SAMPLE_RATE /
                          config.fft_size,
                      (double)config.last_bin * UM_SAMPLE_RATE /
@@ -815,11 +826,12 @@ static int calibration_receiver(live_context *context, unsigned direction,
             }
             live_log(context,
                      "calib rx=%zu/%zu FAIL qam=%u fec=%s cp=%u window=%u "
+                     "repeats=%u "
                      "band=%.0f-%.0fHz sync=%.3f level=%.1fdBFS "
                      "norm=%.2fx clip=%.3f%% reason=%s",
                      candidate + 1u, expected_count, 1u << config.qam_bits,
                      fec_name(config.fec_rate), config.cyclic_prefix,
-                     config.window_samples,
+                     config.window_samples, config.symbol_repetitions,
                      (double)config.first_bin * UM_SAMPLE_RATE /
                          config.fft_size,
                      (double)config.last_bin * UM_SAMPLE_RATE /
@@ -831,10 +843,34 @@ static int calibration_receiver(live_context *context, unsigned direction,
                      metrics.normalization_gain,
                      100.0 * (double)metrics.clipped_sample_fraction,
                      um_status_string(status));
+            if (candidate == 0u) {
+                live_log(context,
+                         "calib baseline failed; not testing faster modes");
+                return status;
+            }
         }
     }
     if (live_interrupted) {
         return UM_ERR_INTERRUPTED;
+    }
+    if (baseline_usable != 0) {
+        size_t position;
+        for (position = 0u; position < rank_count; ++position) {
+            if (ranked[position].index == 0u) {
+                size_t move;
+                for (move = position + 1u; move < rank_count; ++move) {
+                    ranked[move - 1u] = ranked[move];
+                }
+                --rank_count;
+                break;
+            }
+        }
+        if (rank_count == LIVE_CALIBRATION_RANKS) {
+            --rank_count;
+        }
+        ranked[rank_count].index = 0u;
+        ranked[rank_count].score = baseline_score;
+        ++rank_count;
     }
     {
         uint8_t report[4u + LIVE_CALIBRATION_RANKS * 2u];
@@ -866,20 +902,24 @@ static int calibration_receiver(live_context *context, unsigned direction,
             }
             for (trial = 0u; trial < LIVE_VERIFY_TRIALS; ++trial) {
                 um_live_wire_message verify;
+                um_rx_metrics verify_metrics;
                 uint8_t expected[128];
                 uint8_t result_body[1] = {0u};
                 uint16_t verify_sequence =
                     (uint16_t)(rank * LIVE_VERIFY_TRIALS + trial);
                 fill_calibration_body(ranked[rank].index, trial + 1u,
                                       expected, sizeof(expected));
+                memset(&verify_metrics, 0, sizeof(verify_metrics));
                 status = receive_wire(context, selected,
                                       context->session_id, 2600u, &verify,
-                                      NULL);
+                                      &verify_metrics);
                 if (status == UM_OK &&
                     verify.type == UM_WIRE_CALIB_VERIFY &&
                     verify.sequence == verify_sequence &&
                     verify.body_length == sizeof(expected) &&
-                    memcmp(verify.body, expected, sizeof(expected)) == 0) {
+                    memcmp(verify.body, expected, sizeof(expected)) == 0 &&
+                    um_modem_metrics_have_margin(selected, &verify_metrics) !=
+                        0) {
                     result_body[0] = 1u;
                 }
                 sleep_milliseconds(status == UM_OK
@@ -1355,9 +1395,12 @@ int um_run_live_audio(const um_live_audio_options *options,
              options->test_bytes, options->chunk_bytes,
              options->retry_limit);
     live_log(&context,
-             "Bootstrap qam=%u fec=%s cp=%u window=%u band=%.0f-%.0fHz",
+             "Bootstrap qam=%u fec=%s cp=%u window=%u repeats=%u training=%u "
+             "sync=%.1fms band=%.0f-%.0fHz",
              1u << bootstrap.qam_bits, fec_name(bootstrap.fec_rate),
              bootstrap.cyclic_prefix, bootstrap.window_samples,
+             bootstrap.symbol_repetitions, bootstrap.training_symbols,
+             1000.0 * (double)bootstrap.sync_samples / UM_SAMPLE_RATE,
              (double)bootstrap.first_bin * UM_SAMPLE_RATE /
                  bootstrap.fft_size,
              (double)bootstrap.last_bin * UM_SAMPLE_RATE /
