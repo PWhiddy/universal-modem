@@ -23,7 +23,7 @@ enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
 #define SIM_PROXY_PACKETS 5u
 
 /* CoreAudio capture callbacks can resume after AudioQueueStart returns. */
-#define SIM_CAPTURE_START_MS 110u
+#define SIM_CAPTURE_START_MS 60u
 
 typedef struct {
     pthread_mutex_t mutex;
@@ -35,6 +35,9 @@ typedef struct {
     int capture_enabled[SIM_ENDPOINTS];
     um_channel_config channel[SIM_ENDPOINTS];
     uint32_t transmission;
+    int offer_drop_enabled;
+    int offer_drop_armed;
+    unsigned offer_drops;
     int verify_drop_endpoint;
     int verify_drop_armed;
     unsigned verification_drops;
@@ -98,6 +101,7 @@ typedef struct {
     unsigned forward_transfer;
     unsigned reverse_transfer;
     unsigned completed;
+    unsigned offer_refreshes;
     unsigned network_ready;
     unsigned proxying;
     unsigned proxy_completed;
@@ -202,6 +206,18 @@ static void test_log(void *context, const char *message)
     }
     if (strstr(message, "state=CONNECTED handshake complete") != NULL) {
         ++run->connected;
+    }
+    if (run->options.role == UM_LIVE_GATEWAY &&
+        strstr(message, "state=NEGOTIATING rx=DISCOVER tx=OFFER") != NULL) {
+        (void)pthread_mutex_lock(&bus.mutex);
+        if (bus.offer_drop_enabled != 0 && bus.offer_drops == 0u) {
+            bus.offer_drop_armed = 1;
+        }
+        (void)pthread_mutex_unlock(&bus.mutex);
+    }
+    if (strstr(message,
+               "state=NEGOTIATING rx=DISCOVER retry tx=OFFER") != NULL) {
+        ++run->offer_refreshes;
     }
     if (strstr(message, "state=CALIBRATING direction=") != NULL) {
         ++run->calibrating;
@@ -506,6 +522,11 @@ int um_audio_write(um_audio *audio, const float *samples, size_t frame_count)
     channel = bus.channel[audio->endpoint];
     channel.random_seed ^=
         ++bus.transmission * UINT32_C(0x9e3779b9);
+    if (bus.offer_drop_armed != 0 && audio->endpoint == SIM_GATEWAY) {
+        bus.offer_drop_armed = 0;
+        ++bus.offer_drops;
+        drop_write = 1;
+    }
     if (bus.verify_drop_armed != 0 &&
         bus.verify_drop_endpoint == audio->endpoint) {
         bus.verify_drop_armed = 0;
@@ -819,7 +840,8 @@ static void configure_runner(runner *run, const char *name,
 static int run_pair(const char *label,
                     const um_channel_config *client_to_gateway,
                     const um_channel_config *gateway_to_client,
-                    int link_test, int inject_proxy_retry,
+                    int link_test, int inject_offer_retry,
+                    int inject_proxy_retry,
                     int require_upgrade, int require_baseline,
                     int inject_verification_fallback,
                     int inject_baseline_recovery,
@@ -850,6 +872,9 @@ static int run_pair(const char *label,
     bus.capture_enabled[SIM_CLIENT] = 0;
     bus.capture_enabled[SIM_GATEWAY] = 0;
     bus.transmission = 0u;
+    bus.offer_drop_enabled = inject_offer_retry;
+    bus.offer_drop_armed = 0;
+    bus.offer_drops = 0u;
     bus.verify_drop_endpoint = inject_verification_fallback != 0
                                    ? SIM_CLIENT
                                    : -1;
@@ -935,6 +960,8 @@ static int run_pair(const char *label,
          client.adaptive_upgrades + gateway.adaptive_upgrades == 0u) ||
         (require_baseline != 0 &&
          client.baseline_selections + gateway.baseline_selections == 0u) ||
+        (inject_offer_retry != 0 &&
+         (bus.offer_drops != 1u || gateway.offer_refreshes == 0u)) ||
         (inject_verification_fallback != 0 &&
          (bus.verification_drops != 1u ||
           client.verification_fallbacks + gateway.verification_fallbacks ==
@@ -973,7 +1000,7 @@ static int run_pair(const char *label,
     printf("paired live %s passed: connection, adaptive 2-way calibration, "
            "delayed capture restart, %s; upgrades=%u/%u "
            "fallbacks=%u/%u verification-stepdowns=%u calibrations=%u "
-           "cache-skips=%u recovery-probes=%u\n",
+           "cache-skips=%u recovery-probes=%u offer-refreshes=%u\n",
            label,
            link_test != 0 ? "256+256-byte explicit link test"
                           : "prioritized DNS exchange plus four-packet TCP "
@@ -982,7 +1009,8 @@ static int run_pair(const char *label,
            client.baseline_selections, gateway.baseline_selections,
            client.verification_fallbacks + gateway.verification_fallbacks,
            expected_calibrations, client.cache_skips + gateway.cache_skips,
-           client.recovery_probes + gateway.recovery_probes);
+           client.recovery_probes + gateway.recovery_probes,
+           gateway.offer_refreshes);
     return 0;
 }
 
@@ -1007,7 +1035,7 @@ int main(void)
     (void)remove(gateway_path);
 
     status = run_pair("v2-worse-network-proxy", &v2_forward, &v2_reverse,
-                      0, 1, 0, 0, 1, 0, 2u, client_path, gateway_path);
+                      0, 1, 1, 0, 0, 1, 0, 2u, client_path, gateway_path);
     if (status == 0) {
         found = 0;
         if (um_calibration_config_load(client_path, UM_LIVE_CLIENT, &cached,
@@ -1028,13 +1056,13 @@ int main(void)
     }
     if (status == 0) {
         status = run_pair("both-cached-link-test", &v2_forward, &v2_reverse,
-                          1, 0, 0, 0, 0, 0, 0u, client_path,
+                          1, 0, 0, 0, 0, 0, 0, 0u, client_path,
                           gateway_path);
     }
     if (status == 0) {
         (void)remove(gateway_path);
         status = run_pair("one-side-missing-recovery", &v2_forward,
-                          &v2_reverse, 1, 0, 0, 0, 0, 1, 1u,
+                          &v2_reverse, 1, 0, 0, 0, 0, 0, 1, 1u,
                           client_path, gateway_path);
     }
     if (status == 0) {
@@ -1045,8 +1073,8 @@ int main(void)
             (void)remove(client_path);
             (void)remove(gateway_path);
             status = run_pair("baseline-fallback", &strong.client_to_gateway,
-                              &strong.gateway_to_client, 1, 0, 0, 1, 0, 0,
-                              2u, client_path, gateway_path);
+                              &strong.gateway_to_client, 1, 0, 0, 0, 1, 0,
+                              0, 2u, client_path, gateway_path);
         }
     }
 

@@ -915,6 +915,7 @@ static void test_live_wire_protocol(void)
     size_t i;
     um_live_wire_message message;
     ++tests_run;
+    CHECK(UM_LIVE_HANDSHAKE_BYTES == 5u);
     for (i = 0u; i < sizeof(body); ++i) {
         body[i] = (uint8_t)test_random();
     }
@@ -972,6 +973,14 @@ static void test_live_wire_protocol(void)
     um_live_handshake_body(capability, 0);
     CHECK(um_live_handshake_validate(capability, sizeof(capability), 0) ==
           UM_OK);
+    CHECK(um_live_wire_encode(UM_WIRE_DISCOVER, 1u, 2u, capability,
+                              sizeof(capability), wire, sizeof(wire),
+                              &wire_length) == UM_OK);
+    CHECK(wire_length == UM_LIVE_WIRE_HEADER_SIZE + 5u);
+    CHECK(um_live_wire_decode(wire, wire_length, &message) == UM_OK);
+    CHECK(message.body_length == sizeof(capability));
+    CHECK(um_live_handshake_validate(message.body, message.body_length, 0) ==
+          UM_OK);
     CHECK(um_live_handshake_validate(capability, 0u, 0) ==
           UM_ERR_UNSUPPORTED);
     capability[0] ^= 1u;
@@ -982,7 +991,7 @@ static void test_live_wire_protocol(void)
     CHECK(um_live_handshake_validate(capability, sizeof(capability), 0) ==
           UM_ERR_UNSUPPORTED);
     um_live_handshake_body(capability, 0);
-    capability[5] ^= 1u;
+    capability[4] ^= 2u;
     CHECK(um_live_handshake_validate(capability, sizeof(capability), 0) ==
           UM_ERR_UNSUPPORTED);
     um_live_handshake_body(capability, 1);

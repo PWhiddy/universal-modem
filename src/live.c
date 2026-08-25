@@ -17,7 +17,7 @@
 #define LIVE_READ_CHUNK 960u
 #define LIVE_TX_PRE_SAMPLES 960u
 #define LIVE_TX_POST_SAMPLES 2400u
-#define LIVE_TURNAROUND_MS 120u
+#define LIVE_TURNAROUND_MS 80u
 #define LIVE_CALIBRATION_SETTLE_MS 160u
 #define LIVE_RECEIVER_ARM_MS 120u
 #define LIVE_VERIFY_TRIALS_DEFAULT 3u
@@ -282,8 +282,10 @@ void um_live_handshake_body(uint8_t body[UM_LIVE_HANDSHAKE_BYTES],
     body[0] = UM_LIVE_PROTOCOL_VERSION;
     body[1] = UM_LIVE_CONFIG_FORMAT_VERSION;
     write_u16(&body[2], (uint16_t)UM_CALIBRATION_PROBE_BYTES);
-    body[4] = link_test != 0 ? 1u : 0u;
-    body[5] = UM_LIVE_PROXY_FORMAT_VERSION;
+    /* Keep the proven five-byte bootstrap payload.  The low bit is mode and
+     * the remaining bits carry the proxy format generation. */
+    body[4] = (uint8_t)((UM_LIVE_PROXY_FORMAT_VERSION << 1u) |
+                        (link_test != 0 ? 1u : 0u));
 }
 
 int um_live_handshake_validate(const uint8_t *body, size_t body_length,
@@ -295,8 +297,8 @@ int um_live_handshake_validate(const uint8_t *body, size_t body_length,
     return body[0] == UM_LIVE_PROTOCOL_VERSION &&
                    body[1] == UM_LIVE_CONFIG_FORMAT_VERSION &&
                    read_u16(&body[2]) == UM_CALIBRATION_PROBE_BYTES &&
-                   body[4] == (link_test != 0 ? 1u : 0u) &&
-                   body[5] == UM_LIVE_PROXY_FORMAT_VERSION
+                   (body[4] & 1u) == (link_test != 0 ? 1u : 0u) &&
+                   (body[4] >> 1u) == UM_LIVE_PROXY_FORMAT_VERSION
                ? UM_OK
                : UM_ERR_UNSUPPORTED;
 }
@@ -318,11 +320,14 @@ static int validate_handshake_body(live_context *context, const char *frame,
     if (message->body_length >= 4u) {
         probe_bytes = read_u16(&message->body[2]);
     }
-    if (message->body_length >= 5u) {
+    if (message->body_length >= 6u &&
+        (message->body[4] == 0u || message->body[4] == 1u)) {
+        /* Diagnose the immediately preceding six-byte capability layout. */
         peer_link_test = message->body[4];
-    }
-    if (message->body_length >= 6u) {
         proxy_format = message->body[5];
+    } else if (message->body_length >= 5u) {
+        peer_link_test = message->body[4] & 1u;
+        proxy_format = message->body[4] >> 1u;
     }
     if (message->body_length == UM_LIVE_HANDSHAKE_BYTES) {
         if (um_live_handshake_validate(message->body,
@@ -740,36 +745,90 @@ static int gateway_connect(live_context *context)
         }
         log_received_quality(context, "rx=DISCOVER", &metrics);
         context->session_id = message.session_id;
-        sleep_milliseconds(LIVE_TURNAROUND_MS);
-        live_log(context, "state=NEGOTIATING rx=DISCOVER tx=OFFER session=%08x",
-                 context->session_id);
-        status = send_wire(context, &bootstrap, UM_WIRE_OFFER,
-                           message.sequence, handshake, sizeof(handshake), 1,
-                           NULL);
-        if (status != UM_OK) {
-            return status;
+        {
+            uint16_t offer_sequence = message.sequence;
+            int refreshing = 0;
+            for (;;) {
+                uint64_t deadline;
+                sleep_milliseconds(LIVE_TURNAROUND_MS);
+                live_log(context,
+                         refreshing != 0
+                             ? "state=NEGOTIATING rx=DISCOVER retry "
+                               "tx=OFFER session=%08x sequence=%u"
+                             : "state=NEGOTIATING rx=DISCOVER tx=OFFER "
+                               "session=%08x sequence=%u",
+                         context->session_id, (unsigned)offer_sequence);
+                status = send_wire(context, &bootstrap, UM_WIRE_OFFER,
+                                   offer_sequence, handshake,
+                                   sizeof(handshake), 1, NULL);
+                if (status != UM_OK) {
+                    return status;
+                }
+                refreshing = 0;
+                deadline = monotonic_milliseconds() + 2600u;
+                while (!live_interrupted &&
+                       monotonic_milliseconds() < deadline) {
+                    uint64_t now = monotonic_milliseconds();
+                    unsigned remaining = (unsigned)(deadline - now);
+                    status = receive_wire(context, &bootstrap,
+                                          context->session_id, remaining,
+                                          &message, &metrics);
+                    if (status == UM_ERR_HEADER || status == UM_ERR_CRC ||
+                        status == UM_ERR_SYNC ||
+                        status == UM_ERR_TRUNCATED) {
+                        live_log(context,
+                                 "Rejected damaged frame while waiting for "
+                                 "CONFIRM: %s",
+                                 um_status_string(status));
+                        continue;
+                    }
+                    if (status != UM_OK) {
+                        break;
+                    }
+                    if (message.type == UM_WIRE_DISCOVER) {
+                        status = validate_handshake_body(context, "DISCOVER",
+                                                         &message);
+                        if (status != UM_OK) {
+                            return status;
+                        }
+                        log_received_quality(context, "rx=DISCOVER retry",
+                                             &metrics);
+                        offer_sequence = message.sequence;
+                        refreshing = 1;
+                        break;
+                    }
+                    if (message.type == UM_WIRE_CONFIRM &&
+                        message.sequence == offer_sequence) {
+                        status = validate_handshake_body(context, "CONFIRM",
+                                                         &message);
+                        if (status != UM_OK) {
+                            return status;
+                        }
+                        log_received_quality(context, "rx=CONFIRM", &metrics);
+                        sleep_milliseconds(LIVE_TURNAROUND_MS);
+                        status = send_wire(context, &bootstrap,
+                                           UM_WIRE_CONNECTED,
+                                           message.sequence, handshake,
+                                           sizeof(handshake), 1, NULL);
+                        if (status != UM_OK) {
+                            return status;
+                        }
+                        live_log(context,
+                                 "state=CONNECTED handshake complete");
+                        return UM_OK;
+                    }
+                    live_log(context, "Ignoring %s while waiting for CONFIRM",
+                             wire_name(message.type));
+                }
+                if (refreshing != 0) {
+                    continue;
+                }
+                live_log(context,
+                         "CONFIRM not received (%s); listening again",
+                         um_status_string(status));
+                break;
+            }
         }
-        status = receive_expected(context, &bootstrap, UM_WIRE_CONFIRM,
-                                  message.sequence, 2600u, &message, &metrics);
-        if (status != UM_OK) {
-            live_log(context, "CONFIRM not received (%s); listening again",
-                     um_status_string(status));
-            continue;
-        }
-        status = validate_handshake_body(context, "CONFIRM", &message);
-        if (status != UM_OK) {
-            return status;
-        }
-        log_received_quality(context, "rx=CONFIRM", &metrics);
-        sleep_milliseconds(LIVE_TURNAROUND_MS);
-        status = send_wire(context, &bootstrap, UM_WIRE_CONNECTED,
-                           message.sequence, handshake, sizeof(handshake), 1,
-                           NULL);
-        if (status != UM_OK) {
-            return status;
-        }
-        live_log(context, "state=CONNECTED handshake complete");
-        return UM_OK;
     }
     return UM_ERR_INTERRUPTED;
 }
@@ -2523,10 +2582,6 @@ static int client_session(live_context *context)
     if (status != UM_OK) {
         return status;
     }
-    /* From this point onward both peers have a session.  Any failure can
-     * leave their cached/calibrated mode state asymmetric, even when it
-     * occurs during the cache exchange before payload transfer begins. */
-    context->link_stage_started = 1;
     status = exchange_calibration_caches(context);
     if (status != UM_OK) {
         return status;
@@ -2661,7 +2716,6 @@ static int gateway_session(live_context *context)
     if (status != UM_OK) {
         return status;
     }
-    context->link_stage_started = 1;
     status = exchange_calibration_caches(context);
     if (status != UM_OK) {
         return status;
