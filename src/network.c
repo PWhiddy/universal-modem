@@ -1,5 +1,9 @@
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE
+#else
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
 
 #include "network.h"
 
