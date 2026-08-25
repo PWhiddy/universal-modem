@@ -13,14 +13,16 @@ static void usage(FILE *stream)
             "  universal-modem --calibrate [--calib-high]\n"
             "  universal-modem --session-sim [--calib-high]\n"
             "  universal-modem --list-audio\n"
-            "  universal-modem --audio --gateway [audio options]\n"
-            "  universal-modem --audio --client [audio options]\n"
+            "  universal-modem --gateway [audio options]\n"
+            "  universal-modem --client [audio options]\n"
             "\nAudio options:\n"
+            "  --audio              Explicitly select the default audio medium\n"
             "  --input-device ID    Capture device ID shown at startup\n"
             "  --output-device ID   Playback device ID shown at startup\n"
-            "  --test-bytes N       Bytes sent in each direction (default 1024)\n"
-            "  --chunk-bytes N      Data bytes per acknowledged frame (default 128)\n"
-            "  --retries N          Attempts per test frame (default 4)\n"
+            "  --link-test          Finite bidirectional data test; no TUN/routes\n"
+            "  --test-bytes N       Link-test bytes each direction (default 1024)\n"
+            "  --chunk-bytes N      Maximum data body per frame (default 128)\n"
+            "  --retries N          Attempts per acknowledged frame (default 4)\n"
             "  --calib-high         Use the extended real-audio calibration\n"
             "  calibration.config  Auto-loaded/saved; delete it to recalibrate\n");
 }
@@ -172,6 +174,7 @@ int main(int argc, char **argv)
     int session_simulation = 0;
     int high_quality = 0;
     int audio = 0;
+    int link_test = 0;
     int endpoint = 0;
     int list_audio = 0;
     int noise_was_set = 0;
@@ -193,6 +196,8 @@ int main(int argc, char **argv)
             high_quality = 1;
         } else if (strcmp(argv[i], "--audio") == 0) {
             audio = 1;
+        } else if (strcmp(argv[i], "--link-test") == 0) {
+            link_test = 1;
         } else if (strcmp(argv[i], "--list-audio") == 0) {
             list_audio = 1;
         } else if (strcmp(argv[i], "--gateway") == 0) {
@@ -294,7 +299,7 @@ int main(int argc, char **argv)
         }
         return run_session_simulation(high_quality);
     }
-    if (audio != 0 && endpoint != 0 && simulate == 0 && calibrate == 0 &&
+    if (endpoint != 0 && simulate == 0 && calibrate == 0 &&
         session_simulation == 0) {
         um_live_audio_options options = um_live_audio_default_options(
             endpoint == 1 ? UM_LIVE_GATEWAY : UM_LIVE_CLIENT);
@@ -305,6 +310,7 @@ int main(int argc, char **argv)
         }
         options.input_device = input_device;
         options.output_device = output_device;
+        options.link_test = link_test;
         options.test_bytes = test_bytes;
         options.chunk_bytes = chunk_bytes;
         options.retry_limit = retries;

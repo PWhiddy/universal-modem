@@ -2,6 +2,7 @@
 
 #include "audio.h"
 #include "live_wire.h"
+#include "network.h"
 #include "um_internal.h"
 
 #include <signal.h>
@@ -26,10 +27,18 @@
 #define LIVE_READY_BYTES (3u + LIVE_CONFIG_BYTES)
 #define LIVE_REPORT_ENTRY_BYTES (2u + LIVE_CONFIG_BYTES)
 #define LIVE_CACHE_BODY_BYTES (1u + LIVE_CONFIG_BYTES)
+#define LIVE_PROXY_FRAGMENT_HEADER_BYTES 8u
+#define LIVE_PROXY_BEGIN_BYTES 5u
+#define LIVE_PROXY_FORMAT_VERSION 1u
+#define LIVE_PROXY_BURST_PACKETS 2u
+#define LIVE_PROXY_IDLE_MS 350u
+#define LIVE_PROXY_ACK_TIMEOUT_MS 5000u
+#define LIVE_PROXY_RECEIVE_TIMEOUT_MS 6500u
 
 typedef struct {
     um_live_audio_options options;
     um_audio *audio;
+    um_network *network;
     um_log_callback logger;
     void *logger_context;
     uint32_t session_id;
@@ -37,8 +46,30 @@ typedef struct {
     um_modem_config gateway_to_client;
     int have_client_to_gateway;
     int have_gateway_to_client;
+    int link_stage_started;
     float *receive_samples;
 } live_context;
+
+typedef struct {
+    uint16_t transmit_sequence;
+    uint16_t receive_sequence;
+    uint16_t last_received_sequence;
+    uint16_t turn_sequence;
+    uint16_t last_committed_turn;
+    uint32_t transmit_packet_id;
+    uint32_t receive_packet_id;
+    size_t receive_total;
+    size_t receive_offset;
+    size_t receive_fragments;
+    uint8_t receive_packet[UM_NETWORK_MAX_PACKET];
+    size_t packets_sent;
+    size_t packets_received;
+    size_t bytes_sent;
+    size_t bytes_received;
+    uint64_t started_ms;
+    int have_received_sequence;
+    int have_last_commit;
+} live_proxy_state;
 
 typedef struct {
     size_t index;
@@ -134,6 +165,20 @@ static const char *wire_name(um_live_wire_type type)
         return "COMPLETE";
     case UM_WIRE_CALIB_CACHE:
         return "CALIB_CACHE";
+    case UM_WIRE_PROXY_BEGIN:
+        return "PROXY_BEGIN";
+    case UM_WIRE_IP_FRAGMENT:
+        return "IP_FRAGMENT";
+    case UM_WIRE_IP_ACK:
+        return "IP_ACK";
+    case UM_WIRE_PROXY_TURN:
+        return "PROXY_TURN";
+    case UM_WIRE_PROXY_TURN_ACK:
+        return "PROXY_TURN_ACK";
+    case UM_WIRE_PROXY_TURN_COMMIT:
+        return "PROXY_TURN_COMMIT";
+    case UM_WIRE_PROXY_COMPLETE:
+        return "PROXY_COMPLETE";
     default:
         return "UNKNOWN";
     }
@@ -209,21 +254,25 @@ static uint32_t read_u32(const uint8_t *bytes)
            ((uint32_t)bytes[2] << 8u) | bytes[3];
 }
 
-void um_live_handshake_body(uint8_t body[UM_LIVE_HANDSHAKE_BYTES])
+void um_live_handshake_body(uint8_t body[UM_LIVE_HANDSHAKE_BYTES],
+                            int link_test)
 {
     body[0] = UM_LIVE_PROTOCOL_VERSION;
     body[1] = UM_LIVE_CONFIG_FORMAT_VERSION;
     write_u16(&body[2], (uint16_t)UM_CALIBRATION_PROBE_BYTES);
+    body[4] = link_test != 0 ? 1u : 0u;
 }
 
-int um_live_handshake_validate(const uint8_t *body, size_t body_length)
+int um_live_handshake_validate(const uint8_t *body, size_t body_length,
+                               int link_test)
 {
     if (body == NULL || body_length != UM_LIVE_HANDSHAKE_BYTES) {
         return UM_ERR_UNSUPPORTED;
     }
     return body[0] == UM_LIVE_PROTOCOL_VERSION &&
                    body[1] == UM_LIVE_CONFIG_FORMAT_VERSION &&
-                   read_u16(&body[2]) == UM_CALIBRATION_PROBE_BYTES
+                   read_u16(&body[2]) == UM_CALIBRATION_PROBE_BYTES &&
+                   body[4] == (link_test != 0 ? 1u : 0u)
                ? UM_OK
                : UM_ERR_UNSUPPORTED;
 }
@@ -234,23 +283,30 @@ static int validate_handshake_body(live_context *context, const char *frame,
     unsigned protocol = 0u;
     unsigned config_format = 0u;
     unsigned probe_bytes = 0u;
+    unsigned peer_link_test = 2u;
     if (message->body_length == UM_LIVE_HANDSHAKE_BYTES) {
         protocol = message->body[0];
         config_format = message->body[1];
         probe_bytes = read_u16(&message->body[2]);
+        peer_link_test = message->body[4];
         if (um_live_handshake_validate(message->body,
-                                       message->body_length) == UM_OK) {
+                                       message->body_length,
+                                       context->options.link_test) == UM_OK) {
             return UM_OK;
         }
     }
     live_log(context,
              "Incompatible peer %s capability length=%zu protocol=%u "
-             "config-format=%u probe-bytes=%u; need protocol=%u "
-             "config-format=%u probe-bytes=%u. Rebuild both machines from "
-             "the same revision",
+             "config-format=%u probe-bytes=%u mode=%s; need protocol=%u "
+             "config-format=%u probe-bytes=%u mode=%s. Rebuild both machines "
+             "from the same revision and use --link-test on both or neither",
              frame, message->body_length, protocol, config_format,
-             probe_bytes, UM_LIVE_PROTOCOL_VERSION,
-             UM_LIVE_CONFIG_FORMAT_VERSION, UM_CALIBRATION_PROBE_BYTES);
+             probe_bytes,
+             peer_link_test == 1u ? "link-test"
+                                  : peer_link_test == 0u ? "proxy" : "?",
+             UM_LIVE_PROTOCOL_VERSION, UM_LIVE_CONFIG_FORMAT_VERSION,
+             UM_CALIBRATION_PROBE_BYTES,
+             context->options.link_test != 0 ? "link-test" : "proxy");
     return UM_ERR_UNSUPPORTED;
 }
 
@@ -564,7 +620,7 @@ static int client_connect(live_context *context)
     um_modem_config bootstrap = live_bootstrap_config();
     uint8_t handshake[UM_LIVE_HANDSHAKE_BYTES];
     uint16_t attempt = 0u;
-    um_live_handshake_body(handshake);
+    um_live_handshake_body(handshake, context->options.link_test);
     while (!live_interrupted) {
         um_live_wire_message message;
         um_rx_metrics metrics;
@@ -622,7 +678,7 @@ static int gateway_connect(live_context *context)
 {
     um_modem_config bootstrap = live_bootstrap_config();
     uint8_t handshake[UM_LIVE_HANDSHAKE_BYTES];
-    um_live_handshake_body(handshake);
+    um_live_handshake_body(handshake, context->options.link_test);
     live_log(context, "state=LISTENING waiting for client DISCOVER");
     while (!live_interrupted) {
         um_live_wire_message message;
@@ -1593,6 +1649,600 @@ static int exchange_calibration_caches(live_context *context)
     return UM_OK;
 }
 
+static const um_modem_config *proxy_transmit_config(
+    const live_context *context)
+{
+    return context->options.role == UM_LIVE_CLIENT
+               ? &context->client_to_gateway
+               : &context->gateway_to_client;
+}
+
+static const um_modem_config *proxy_receive_config(
+    const live_context *context)
+{
+    return context->options.role == UM_LIVE_CLIENT
+               ? &context->gateway_to_client
+               : &context->client_to_gateway;
+}
+
+static const char *proxy_transmit_label(const live_context *context)
+{
+    return context->options.role == UM_LIVE_CLIENT ? "client->gateway"
+                                                   : "gateway->client";
+}
+
+static const char *proxy_receive_label(const live_context *context)
+{
+    return context->options.role == UM_LIVE_CLIENT ? "gateway->client"
+                                                   : "client->gateway";
+}
+
+static int validate_ip_packet(const uint8_t *packet, size_t length)
+{
+    unsigned version;
+    if (packet == NULL || length == 0u || length > UM_NETWORK_MAX_PACKET) {
+        return UM_ERR_HEADER;
+    }
+    version = packet[0] >> 4u;
+    if (version == 4u) {
+        size_t header_length;
+        if (length < 20u) {
+            return UM_ERR_HEADER;
+        }
+        header_length = (size_t)(packet[0] & 0x0fu) * 4u;
+        if (header_length < 20u || header_length > length ||
+            read_u16(&packet[2]) != length) {
+            return UM_ERR_HEADER;
+        }
+        return UM_OK;
+    }
+    if (version == 6u) {
+        if (length < 40u || (size_t)read_u16(&packet[4]) + 40u != length) {
+            return UM_ERR_HEADER;
+        }
+        return UM_OK;
+    }
+    return UM_ERR_HEADER;
+}
+
+static int ensure_network(live_context *context)
+{
+    int status;
+    if (context->network != NULL) {
+        return UM_OK;
+    }
+    live_log(context, "state=NETWORK_CONFIGURING role=%s",
+             context->options.role == UM_LIVE_CLIENT ? "client" : "gateway");
+    status = um_network_open(&context->network, context->options.role,
+                             context->logger, context->logger_context);
+    if (status != UM_OK) {
+        return status;
+    }
+    live_log(context, "state=NETWORK_READY interface=%s mtu=%u",
+             um_network_interface_name(context->network), UM_NETWORK_MTU);
+    return UM_OK;
+}
+
+static void log_proxy_packet(live_context *context,
+                             const live_proxy_state *state, int transmitted,
+                             uint32_t packet_id, size_t packet_length,
+                             size_t fragments)
+{
+    double seconds = (double)(monotonic_milliseconds() - state->started_ms) /
+                     1000.0;
+    size_t bytes = transmitted != 0 ? state->bytes_sent
+                                    : state->bytes_received;
+    live_log(context,
+             "proxy %s packet=%u bytes=%zu fragments=%zu total-packets=%zu "
+             "total-bytes=%zu rate=%.0fbps",
+             transmitted != 0 ? proxy_transmit_label(context)
+                              : proxy_receive_label(context),
+             packet_id, packet_length, fragments,
+             transmitted != 0 ? state->packets_sent
+                              : state->packets_received,
+             bytes, seconds > 0.0 ? (double)(bytes * 8u) / seconds : 0.0);
+}
+
+static int send_proxy_packet(live_context *context, live_proxy_state *state,
+                             const uint8_t *packet, size_t packet_length,
+                             size_t frame_body_limit)
+{
+    const um_modem_config *transmit = proxy_transmit_config(context);
+    const um_modem_config *receive = proxy_receive_config(context);
+    size_t fragment_capacity = frame_body_limit -
+                               LIVE_PROXY_FRAGMENT_HEADER_BYTES;
+    size_t offset = 0u;
+    size_t fragments = 0u;
+    uint32_t packet_id = ++state->transmit_packet_id;
+    int status = validate_ip_packet(packet, packet_length);
+    if (status != UM_OK || packet_length > UINT16_MAX) {
+        return status != UM_OK ? status : UM_ERR_CAPACITY;
+    }
+    while (offset < packet_length && !live_interrupted) {
+        uint8_t body[UM_LIVE_MAX_BODY];
+        size_t fragment_length = packet_length - offset;
+        unsigned attempt;
+        int acknowledged = 0;
+        if (fragment_length > fragment_capacity) {
+            fragment_length = fragment_capacity;
+        }
+        write_u32(body, packet_id);
+        write_u16(&body[4], (uint16_t)packet_length);
+        write_u16(&body[6], (uint16_t)offset);
+        memcpy(body + LIVE_PROXY_FRAGMENT_HEADER_BYTES, packet + offset,
+               fragment_length);
+        for (attempt = 0u; attempt < context->options.retry_limit; ++attempt) {
+            um_live_wire_message acknowledgement;
+            sleep_milliseconds(LIVE_TURNAROUND_MS);
+            status = send_wire(
+                context, transmit, UM_WIRE_IP_FRAGMENT,
+                state->transmit_sequence, body,
+                LIVE_PROXY_FRAGMENT_HEADER_BYTES + fragment_length, 1, NULL);
+            if (status != UM_OK) {
+                return status;
+            }
+            status = receive_expected(
+                context, receive, UM_WIRE_IP_ACK, state->transmit_sequence,
+                LIVE_PROXY_ACK_TIMEOUT_MS, &acknowledgement, NULL);
+            if (status == UM_OK) {
+                acknowledged = 1;
+                break;
+            }
+            live_log(context,
+                     "proxy %s fragment seq=%u retry=%u/%u (%s)",
+                     proxy_transmit_label(context),
+                     (unsigned)state->transmit_sequence, attempt + 1u,
+                     context->options.retry_limit, um_status_string(status));
+        }
+        if (acknowledged == 0) {
+            return UM_ERR_TIMEOUT;
+        }
+        offset += fragment_length;
+        ++state->transmit_sequence;
+        ++fragments;
+    }
+    if (live_interrupted) {
+        return UM_ERR_INTERRUPTED;
+    }
+    ++state->packets_sent;
+    state->bytes_sent += packet_length;
+    log_proxy_packet(context, state, 1, packet_id, packet_length, fragments);
+    return UM_OK;
+}
+
+static int receive_proxy_fragment(live_context *context,
+                                  live_proxy_state *state,
+                                  const um_live_wire_message *message)
+{
+    const um_modem_config *acknowledgement = proxy_transmit_config(context);
+    uint32_t packet_id;
+    size_t total;
+    size_t offset;
+    size_t fragment_length;
+    int status;
+    if (message->body_length <= LIVE_PROXY_FRAGMENT_HEADER_BYTES) {
+        return UM_ERR_HEADER;
+    }
+    packet_id = read_u32(message->body);
+    total = read_u16(&message->body[4]);
+    offset = read_u16(&message->body[6]);
+    fragment_length = message->body_length -
+                      LIVE_PROXY_FRAGMENT_HEADER_BYTES;
+    if (total == 0u || total > sizeof(state->receive_packet) ||
+        offset > total || fragment_length > total - offset) {
+        return UM_ERR_HEADER;
+    }
+    if (message->sequence == state->receive_sequence) {
+        if (offset == 0u) {
+            state->receive_packet_id = packet_id;
+            state->receive_total = total;
+            state->receive_offset = 0u;
+            state->receive_fragments = 0u;
+        }
+        if (packet_id != state->receive_packet_id ||
+            total != state->receive_total || offset != state->receive_offset) {
+            return UM_ERR_HEADER;
+        }
+        memcpy(state->receive_packet + offset,
+               message->body + LIVE_PROXY_FRAGMENT_HEADER_BYTES,
+               fragment_length);
+        state->receive_offset += fragment_length;
+        ++state->receive_fragments;
+        state->last_received_sequence = message->sequence;
+        state->have_received_sequence = 1;
+        ++state->receive_sequence;
+        if (state->receive_offset == state->receive_total) {
+            size_t completed_length = state->receive_total;
+            size_t completed_fragments = state->receive_fragments;
+            status = validate_ip_packet(state->receive_packet,
+                                        completed_length);
+            if (status != UM_OK) {
+                return status;
+            }
+            status = um_network_write(context->network,
+                                      state->receive_packet,
+                                      completed_length, 1000u);
+            if (status != UM_OK) {
+                return status;
+            }
+            ++state->packets_received;
+            state->bytes_received += completed_length;
+            log_proxy_packet(context, state, 0, state->receive_packet_id,
+                             completed_length, completed_fragments);
+            state->receive_total = 0u;
+            state->receive_offset = 0u;
+            state->receive_fragments = 0u;
+        }
+    } else if (state->have_received_sequence == 0 ||
+               message->sequence != state->last_received_sequence) {
+        return UM_ERR_HEADER;
+    }
+    sleep_milliseconds(LIVE_TURNAROUND_MS);
+    return send_wire(context, acknowledgement, UM_WIRE_IP_ACK,
+                     message->sequence, NULL, 0u, 1, NULL);
+}
+
+static int resend_proxy_commit(live_context *context,
+                               live_proxy_state *state)
+{
+    if (state->have_last_commit == 0) {
+        return UM_ERR_HEADER;
+    }
+    sleep_milliseconds(LIVE_TURNAROUND_MS);
+    return send_wire(context, proxy_transmit_config(context),
+                     UM_WIRE_PROXY_TURN_COMMIT,
+                     state->last_committed_turn, NULL, 0u, 1, NULL);
+}
+
+static int yield_proxy_token(live_context *context,
+                             live_proxy_state *state)
+{
+    const um_modem_config *transmit = proxy_transmit_config(context);
+    const um_modem_config *receive = proxy_receive_config(context);
+    unsigned attempt;
+    for (attempt = 0u; attempt < context->options.retry_limit; ++attempt) {
+        um_live_wire_message response;
+        int status;
+        sleep_milliseconds(LIVE_TURNAROUND_MS);
+        status = send_wire(context, transmit, UM_WIRE_PROXY_TURN,
+                           state->turn_sequence, NULL, 0u, 1, NULL);
+        if (status != UM_OK) {
+            return status;
+        }
+        status = receive_expected(
+            context, receive, UM_WIRE_PROXY_TURN_ACK,
+            state->turn_sequence, LIVE_PROXY_ACK_TIMEOUT_MS, &response, NULL);
+        if (status == UM_OK) {
+            live_log(context, "proxy token commit sequence=%u",
+                     (unsigned)state->turn_sequence);
+            sleep_milliseconds(LIVE_TURNAROUND_MS);
+            status = send_wire(context, transmit,
+                               UM_WIRE_PROXY_TURN_COMMIT,
+                               state->turn_sequence, NULL, 0u, 1, NULL);
+            if (status != UM_OK) {
+                return status;
+            }
+            state->last_committed_turn = state->turn_sequence;
+            state->have_last_commit = 1;
+            ++state->turn_sequence;
+            return UM_OK;
+        }
+        live_log(context, "proxy token handoff retry=%u/%u (%s)",
+                 attempt + 1u, context->options.retry_limit,
+                 um_status_string(status));
+    }
+    return UM_ERR_TIMEOUT;
+}
+
+static int accept_proxy_token(live_context *context,
+                              live_proxy_state *state,
+                              uint16_t turn_sequence)
+{
+    const um_modem_config *transmit = proxy_transmit_config(context);
+    const um_modem_config *receive = proxy_receive_config(context);
+    unsigned attempt;
+    if (turn_sequence != state->turn_sequence) {
+        return UM_ERR_HEADER;
+    }
+    for (attempt = 0u; attempt < context->options.retry_limit; ++attempt) {
+        uint64_t deadline;
+        int status;
+        live_log(context, "proxy token accept sequence=%u attempt=%u/%u",
+                 (unsigned)turn_sequence, attempt + 1u,
+                 context->options.retry_limit);
+        sleep_milliseconds(LIVE_TURNAROUND_MS);
+        status = send_wire(context, transmit, UM_WIRE_PROXY_TURN_ACK,
+                           turn_sequence, NULL, 0u, 1, NULL);
+        if (status != UM_OK) {
+            return status;
+        }
+        deadline = monotonic_milliseconds() + LIVE_PROXY_ACK_TIMEOUT_MS;
+        while (!live_interrupted && monotonic_milliseconds() < deadline) {
+            um_live_wire_message message;
+            unsigned remaining =
+                (unsigned)(deadline - monotonic_milliseconds());
+            status = receive_wire(context, receive, context->session_id,
+                                  remaining, &message, NULL);
+            if (status == UM_ERR_HEADER || status == UM_ERR_CRC ||
+                status == UM_ERR_SYNC || status == UM_ERR_TRUNCATED) {
+                continue;
+            }
+            if (status != UM_OK) {
+                break;
+            }
+            if (message.type == UM_WIRE_PROXY_TURN_COMMIT &&
+                message.sequence == turn_sequence) {
+                ++state->turn_sequence;
+                return UM_OK;
+            }
+            if (message.type == UM_WIRE_PROXY_TURN &&
+                message.sequence == turn_sequence) {
+                break;
+            }
+        }
+        live_log(context, "proxy token commit wait retry=%u/%u",
+                 attempt + 1u, context->options.retry_limit);
+    }
+    return live_interrupted ? UM_ERR_INTERRUPTED : UM_ERR_TIMEOUT;
+}
+
+static int send_proxy_completion(live_context *context,
+                                 live_proxy_state *state)
+{
+    const um_modem_config *transmit = proxy_transmit_config(context);
+    const um_modem_config *receive = proxy_receive_config(context);
+    unsigned attempt;
+    for (attempt = 0u; attempt < context->options.retry_limit; ++attempt) {
+        um_live_wire_message response;
+        int status;
+        sleep_milliseconds(LIVE_TURNAROUND_MS);
+        status = send_wire(context, transmit, UM_WIRE_PROXY_COMPLETE,
+                           state->turn_sequence, NULL, 0u, 1, NULL);
+        if (status != UM_OK) {
+            return status;
+        }
+        status = receive_expected(
+            context, receive, UM_WIRE_PROXY_COMPLETE,
+            state->turn_sequence, LIVE_PROXY_ACK_TIMEOUT_MS, &response, NULL);
+        if (status == UM_OK) {
+            return UM_OK;
+        }
+    }
+    return UM_ERR_TIMEOUT;
+}
+
+static int receive_until_proxy_token(live_context *context,
+                                     live_proxy_state *state,
+                                     size_t frame_body_limit,
+                                     int *peer_completed)
+{
+    const um_modem_config *receive = proxy_receive_config(context);
+    unsigned misses = 0u;
+    *peer_completed = 0;
+    while (!live_interrupted) {
+        um_live_wire_message message;
+        int status = receive_wire(context, receive, context->session_id,
+                                  LIVE_PROXY_RECEIVE_TIMEOUT_MS, &message,
+                                  NULL);
+        if (status == UM_ERR_HEADER || status == UM_ERR_CRC ||
+            status == UM_ERR_SYNC || status == UM_ERR_TRUNCATED ||
+            status == UM_ERR_TIMEOUT) {
+            if (++misses > context->options.retry_limit + 1u) {
+                return status;
+            }
+            live_log(context, "proxy receive miss=%u/%u (%s)", misses,
+                     context->options.retry_limit + 1u,
+                     um_status_string(status));
+            continue;
+        }
+        if (status != UM_OK) {
+            return status;
+        }
+        misses = 0u;
+        if (message.type == UM_WIRE_IP_FRAGMENT) {
+            status = receive_proxy_fragment(context, state, &message);
+            if (status != UM_OK) {
+                return status;
+            }
+            continue;
+        }
+        if (message.type == UM_WIRE_PROXY_BEGIN && message.sequence == 0u &&
+            message.body_length == LIVE_PROXY_BEGIN_BYTES &&
+            message.body[0] == LIVE_PROXY_FORMAT_VERSION &&
+            read_u16(&message.body[1]) == UM_NETWORK_MTU &&
+            read_u16(&message.body[3]) == frame_body_limit) {
+            live_log(context,
+                     "Duplicate PROXY_BEGIN received; repeating ready ACK");
+            sleep_milliseconds(LIVE_TURNAROUND_MS);
+            status = send_wire(context, proxy_transmit_config(context),
+                               UM_WIRE_ACK, 0u, NULL, 0u, 1, NULL);
+            if (status != UM_OK) {
+                return status;
+            }
+            continue;
+        }
+        if (message.type == UM_WIRE_PROXY_TURN) {
+            return accept_proxy_token(context, state, message.sequence);
+        }
+        if (message.type == UM_WIRE_PROXY_TURN_ACK &&
+            state->have_last_commit != 0 &&
+            message.sequence == state->last_committed_turn) {
+            status = resend_proxy_commit(context, state);
+            if (status != UM_OK) {
+                return status;
+            }
+            continue;
+        }
+        if (message.type == UM_WIRE_PROXY_COMPLETE &&
+            context->options.proxy_test_packets != 0u) {
+            sleep_milliseconds(LIVE_TURNAROUND_MS);
+            status = send_wire(context, proxy_transmit_config(context),
+                               UM_WIRE_PROXY_COMPLETE, message.sequence,
+                               NULL, 0u, 1, NULL);
+            if (status != UM_OK) {
+                return status;
+            }
+            *peer_completed = 1;
+            return UM_OK;
+        }
+        live_log(context, "Ignoring %s during network proxy receive turn",
+                 wire_name(message.type));
+    }
+    return UM_ERR_INTERRUPTED;
+}
+
+static int run_proxy_loop(live_context *context, size_t frame_body_limit)
+{
+    live_proxy_state state;
+    int have_token = context->options.role == UM_LIVE_CLIENT;
+    memset(&state, 0, sizeof(state));
+    state.started_ms = monotonic_milliseconds();
+    live_log(context,
+             "state=PROXYING interface=%s mtu=%u frame-body=%zu "
+             "fragment-payload=%zu initial-token=%s",
+             um_network_interface_name(context->network), UM_NETWORK_MTU,
+             frame_body_limit,
+             frame_body_limit - LIVE_PROXY_FRAGMENT_HEADER_BYTES,
+             have_token != 0 ? "local" : "peer");
+    while (!live_interrupted) {
+        int status;
+        if (have_token != 0) {
+            size_t burst;
+            if (context->options.role == UM_LIVE_CLIENT &&
+                context->options.proxy_test_packets != 0u &&
+                state.packets_sent >= context->options.proxy_test_packets &&
+                state.packets_received >=
+                    context->options.proxy_test_packets) {
+                status = send_proxy_completion(context, &state);
+                if (status == UM_OK) {
+                    live_log(context,
+                             "state=COMPLETE bidirectional network proxy "
+                             "test passed packets=%zu each direction",
+                             context->options.proxy_test_packets);
+                }
+                return status;
+            }
+            for (burst = 0u; burst < LIVE_PROXY_BURST_PACKETS; ++burst) {
+                uint8_t packet[UM_NETWORK_MAX_PACKET];
+                size_t packet_length = 0u;
+                unsigned timeout = burst == 0u ? LIVE_PROXY_IDLE_MS : 0u;
+                status = um_network_read(context->network, packet,
+                                         sizeof(packet), timeout,
+                                         &packet_length);
+                if (status == UM_ERR_TIMEOUT) {
+                    break;
+                }
+                if (status != UM_OK) {
+                    return status;
+                }
+                status = send_proxy_packet(context, &state, packet,
+                                           packet_length,
+                                           frame_body_limit);
+                if (status != UM_OK) {
+                    return status;
+                }
+            }
+            status = yield_proxy_token(context, &state);
+            if (status != UM_OK) {
+                return status;
+            }
+            have_token = 0;
+        } else {
+            int peer_completed = 0;
+            status = receive_until_proxy_token(context, &state,
+                                               frame_body_limit,
+                                               &peer_completed);
+            if (status != UM_OK) {
+                return status;
+            }
+            if (peer_completed != 0) {
+                live_log(context,
+                         "state=COMPLETE bidirectional network proxy test "
+                         "passed packets=%zu each direction",
+                         context->options.proxy_test_packets);
+                return UM_OK;
+            }
+            have_token = 1;
+        }
+    }
+    return UM_ERR_INTERRUPTED;
+}
+
+static int client_proxy_session(live_context *context)
+{
+    uint8_t begin[LIVE_PROXY_BEGIN_BYTES];
+    um_live_wire_message acknowledgement;
+    size_t frame_body_limit = context->options.chunk_bytes;
+    unsigned attempt;
+    int status = ensure_network(context);
+    if (status != UM_OK) {
+        return status;
+    }
+    context->link_stage_started = 1;
+    begin[0] = LIVE_PROXY_FORMAT_VERSION;
+    write_u16(&begin[1], (uint16_t)UM_NETWORK_MTU);
+    write_u16(&begin[3], (uint16_t)frame_body_limit);
+    for (attempt = 0u; attempt < context->options.retry_limit; ++attempt) {
+        sleep_milliseconds(LIVE_TURNAROUND_MS);
+        status = send_wire(context, proxy_transmit_config(context),
+                           UM_WIRE_PROXY_BEGIN, 0u, begin, sizeof(begin), 1,
+                           NULL);
+        if (status != UM_OK) {
+            return status;
+        }
+        status = receive_expected(context, proxy_receive_config(context),
+                                  UM_WIRE_ACK, 0u,
+                                  LIVE_PROXY_ACK_TIMEOUT_MS,
+                                  &acknowledgement, NULL);
+        if (status == UM_OK) {
+            break;
+        }
+        if (status == UM_ERR_INTERRUPTED) {
+            return status;
+        }
+        live_log(context, "proxy start retry=%u/%u (%s)", attempt + 1u,
+                 context->options.retry_limit, um_status_string(status));
+    }
+    if (status != UM_OK) {
+        return UM_ERR_TIMEOUT;
+    }
+    return run_proxy_loop(context, frame_body_limit);
+}
+
+static int gateway_proxy_session(live_context *context)
+{
+    um_live_wire_message begin;
+    size_t frame_body_limit;
+    int status;
+    context->link_stage_started = 1;
+    status = receive_expected(context, proxy_receive_config(context),
+                              UM_WIRE_PROXY_BEGIN, 0u, 15000u, &begin, NULL);
+    if (status != UM_OK) {
+        return status;
+    }
+    if (begin.body_length != LIVE_PROXY_BEGIN_BYTES ||
+        begin.body[0] != LIVE_PROXY_FORMAT_VERSION ||
+        read_u16(&begin.body[1]) != UM_NETWORK_MTU) {
+        return UM_ERR_HEADER;
+    }
+    frame_body_limit = read_u16(&begin.body[3]);
+    if (frame_body_limit <= LIVE_PROXY_FRAGMENT_HEADER_BYTES ||
+        frame_body_limit > UM_LIVE_MAX_BODY) {
+        return UM_ERR_HEADER;
+    }
+    status = ensure_network(context);
+    if (status != UM_OK) {
+        return status;
+    }
+    sleep_milliseconds(LIVE_TURNAROUND_MS);
+    status = send_wire(context, proxy_transmit_config(context), UM_WIRE_ACK,
+                       0u, NULL, 0u, 1, NULL);
+    if (status != UM_OK) {
+        return status;
+    }
+    return run_proxy_loop(context, frame_body_limit);
+}
+
 static int client_session(live_context *context)
 {
     um_live_wire_message message;
@@ -1639,6 +2289,10 @@ static int client_session(live_context *context)
         save_local_calibration(context, 1u,
                                &context->gateway_to_client);
     }
+    if (context->options.link_test == 0) {
+        return client_proxy_session(context);
+    }
+    context->link_stage_started = 1;
     forward_seed = context->session_id ^ UINT32_C(0xc2a70001);
     reverse_seed = context->session_id ^ UINT32_C(0x6a2c0002);
     write_u32(begin, (uint32_t)context->options.test_bytes);
@@ -1769,6 +2423,10 @@ static int gateway_session(live_context *context)
         }
         context->have_gateway_to_client = 1;
     }
+    if (context->options.link_test == 0) {
+        return gateway_proxy_session(context);
+    }
+    context->link_stage_started = 1;
     status = receive_control(context, UM_WIRE_TEST_BEGIN, 0u, 3500u,
                              &message);
     if (status != UM_OK || message.body_length != 10u) {
@@ -1838,7 +2496,8 @@ static int fatal_live_status(int status)
 {
     return status == UM_ERR_ARGUMENT || status == UM_ERR_MEMORY ||
            status == UM_ERR_AUDIO || status == UM_ERR_CONFIG ||
-           status == UM_ERR_UNSUPPORTED || status == UM_ERR_CAPACITY;
+           status == UM_ERR_UNSUPPORTED || status == UM_ERR_CAPACITY ||
+           status == UM_ERR_NETWORK;
 }
 
 um_live_audio_options um_live_audio_default_options(um_live_role role)
@@ -1847,12 +2506,14 @@ um_live_audio_options um_live_audio_default_options(um_live_role role)
     options.role = role;
     options.input_device = "default";
     options.output_device = "default";
+    options.link_test = 0;
     options.test_bytes = 1024u;
     options.chunk_bytes = 128u;
     options.retry_limit = 4u;
     options.discovery_interval_seconds = 2.0f;
     options.calibrate_high_quality = 0;
     options.calibration_path = "calibration.config";
+    options.proxy_test_packets = 0u;
     return options;
 }
 
@@ -1872,9 +2533,12 @@ int um_run_live_audio(const um_live_audio_options *options,
     if (options == NULL || logger == NULL ||
         (options->role != UM_LIVE_GATEWAY &&
          options->role != UM_LIVE_CLIENT) ||
-        options->test_bytes == 0u || options->test_bytes > UINT32_MAX ||
+        (options->link_test != 0 &&
+         (options->test_bytes == 0u || options->test_bytes > UINT32_MAX)) ||
         options->chunk_bytes == 0u ||
         options->chunk_bytes > UM_LIVE_MAX_BODY ||
+        (options->link_test == 0 &&
+         options->chunk_bytes <= LIVE_PROXY_FRAGMENT_HEADER_BYTES) ||
         options->chunk_bytes > UINT16_MAX || options->retry_limit == 0u ||
         options->discovery_interval_seconds <= 0.0f) {
         return UM_ERR_ARGUMENT;
@@ -1896,7 +2560,12 @@ int um_run_live_audio(const um_live_audio_options *options,
     live_interrupted = 0;
     previous_sigint = signal(SIGINT, handle_signal);
     previous_sigterm = signal(SIGTERM, handle_signal);
-    live_log(&context, "Opening real audio; no TUN/utun or routes will be changed");
+    live_log(&context,
+             options->link_test != 0
+                 ? "Opening real audio; link-test mode will not change "
+                   "TUN/utun, routes, DNS, forwarding, or firewall state"
+                 : "Opening real audio; network proxy mode will configure "
+                   "TUN/utun after connection and calibration");
     status = um_audio_open(&context.audio, options->input_device,
                            options->output_device, logger, logger_context);
     if (status != UM_OK) {
@@ -1913,10 +2582,11 @@ int um_run_live_audio(const um_live_audio_options *options,
     calibration_probe_budget = um_calibration_search_budget(
         options->calibrate_high_quality);
     live_log(&context,
-             "Live protocol=%u config-format=%u role=%s test-bytes=%zu "
-             "chunk-bytes=%zu retries=%u",
+             "Live protocol=%u config-format=%u role=%s mode=%s "
+             "test-bytes=%zu chunk-bytes=%zu retries=%u",
              UM_LIVE_PROTOCOL_VERSION, UM_LIVE_CONFIG_FORMAT_VERSION,
              options->role == UM_LIVE_CLIENT ? "client" : "gateway",
+             options->link_test != 0 ? "link-test" : "network-proxy",
              options->test_bytes, options->chunk_bytes,
              options->retry_limit);
     live_log(&context,
@@ -1960,6 +2630,7 @@ int um_run_live_audio(const um_live_audio_options *options,
                  options->calibrate_high_quality));
     load_local_calibration(&context);
     while (!live_interrupted) {
+        context.link_stage_started = 0;
         status = options->role == UM_LIVE_CLIENT ? client_session(&context)
                                                  : gateway_session(&context);
         if (status == UM_OK || fatal_live_status(status)) {
@@ -1969,12 +2640,21 @@ int um_run_live_audio(const um_live_audio_options *options,
                  "state=RECONNECTING link stage failed: %s; returning to %s",
                  um_status_string(status),
                  options->role == UM_LIVE_CLIENT ? "discovery" : "listening");
+        if (context.link_stage_started != 0) {
+            context.have_client_to_gateway = 0;
+            context.have_gateway_to_client = 0;
+            live_log(&context,
+                     "Discarding cached in-memory modes after a link-stage "
+                     "failure; the next connection will recalibrate both "
+                     "directions");
+        }
         (void)um_audio_flush_capture(context.audio);
         sleep_milliseconds(1000u);
     }
     if (live_interrupted) {
         status = UM_ERR_INTERRUPTED;
     }
+    um_network_close(context.network);
     um_audio_close(context.audio);
     free(context.receive_samples);
     if (previous_sigint != SIG_ERR) {

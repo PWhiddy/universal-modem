@@ -2,6 +2,7 @@
 
 #include "um.h"
 #include "../src/audio.h"
+#include "../src/network.h"
 #include "../src/um_internal.h"
 
 #include <errno.h>
@@ -14,6 +15,9 @@
 #include <unistd.h>
 
 enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
+
+#define SIM_REQUEST_BYTES UM_NETWORK_MTU
+#define SIM_RESPONSE_BYTES 413u
 
 /* CoreAudio capture callbacks can resume after AudioQueueStart returns. */
 #define SIM_CAPTURE_START_MS 60u
@@ -34,6 +38,20 @@ typedef struct {
     int baseline_drop_endpoint;
     int baseline_drop_armed;
     unsigned baseline_drops;
+    int proxy_drop_endpoint;
+    int proxy_drop_armed;
+    unsigned proxy_drops;
+    int begin_ack_drop_armed;
+    unsigned begin_ack_drops;
+    int turn_ack_drop_armed;
+    unsigned turn_ack_drops;
+    int commit_drop_armed;
+    unsigned commit_drops;
+    int network_opened[SIM_ENDPOINTS];
+    int network_input_ready[SIM_ENDPOINTS];
+    unsigned network_reads[SIM_ENDPOINTS];
+    unsigned network_writes[SIM_ENDPOINTS];
+    unsigned network_matches[SIM_ENDPOINTS];
     int runners_done;
 } simulated_bus;
 
@@ -53,11 +71,30 @@ static simulated_bus bus = {
     -1,
     0,
     0u,
+    -1,
+    0,
+    0u,
+    0,
+    0u,
+    0,
+    0u,
+    0,
+    0u,
+    {0, 0},
+    {0, 0},
+    {0u, 0u},
+    {0u, 0u},
+    {0u, 0u},
     0
 };
 
 struct um_audio {
     int endpoint;
+};
+
+struct um_network {
+    int endpoint;
+    char interface_name[24];
 };
 
 typedef struct {
@@ -81,8 +118,29 @@ typedef struct {
     unsigned forward_transfer;
     unsigned reverse_transfer;
     unsigned completed;
+    unsigned network_ready;
+    unsigned proxying;
+    unsigned proxy_completed;
+    unsigned proxy_start_retries;
+    unsigned proxy_retries;
+    unsigned token_retries;
+    unsigned commit_retries;
     unsigned reconnecting;
 } runner;
+
+static void make_ipv4_packet(uint8_t *packet, size_t length, uint8_t seed)
+{
+    size_t index;
+    memset(packet, 0, length);
+    packet[0] = 0x45u;
+    packet[2] = (uint8_t)(length >> 8u);
+    packet[3] = (uint8_t)length;
+    packet[8] = 64u;
+    packet[9] = 17u;
+    for (index = 20u; index < length; ++index) {
+        packet[index] = (uint8_t)(seed + index * 29u);
+    }
+}
 
 static void add_milliseconds(struct timespec *time, unsigned milliseconds)
 {
@@ -171,6 +229,59 @@ static void test_log(void *context, const char *message)
                "state=COMPLETE bidirectional real-audio test passed") !=
         NULL) {
         ++run->completed;
+    }
+    if (strstr(message, "state=NETWORK_READY") != NULL) {
+        ++run->network_ready;
+        (void)pthread_mutex_lock(&bus.mutex);
+        if (run->options.role == UM_LIVE_GATEWAY &&
+            bus.proxy_drop_endpoint >= 0 && bus.begin_ack_drops == 0u) {
+            bus.begin_ack_drop_armed = 1;
+        }
+        (void)pthread_mutex_unlock(&bus.mutex);
+    }
+    if (strstr(message, "state=PROXYING") != NULL) {
+        ++run->proxying;
+        (void)pthread_mutex_lock(&bus.mutex);
+        if (run->options.role == UM_LIVE_CLIENT &&
+            bus.proxy_drop_endpoint >= 0 && bus.proxy_drops == 0u) {
+            bus.proxy_drop_armed = 1;
+        }
+        (void)pthread_mutex_unlock(&bus.mutex);
+    }
+    if (strstr(message,
+               "state=COMPLETE bidirectional network proxy test passed") !=
+        NULL) {
+        ++run->proxy_completed;
+    }
+    if (strstr(message, "proxy ") != NULL &&
+        strstr(message, " fragment seq=") != NULL &&
+        strstr(message, " retry=") != NULL) {
+        ++run->proxy_retries;
+    }
+    if (strstr(message, "proxy start retry=") != NULL) {
+        ++run->proxy_start_retries;
+    }
+    if (strstr(message, "proxy token handoff retry=") != NULL) {
+        ++run->token_retries;
+    }
+    if (strstr(message, "proxy token commit wait retry=") != NULL) {
+        ++run->commit_retries;
+    }
+    if (run->options.role == UM_LIVE_GATEWAY &&
+        strstr(message, "proxy token accept sequence=") != NULL) {
+        (void)pthread_mutex_lock(&bus.mutex);
+        if (bus.proxy_drop_endpoint >= 0 && bus.turn_ack_drops == 0u) {
+            bus.turn_ack_drop_armed = 1;
+        }
+        (void)pthread_mutex_unlock(&bus.mutex);
+    }
+    if (run->options.role == UM_LIVE_CLIENT &&
+        strstr(message, "proxy token commit sequence=") != NULL) {
+        (void)pthread_mutex_lock(&bus.mutex);
+        if (bus.proxy_drop_endpoint >= 0 && bus.commit_drops == 0u) {
+            bus.commit_drop_armed = 1;
+        }
+        (void)pthread_mutex_unlock(&bus.mutex);
     }
     if (strstr(message, "state=RECONNECTING") != NULL) {
         ++run->reconnecting;
@@ -359,6 +470,27 @@ int um_audio_write(um_audio *audio, const float *samples, size_t frame_count)
         ++bus.baseline_drops;
         drop_write = 1;
     }
+    if (bus.proxy_drop_armed != 0 &&
+        bus.proxy_drop_endpoint == audio->endpoint) {
+        bus.proxy_drop_armed = 0;
+        ++bus.proxy_drops;
+        drop_write = 1;
+    }
+    if (bus.begin_ack_drop_armed != 0 && audio->endpoint == SIM_GATEWAY) {
+        bus.begin_ack_drop_armed = 0;
+        ++bus.begin_ack_drops;
+        drop_write = 1;
+    }
+    if (bus.turn_ack_drop_armed != 0 && audio->endpoint == SIM_GATEWAY) {
+        bus.turn_ack_drop_armed = 0;
+        ++bus.turn_ack_drops;
+        drop_write = 1;
+    }
+    if (bus.commit_drop_armed != 0 && audio->endpoint == SIM_CLIENT) {
+        bus.commit_drop_armed = 0;
+        ++bus.commit_drops;
+        drop_write = 1;
+    }
     (void)pthread_mutex_unlock(&bus.mutex);
     if (drop_write != 0) {
         return UM_OK;
@@ -409,6 +541,142 @@ int um_audio_write(um_audio *audio, const float *samples, size_t frame_count)
     return status;
 }
 
+int um_network_open(um_network **network, um_live_role role,
+                    um_log_callback logger, void *logger_context)
+{
+    um_network *opened;
+    int endpoint;
+    if (network == NULL ||
+        (role != UM_LIVE_CLIENT && role != UM_LIVE_GATEWAY)) {
+        return UM_ERR_ARGUMENT;
+    }
+    endpoint = role == UM_LIVE_CLIENT ? SIM_CLIENT : SIM_GATEWAY;
+    opened = (um_network *)malloc(sizeof(*opened));
+    if (opened == NULL) {
+        return UM_ERR_MEMORY;
+    }
+    opened->endpoint = endpoint;
+    (void)snprintf(opened->interface_name, sizeof(opened->interface_name),
+                   "sim-tun-%s", endpoint == SIM_CLIENT ? "client"
+                                                        : "gateway");
+    (void)pthread_mutex_lock(&bus.mutex);
+    if (bus.network_opened[endpoint] != 0) {
+        (void)pthread_mutex_unlock(&bus.mutex);
+        free(opened);
+        return UM_ERR_NETWORK;
+    }
+    bus.network_opened[endpoint] = 1;
+    if (endpoint == SIM_CLIENT) {
+        bus.network_input_ready[endpoint] = 1;
+    }
+    (void)pthread_cond_broadcast(&bus.changed);
+    (void)pthread_mutex_unlock(&bus.mutex);
+    if (logger != NULL) {
+        logger(logger_context,
+               endpoint == SIM_CLIENT
+                   ? "Opened independent simulated client TUN"
+                   : "Opened independent simulated gateway TUN");
+    }
+    *network = opened;
+    return UM_OK;
+}
+
+void um_network_close(um_network *network)
+{
+    if (network == NULL) {
+        return;
+    }
+    (void)pthread_mutex_lock(&bus.mutex);
+    bus.network_opened[network->endpoint] = 0;
+    bus.network_input_ready[network->endpoint] = 0;
+    (void)pthread_cond_broadcast(&bus.changed);
+    (void)pthread_mutex_unlock(&bus.mutex);
+    free(network);
+}
+
+int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
+                    unsigned timeout_ms, size_t *packet_length)
+{
+    struct timespec deadline;
+    uint8_t generated[UM_NETWORK_MTU];
+    size_t length;
+    int wait_status = 0;
+    if (network == NULL || packet == NULL || packet_length == NULL) {
+        return UM_ERR_ARGUMENT;
+    }
+    *packet_length = 0u;
+    length = network->endpoint == SIM_CLIENT ? SIM_REQUEST_BYTES
+                                             : SIM_RESPONSE_BYTES;
+    if (capacity < length) {
+        return UM_ERR_CAPACITY;
+    }
+    (void)clock_gettime(CLOCK_REALTIME, &deadline);
+    add_milliseconds(&deadline, timeout_ms);
+    (void)pthread_mutex_lock(&bus.mutex);
+    while (bus.network_input_ready[network->endpoint] == 0 &&
+           bus.network_opened[network->endpoint] != 0 &&
+           wait_status != ETIMEDOUT && timeout_ms != 0u) {
+        wait_status = pthread_cond_timedwait(&bus.changed, &bus.mutex,
+                                             &deadline);
+    }
+    if (bus.network_opened[network->endpoint] == 0) {
+        (void)pthread_mutex_unlock(&bus.mutex);
+        return UM_ERR_NETWORK;
+    }
+    if (bus.network_input_ready[network->endpoint] == 0) {
+        (void)pthread_mutex_unlock(&bus.mutex);
+        return UM_ERR_TIMEOUT;
+    }
+    bus.network_input_ready[network->endpoint] = 0;
+    ++bus.network_reads[network->endpoint];
+    (void)pthread_mutex_unlock(&bus.mutex);
+
+    make_ipv4_packet(generated, length,
+                     network->endpoint == SIM_CLIENT ? 0x31u : 0xa7u);
+    memcpy(packet, generated, length);
+    *packet_length = length;
+    return UM_OK;
+}
+
+int um_network_write(um_network *network, const uint8_t *packet,
+                     size_t packet_length, unsigned timeout_ms)
+{
+    uint8_t expected[UM_NETWORK_MTU];
+    size_t expected_length;
+    int matches;
+    (void)timeout_ms;
+    if (network == NULL || packet == NULL) {
+        return UM_ERR_ARGUMENT;
+    }
+    expected_length = network->endpoint == SIM_GATEWAY
+                          ? SIM_REQUEST_BYTES
+                          : SIM_RESPONSE_BYTES;
+    make_ipv4_packet(expected, expected_length,
+                     network->endpoint == SIM_GATEWAY ? 0x31u : 0xa7u);
+    matches = packet_length == expected_length &&
+              memcmp(packet, expected, expected_length) == 0;
+    (void)pthread_mutex_lock(&bus.mutex);
+    if (bus.network_opened[network->endpoint] == 0) {
+        (void)pthread_mutex_unlock(&bus.mutex);
+        return UM_ERR_NETWORK;
+    }
+    ++bus.network_writes[network->endpoint];
+    if (matches != 0) {
+        ++bus.network_matches[network->endpoint];
+        if (network->endpoint == SIM_GATEWAY) {
+            bus.network_input_ready[SIM_GATEWAY] = 1;
+        }
+        (void)pthread_cond_broadcast(&bus.changed);
+    }
+    (void)pthread_mutex_unlock(&bus.mutex);
+    return matches != 0 ? UM_OK : UM_ERR_NETWORK;
+}
+
+const char *um_network_interface_name(const um_network *network)
+{
+    return network != NULL ? network->interface_name : NULL;
+}
+
 static void *run_endpoint(void *argument)
 {
     runner *run = (runner *)argument;
@@ -429,29 +697,40 @@ static void print_logs(const runner *run)
     }
 }
 
-static int check_runner(const runner *run, unsigned expected_calibrations)
+static int check_runner(const runner *run, unsigned expected_calibrations,
+                        int link_test)
 {
-    return run->status == UM_OK && run->connected == 1u &&
-           run->calibrating == expected_calibrations &&
-           run->calibration_selections == expected_calibrations &&
-           run->cache_exchanges == 1u &&
-           run->cache_skips == 2u - expected_calibrations &&
-           run->forward_transfer == 1u &&
-           run->reverse_transfer == 1u && run->completed == 1u &&
-           run->reconnecting == 0u;
+    int common = run->status == UM_OK && run->connected == 1u &&
+                 run->calibrating == expected_calibrations &&
+                 run->calibration_selections == expected_calibrations &&
+                 run->cache_exchanges == 1u &&
+                 run->cache_skips == 2u - expected_calibrations &&
+                 run->reconnecting == 0u;
+    if (link_test != 0) {
+        return common && run->forward_transfer == 1u &&
+               run->reverse_transfer == 1u && run->completed == 1u &&
+               run->network_ready == 0u && run->proxying == 0u &&
+               run->proxy_completed == 0u;
+    }
+    return common && run->forward_transfer == 0u &&
+           run->reverse_transfer == 0u && run->completed == 0u &&
+           run->network_ready == 1u && run->proxying == 1u &&
+           run->proxy_completed == 1u;
 }
 
 static void configure_runner(runner *run, const char *name,
                              um_live_role role, const char *device,
-                             const char *calibration_path)
+                             const char *calibration_path, int link_test)
 {
     memset(run, 0, sizeof(*run));
     run->name = name;
     run->options = um_live_audio_default_options(role);
     run->options.input_device = device;
     run->options.output_device = device;
+    run->options.link_test = link_test;
+    run->options.proxy_test_packets = link_test == 0 ? 1u : 0u;
     run->options.test_bytes = 256u;
-    run->options.chunk_bytes = 64u;
+    run->options.chunk_bytes = link_test != 0 ? 64u : 128u;
     run->options.retry_limit = 5u;
     run->options.discovery_interval_seconds = 0.4f;
     run->options.calibration_path = calibration_path;
@@ -460,6 +739,7 @@ static void configure_runner(runner *run, const char *name,
 static int run_pair(const char *label,
                     const um_channel_config *client_to_gateway,
                     const um_channel_config *gateway_to_client,
+                    int link_test, int inject_proxy_retry,
                     int require_upgrade, int require_baseline,
                     int inject_verification_fallback,
                     int inject_baseline_recovery,
@@ -476,9 +756,9 @@ static int run_pair(const char *label,
     int status;
 
     configure_runner(&client, "client", UM_LIVE_CLIENT, "sim-client",
-                     client_calibration_path);
+                     client_calibration_path, link_test);
     configure_runner(&gateway, "gateway", UM_LIVE_GATEWAY, "sim-gateway",
-                     gateway_calibration_path);
+                     gateway_calibration_path, link_test);
 
     (void)pthread_mutex_lock(&bus.mutex);
     bus.channel[SIM_CLIENT] = *client_to_gateway;
@@ -500,6 +780,22 @@ static int run_pair(const char *label,
                                      : -1;
     bus.baseline_drop_armed = 0;
     bus.baseline_drops = 0u;
+    bus.proxy_drop_endpoint = inject_proxy_retry != 0
+                                  ? SIM_GATEWAY
+                                  : -1;
+    bus.proxy_drop_armed = 0;
+    bus.proxy_drops = 0u;
+    bus.begin_ack_drop_armed = 0;
+    bus.begin_ack_drops = 0u;
+    bus.turn_ack_drop_armed = 0;
+    bus.turn_ack_drops = 0u;
+    bus.commit_drop_armed = 0;
+    bus.commit_drops = 0u;
+    memset(bus.network_opened, 0, sizeof(bus.network_opened));
+    memset(bus.network_input_ready, 0, sizeof(bus.network_input_ready));
+    memset(bus.network_reads, 0, sizeof(bus.network_reads));
+    memset(bus.network_writes, 0, sizeof(bus.network_writes));
+    memset(bus.network_matches, 0, sizeof(bus.network_matches));
     bus.runners_done = 0;
     (void)pthread_mutex_unlock(&bus.mutex);
 
@@ -530,7 +826,7 @@ static int run_pair(const char *label,
 
     (void)pthread_mutex_lock(&bus.mutex);
     (void)clock_gettime(CLOCK_REALTIME, &deadline);
-    add_milliseconds(&deadline, 60000u);
+    add_milliseconds(&deadline, link_test != 0 ? 60000u : 120000u);
     while (bus.runners_done < 2) {
         status = pthread_cond_timedwait(&bus.changed, &bus.mutex, &deadline);
         if (status == ETIMEDOUT) {
@@ -547,8 +843,8 @@ static int run_pair(const char *label,
     (void)pthread_join(gateway_thread, NULL);
 
     if (timed_out != 0 ||
-        !check_runner(&client, expected_calibrations) ||
-        !check_runner(&gateway, expected_calibrations) ||
+        !check_runner(&client, expected_calibrations, link_test) ||
+        !check_runner(&gateway, expected_calibrations, link_test) ||
         (expected_calibrations != 0u &&
          (client.robust_passes + gateway.robust_passes <
               expected_calibrations)) ||
@@ -562,7 +858,24 @@ static int run_pair(const char *label,
               0u)) ||
         (inject_baseline_recovery != 0 &&
          (bus.baseline_drops != 1u ||
-          client.recovery_probes + gateway.recovery_probes == 0u))) {
+          client.recovery_probes + gateway.recovery_probes == 0u)) ||
+        (link_test == 0 &&
+         (bus.network_opened[SIM_CLIENT] != 0 ||
+          bus.network_opened[SIM_GATEWAY] != 0 ||
+          bus.network_reads[SIM_CLIENT] != 1u ||
+          bus.network_reads[SIM_GATEWAY] != 1u ||
+          bus.network_writes[SIM_CLIENT] != 1u ||
+          bus.network_writes[SIM_GATEWAY] != 1u ||
+          bus.network_matches[SIM_CLIENT] != 1u ||
+          bus.network_matches[SIM_GATEWAY] != 1u)) ||
+        (inject_proxy_retry != 0 &&
+         (bus.proxy_drops != 1u || bus.begin_ack_drops != 1u ||
+          bus.turn_ack_drops != 1u ||
+          bus.commit_drops != 1u ||
+          client.proxy_start_retries + gateway.proxy_start_retries == 0u ||
+          client.proxy_retries + gateway.proxy_retries == 0u ||
+          client.token_retries + gateway.token_retries == 0u ||
+          client.commit_retries + gateway.commit_retries == 0u))) {
         fprintf(stderr,
                 "%s paired live simulation failed timeout=%d client=%s "
                 "gateway=%s\n",
@@ -573,10 +886,13 @@ static int run_pair(const char *label,
         return 1;
     }
     printf("paired live %s passed: connection, adaptive 2-way calibration, "
-           "delayed capture restart, 256+256 bytes; upgrades=%u/%u "
+           "delayed capture restart, %s; upgrades=%u/%u "
            "fallbacks=%u/%u verification-stepdowns=%u calibrations=%u "
            "cache-skips=%u recovery-probes=%u\n",
-           label, client.adaptive_upgrades, gateway.adaptive_upgrades,
+           label,
+           link_test != 0 ? "256+256-byte explicit link test"
+                          : "576+413-byte fragmented IP proxy exchange",
+           client.adaptive_upgrades, gateway.adaptive_upgrades,
            client.baseline_selections, gateway.baseline_selections,
            client.verification_fallbacks + gateway.verification_fallbacks,
            expected_calibrations, client.cache_skips + gateway.cache_skips,
@@ -604,8 +920,8 @@ int main(void)
     (void)remove(client_path);
     (void)remove(gateway_path);
 
-    status = run_pair("v2-worse", &v2_forward, &v2_reverse, 0, 0, 1, 0,
-                      2u, client_path, gateway_path);
+    status = run_pair("v2-worse-network-proxy", &v2_forward, &v2_reverse,
+                      0, 1, 0, 0, 1, 0, 2u, client_path, gateway_path);
     if (status == 0) {
         found = 0;
         if (um_calibration_config_load(client_path, UM_LIVE_CLIENT, &cached,
@@ -625,14 +941,15 @@ int main(void)
         }
     }
     if (status == 0) {
-        status = run_pair("both-cached", &v2_forward, &v2_reverse, 0, 0, 0,
-                          0, 0u, client_path, gateway_path);
+        status = run_pair("both-cached-link-test", &v2_forward, &v2_reverse,
+                          1, 0, 0, 0, 0, 0, 0u, client_path,
+                          gateway_path);
     }
     if (status == 0) {
         (void)remove(gateway_path);
         status = run_pair("one-side-missing-recovery", &v2_forward,
-                          &v2_reverse, 0, 0, 0, 1, 1u, client_path,
-                          gateway_path);
+                          &v2_reverse, 1, 0, 0, 0, 0, 1, 1u,
+                          client_path, gateway_path);
     }
     if (status == 0) {
         if (um_distortion_profile_get(5u, &strong) != UM_OK) {
@@ -642,8 +959,8 @@ int main(void)
             (void)remove(client_path);
             (void)remove(gateway_path);
             status = run_pair("baseline-fallback", &strong.client_to_gateway,
-                              &strong.gateway_to_client, 0, 1, 0, 0, 2u,
-                              client_path, gateway_path);
+                              &strong.gateway_to_client, 1, 0, 0, 1, 0, 0,
+                              2u, client_path, gateway_path);
         }
     }
 

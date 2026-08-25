@@ -26,7 +26,14 @@ typedef enum {
     UM_WIRE_ACK = 13,
     UM_WIRE_TURN = 14,
     UM_WIRE_COMPLETE = 15,
-    UM_WIRE_CALIB_CACHE = 16
+    UM_WIRE_CALIB_CACHE = 16,
+    UM_WIRE_PROXY_BEGIN = 17,
+    UM_WIRE_IP_FRAGMENT = 18,
+    UM_WIRE_IP_ACK = 19,
+    UM_WIRE_PROXY_TURN = 20,
+    UM_WIRE_PROXY_TURN_ACK = 21,
+    UM_WIRE_PROXY_TURN_COMMIT = 22,
+    UM_WIRE_PROXY_COMPLETE = 23
 } um_live_wire_type;
 
 typedef struct {

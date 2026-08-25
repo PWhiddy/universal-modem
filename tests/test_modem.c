@@ -961,18 +961,28 @@ static void test_live_wire_protocol(void)
           UM_ERR_CAPACITY);
     CHECK(um_live_wire_encode((um_live_wire_type)0, 0u, 0u, NULL, 0u, wire,
                               sizeof(wire), &wire_length) == UM_ERR_ARGUMENT);
+    CHECK(um_live_wire_encode(UM_WIRE_PROXY_COMPLETE, 3u, 4u, NULL, 0u,
+                              wire, sizeof(wire), &wire_length) == UM_OK);
+    CHECK(um_live_wire_decode(wire, wire_length, &message) == UM_OK);
+    CHECK(message.type == UM_WIRE_PROXY_COMPLETE);
+    CHECK(um_live_wire_encode((um_live_wire_type)24, 0u, 0u, NULL, 0u,
+                              wire, sizeof(wire), &wire_length) ==
+          UM_ERR_ARGUMENT);
 
-    um_live_handshake_body(capability);
-    CHECK(um_live_handshake_validate(capability, sizeof(capability)) ==
+    um_live_handshake_body(capability, 0);
+    CHECK(um_live_handshake_validate(capability, sizeof(capability), 0) ==
           UM_OK);
-    CHECK(um_live_handshake_validate(capability, 0u) ==
+    CHECK(um_live_handshake_validate(capability, 0u, 0) ==
           UM_ERR_UNSUPPORTED);
     capability[0] ^= 1u;
-    CHECK(um_live_handshake_validate(capability, sizeof(capability)) ==
+    CHECK(um_live_handshake_validate(capability, sizeof(capability), 0) ==
           UM_ERR_UNSUPPORTED);
-    um_live_handshake_body(capability);
+    um_live_handshake_body(capability, 0);
     capability[3] ^= 1u;
-    CHECK(um_live_handshake_validate(capability, sizeof(capability)) ==
+    CHECK(um_live_handshake_validate(capability, sizeof(capability), 0) ==
+          UM_ERR_UNSUPPORTED);
+    um_live_handshake_body(capability, 1);
+    CHECK(um_live_handshake_validate(capability, sizeof(capability), 0) ==
           UM_ERR_UNSUPPORTED);
 
     CHECK(um_live_wire_encode(UM_WIRE_ACK, 1u, 2u, NULL, 0u, wire,

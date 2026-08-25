@@ -13,7 +13,7 @@ endif
 
 ifeq ($(SYSTEM_NAME),Darwin)
 LDLIBS += -framework CoreAudio -framework AudioToolbox
-LDLIBS += -framework CoreFoundation -pthread
+LDLIBS += -framework CoreFoundation -framework SystemConfiguration -pthread
 CFLAGS += -pthread
 endif
 
@@ -30,11 +30,12 @@ LIB_SOURCES := \
 	src/live.c \
 	src/live_wire.c \
 	src/modem.c \
+	src/network.c \
 	src/qam.c
 
 LIB_SOURCES += src/session.c src/validation.c
 LIB_OBJECTS := $(LIB_SOURCES:.c=.o)
-SIM_LIB_OBJECTS := $(filter-out src/audio.o,$(LIB_OBJECTS))
+SIM_LIB_OBJECTS := $(filter-out src/audio.o src/network.o,$(LIB_OBJECTS))
 
 .PHONY: all clean test check
 
@@ -57,6 +58,7 @@ test check: test_modem test_live_audio
 	$(CC) $(CPPFLAGS) $(CSTD) $(CFLAGS) $(WARNINGS) -c $< -o $@
 
 src/audio.o src/live.o: src/audio.h
+src/live.o src/network.o tests/test_live_audio.o: src/network.h
 src/live.o src/live_wire.o tests/test_modem.o tests/test_live_audio.o: src/live_wire.h
 tests/test_live_audio.o: src/audio.h
 

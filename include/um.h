@@ -30,7 +30,8 @@ typedef enum {
     UM_ERR_AUDIO = -10,
     UM_ERR_UNSUPPORTED = -11,
     UM_ERR_INTERRUPTED = -12,
-    UM_ERR_RELIABILITY = -13
+    UM_ERR_RELIABILITY = -13,
+    UM_ERR_NETWORK = -14
 } um_status;
 
 typedef enum {
@@ -181,12 +182,14 @@ typedef struct {
     um_live_role role;
     const char *input_device;
     const char *output_device;
+    int link_test;
     size_t test_bytes;
     size_t chunk_bytes;
     unsigned retry_limit;
     float discovery_interval_seconds;
     int calibrate_high_quality;
     const char *calibration_path;
+    size_t proxy_test_packets;
 } um_live_audio_options;
 
 uint32_t um_crc32(const uint8_t *data, size_t length);

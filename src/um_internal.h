@@ -21,9 +21,9 @@
 #define UM_MAX_PAYLOAD 65535u
 #define UM_CALIBRATION_SEARCH_MAX_NODES 512u
 #define UM_CALIBRATION_PROBE_BYTES 128u
-#define UM_LIVE_PROTOCOL_VERSION 3u
+#define UM_LIVE_PROTOCOL_VERSION 4u
 #define UM_LIVE_CONFIG_FORMAT_VERSION 1u
-#define UM_LIVE_HANDSHAKE_BYTES 4u
+#define UM_LIVE_HANDSHAKE_BYTES 5u
 
 typedef enum {
     UM_CALIB_STEP_BASELINE = 0,
@@ -141,8 +141,10 @@ size_t um_calibration_rank_candidates(
     const um_calibration_search *search,
     const float scores[UM_CALIBRATION_SEARCH_MAX_NODES], size_t *ranked,
     size_t ranked_capacity);
-void um_live_handshake_body(uint8_t body[UM_LIVE_HANDSHAKE_BYTES]);
-int um_live_handshake_validate(const uint8_t *body, size_t body_length);
+void um_live_handshake_body(uint8_t body[UM_LIVE_HANDSHAKE_BYTES],
+                            int link_test);
+int um_live_handshake_validate(const uint8_t *body, size_t body_length,
+                               int link_test);
 int um_calibration_config_load(const char *path, um_live_role role,
                                um_modem_config *config, int *found);
 int um_calibration_config_save(const char *path, um_live_role role,

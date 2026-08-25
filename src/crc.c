@@ -98,6 +98,8 @@ const char *um_status_string(int status)
         return "interrupted";
     case UM_ERR_RELIABILITY:
         return "insufficient reliability margin";
+    case UM_ERR_NETWORK:
+        return "network interface or routing error";
     default:
         return "unknown error";
     }
