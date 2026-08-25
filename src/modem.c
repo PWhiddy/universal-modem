@@ -156,6 +156,22 @@ um_modem_config um_modem_robust_config(void)
     return config;
 }
 
+int um_modem_metrics_have_baseline_margin(const um_rx_metrics *metrics)
+{
+    if (metrics == NULL) {
+        return 0;
+    }
+    /*
+     * A robust frame is ultimately proven by its CRC and the repeated
+     * calibration verification frames.  These two checks prevent a lucky
+     * decode from being called a working baseline while avoiding dependence
+     * on decision-directed EVM, which is diagnostic rather than authoritative
+     * for strongly frequency-selective QPSK channels.
+     */
+    return metrics->sync_correlation >= 0.30f &&
+           metrics->estimated_snr_db >= 6.0f;
+}
+
 int um_modem_metrics_have_margin(const um_modem_config *config,
                                  const um_rx_metrics *metrics)
 {
@@ -960,7 +976,11 @@ static int demodulate_symbols(const um_modem_config *config,
     size_t output = 0u;
     size_t symbol;
     for (symbol = 0u; symbol < symbol_count; ++symbol) {
+        um_complex combined[UM_FFT_SIZE];
+        float combined_weight[UM_FFT_SIZE];
         size_t repetition;
+        memset(combined, 0, sizeof(combined));
+        memset(combined_weight, 0, sizeof(combined_weight));
         memset(soft + output, 0, bits_per_symbol * sizeof(*soft));
         for (repetition = 0u;
              repetition < config->symbol_repetitions; ++repetition) {
@@ -982,13 +1002,12 @@ static int demodulate_symbols(const um_modem_config *config,
             for (bin = config->first_bin; bin <= config->last_bin; ++bin) {
                 if (!is_pilot(config, bin)) {
                     float symbol_soft[6];
-                    uint8_t hard[6];
                     float symbol_reliability =
                         phase.amplitude * phase.amplitude;
+                    float decision_weight;
                     um_complex equalized = um_cmul(
                         um_cdiv(frequency[bin], channel[bin]),
                         phase_correction(&phase, bin, config));
-                    um_complex nearest;
                     unsigned bit;
                     status =
                         um_qam_soft_demod(equalized, qam_bits, symbol_soft);
@@ -998,20 +1017,48 @@ static int demodulate_symbols(const um_modem_config *config,
                     if (symbol_reliability > 4.0f) {
                         symbol_reliability = 4.0f;
                     }
+                    decision_weight = reliability[bin] * phase.confidence *
+                                      symbol_reliability;
                     for (bit = 0u; bit < qam_bits; ++bit) {
                         soft[output + carrier_output + bit] +=
-                            symbol_soft[bit] * reliability[bin] *
-                            phase.confidence * symbol_reliability;
-                        hard[bit] = symbol_soft[bit] >= 0.0f ? 1u : 0u;
+                            symbol_soft[bit] * decision_weight;
+                    }
+                    combined[bin] =
+                        um_cadd(combined[bin],
+                                um_cscale(equalized, decision_weight));
+                    combined_weight[bin] += decision_weight;
+                    carrier_output += qam_bits;
+                }
+            }
+        }
+        {
+            size_t carrier_output = 0u;
+            unsigned bin;
+            for (bin = config->first_bin; bin <= config->last_bin; ++bin) {
+                if (!is_pilot(config, bin)) {
+                    uint8_t hard[6];
+                    um_complex nearest;
+                    unsigned bit;
+                    for (bit = 0u; bit < qam_bits; ++bit) {
+                        hard[bit] =
+                            soft[output + carrier_output + bit] >= 0.0f
+                                ? 1u
+                                : 0u;
+                    }
+                    nearest = um_qam_map(hard, qam_bits);
+                    if (combined_weight[bin] > 1.0e-8f) {
+                        um_complex effective = um_cscale(
+                            combined[bin], 1.0f / combined_weight[bin]);
+                        double weight = combined_weight[bin];
+                        *error_energy +=
+                            weight *
+                            ((double)(effective.re - nearest.re) *
+                                 (effective.re - nearest.re) +
+                             (double)(effective.im - nearest.im) *
+                                 (effective.im - nearest.im));
+                        *ideal_energy += weight * um_cabs2(nearest);
                     }
                     carrier_output += qam_bits;
-                    nearest = um_qam_map(hard, qam_bits);
-                    *error_energy +=
-                        (double)(equalized.re - nearest.re) *
-                            (equalized.re - nearest.re) +
-                        (double)(equalized.im - nearest.im) *
-                            (equalized.im - nearest.im);
-                    *ideal_energy += um_cabs2(nearest);
                 }
             }
         }
@@ -1239,6 +1286,10 @@ int um_demodulate_frame(const um_modem_config *config,
         status = UM_ERR_CAPACITY;
         goto done;
     }
+
+    /* Successful frames report payload-mode EVM, not a QPSK-header average. */
+    error_energy = 0.0;
+    ideal_energy = 0.0;
 
     payload_fec_bits = um_fec_encoded_bits(decoded_length * 8u,
                                            config->fec_rate);

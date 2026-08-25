@@ -14,6 +14,7 @@ typedef struct {
     float score;
     float payload_bps;
     float evm_rms;
+    int baseline;
 } viable_candidate;
 
 static const frequency_range default_ranges[] = {
@@ -288,176 +289,113 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                            um_calibration_result *result,
                            um_log_callback logger, void *logger_context)
 {
-    const frequency_range *ranges = high_quality != 0 ? high_ranges
-                                                       : default_ranges;
-    size_t range_count = high_quality != 0
-                             ? sizeof(high_ranges) / sizeof(high_ranges[0])
-                             : sizeof(default_ranges) /
-                                   sizeof(default_ranges[0]);
-    const unsigned *prefixes = high_quality != 0 ? high_prefixes
-                                                  : default_prefixes;
-    size_t prefix_count = high_quality != 0
-                              ? sizeof(high_prefixes) /
-                                    sizeof(high_prefixes[0])
-                              : sizeof(default_prefixes) /
-                                    sizeof(default_prefixes[0]);
-    const unsigned *windows = high_quality != 0 ? high_windows
-                                                 : default_windows;
-    size_t window_count = high_quality != 0
-                              ? sizeof(high_windows) / sizeof(high_windows[0])
-                              : sizeof(default_windows) /
-                                    sizeof(default_windows[0]);
     uint8_t probe[32];
     uint8_t verification_probe[128];
-    size_t maximum_candidates = range_count *
-                                (sizeof(qam_options) /
-                                 sizeof(qam_options[0])) *
-                                prefix_count *
-                                (sizeof(fec_options) /
-                                 sizeof(fec_options[0])) *
-                                window_count;
+    size_t candidate_count = um_live_calibration_candidate_count(high_quality);
     viable_candidate *viable = NULL;
     size_t viable_count = 0u;
-    size_t range_index;
-    size_t qam_index;
-    size_t prefix_index;
-    size_t fec_index;
-    size_t window_index;
-    int fatal_status = UM_OK;
+    size_t candidate_index;
 
-    if (channel == NULL || result == NULL) {
+    if (channel == NULL || result == NULL || candidate_count == 0u) {
         return UM_ERR_ARGUMENT;
     }
     memset(result, 0, sizeof(*result));
-    result->config = um_modem_default_config();
+    result->config = um_modem_robust_config();
     fill_probe(probe, sizeof(probe), UINT32_C(0xc001d00d));
-    viable = (viable_candidate *)malloc(maximum_candidates * sizeof(*viable));
+    viable = (viable_candidate *)malloc(candidate_count * sizeof(*viable));
     if (viable == NULL) {
         return UM_ERR_MEMORY;
     }
 
-    for (range_index = 0u; range_index < range_count; ++range_index) {
-        for (qam_index = 0u;
-             qam_index < sizeof(qam_options) / sizeof(qam_options[0]);
-             ++qam_index) {
-            for (prefix_index = 0u; prefix_index < prefix_count;
-                 ++prefix_index) {
-                for (fec_index = 0u;
-                     fec_index < sizeof(fec_options) / sizeof(fec_options[0]);
-                     ++fec_index) {
-                    for (window_index = 0u; window_index < window_count;
-                         ++window_index) {
-                        um_modem_config candidate = um_modem_default_config();
-                        um_rx_metrics metrics;
-                        float duration = 0.0f;
-                        float payload_bps = 0.0f;
-                        float raw_bps;
-                        float quality;
-                        float score;
-                        int reliable;
-                        int status;
-                        char line[320];
+    for (candidate_index = 0u; candidate_index < candidate_count;
+         ++candidate_index) {
+        um_modem_config candidate;
+        um_rx_metrics metrics;
+        float duration = 0.0f;
+        float payload_bps = 0.0f;
+        float raw_bps;
+        float quality;
+        float score;
+        int baseline = candidate_index == 0u;
+        int reliable;
+        int status;
+        char line[320];
 
-                        candidate.first_bin = ranges[range_index].first_bin;
-                        candidate.last_bin = ranges[range_index].last_bin;
-                        candidate.qam_bits = qam_options[qam_index];
-                        candidate.cyclic_prefix = prefixes[prefix_index];
-                        candidate.fec_rate = fec_options[fec_index];
-                        candidate.window_samples = windows[window_index];
-                        if (high_quality == 0 &&
-                            (range_index + qam_index + prefix_index +
-                             fec_index + window_index) % 3u != 0u) {
-                            continue;
-                        }
-                        if (um_modem_config_validate(&candidate) != UM_OK) {
-                            continue;
-                        }
-                        ++result->candidates_tested;
-                        memset(&metrics, 0, sizeof(metrics));
-                        status = try_candidate(
-                            &candidate, channel,
-                            (uint32_t)result->candidates_tested, probe,
-                            sizeof(probe), &duration, &payload_bps, &metrics);
-                        if (status == UM_ERR_MEMORY) {
-                            fatal_status = status;
-                            goto done;
-                        }
-                        reliable = status == UM_OK &&
-                                   um_modem_metrics_have_margin(&candidate,
-                                                                &metrics) != 0;
-                        result->estimated_seconds += duration;
-                        raw_bps =
-                            (float)um_modem_data_carriers(&candidate) *
-                            (float)candidate.qam_bits *
-                            fec_ratio(candidate.fec_rate) *
-                            (float)UM_SAMPLE_RATE /
-                            ((float)(candidate.fft_size +
-                                     candidate.cyclic_prefix) *
-                             (float)candidate.symbol_repetitions);
-                        quality = reliable != 0
-                                      ? 1.0f /
-                                            (1.0f + 4.0f * metrics.evm_rms *
-                                                        metrics.evm_rms)
-                                      : 0.0f;
-                        if (candidate.window_samples == 0u) {
-                            quality *= 0.94f;
-                        } else if (candidate.window_samples < 8u) {
-                            quality *= 0.98f;
-                        } else if (candidate.window_samples > 8u) {
-                            quality *= 0.995f;
-                        }
-                        /*
-                         * The 32-byte probe is intentionally short, so its
-                         * measured frame throughput is dominated by sync and
-                         * training and makes QPSK tie with QAM-64.  Rank by
-                         * sustained coded carrier rate, then require the
-                         * longer independent verification frames to prove it.
-                         */
-                        score = raw_bps * quality;
-                        if (reliable != 0) {
-                            ++result->candidates_viable;
-                            viable[viable_count].config = candidate;
-                            viable[viable_count].score = score;
-                            viable[viable_count].payload_bps = payload_bps;
-                            viable[viable_count].evm_rms = metrics.evm_rms;
-                            ++viable_count;
-                        }
-                        if (logger != NULL) {
-                            (void)snprintf(
-                                line, sizeof(line),
-                                "calib %zu band=%.0f-%.0fHz qam=%u cp=%.2fms "
-                                "fec=%s win=%u: %s snr=%.1fdB evm=%.3f "
-                                "payload=%.0fbps score=%.0f",
-                                result->candidates_tested,
-                                (double)candidate.first_bin *
-                                    (double)UM_SAMPLE_RATE /
-                                    (double)candidate.fft_size,
-                                (double)candidate.last_bin *
-                                    (double)UM_SAMPLE_RATE /
-                                    (double)candidate.fft_size,
-                                1u << candidate.qam_bits,
-                                1000.0 * (double)candidate.cyclic_prefix /
-                                    (double)UM_SAMPLE_RATE,
-                                fec_name(candidate.fec_rate),
-                                candidate.window_samples,
-                                reliable != 0
-                                    ? "pass"
-                                    : status == UM_OK ? "marginal"
-                                                      : um_status_string(status),
-                                metrics.estimated_snr_db, metrics.evm_rms,
-                                payload_bps, score);
-                            logger(logger_context, line);
-                        }
-                    }
-                }
-            }
+        status = um_live_calibration_candidate_get(
+            high_quality, candidate_index, &candidate);
+        if (status != UM_OK) {
+            free(viable);
+            return status;
         }
-    }
-
-done:
-    if (fatal_status != UM_OK) {
-        free(viable);
-        return fatal_status;
+        ++result->candidates_tested;
+        memset(&metrics, 0, sizeof(metrics));
+        status = try_candidate(
+            &candidate, channel, (uint32_t)result->candidates_tested, probe,
+            sizeof(probe), &duration, &payload_bps, &metrics);
+        if (status == UM_ERR_MEMORY) {
+            free(viable);
+            return status;
+        }
+        reliable = status == UM_OK &&
+                   (baseline != 0
+                        ? um_modem_metrics_have_baseline_margin(&metrics)
+                        : um_modem_metrics_have_margin(&candidate, &metrics)) !=
+                       0;
+        result->estimated_seconds += duration;
+        raw_bps = (float)um_modem_data_carriers(&candidate) *
+                  (float)candidate.qam_bits * fec_ratio(candidate.fec_rate) *
+                  (float)UM_SAMPLE_RATE /
+                  ((float)(candidate.fft_size + candidate.cyclic_prefix) *
+                   (float)candidate.symbol_repetitions);
+        quality = reliable != 0
+                      ? 1.0f /
+                            (1.0f + 4.0f * metrics.evm_rms * metrics.evm_rms)
+                      : 0.0f;
+        if (candidate.window_samples == 0u) {
+            quality *= 0.94f;
+        } else if (candidate.window_samples < 8u) {
+            quality *= 0.98f;
+        } else if (candidate.window_samples > 8u) {
+            quality *= 0.995f;
+        }
+        score = raw_bps * quality;
+        if (reliable != 0) {
+            ++result->candidates_viable;
+            viable[viable_count].config = candidate;
+            viable[viable_count].score = score;
+            viable[viable_count].payload_bps = payload_bps;
+            viable[viable_count].evm_rms = metrics.evm_rms;
+            viable[viable_count].baseline = baseline;
+            ++viable_count;
+        }
+        if (logger != NULL) {
+            (void)snprintf(
+                line, sizeof(line),
+                "calib %zu%s band=%.0f-%.0fHz qam=%u cp=%.2fms fec=%s "
+                "win=%u repeats=%u: %s snr=%.1fdB evm=%.3f "
+                "payload=%.0fbps score=%.0f",
+                result->candidates_tested, baseline != 0 ? " baseline" : "",
+                (double)candidate.first_bin * (double)UM_SAMPLE_RATE /
+                    (double)candidate.fft_size,
+                (double)candidate.last_bin * (double)UM_SAMPLE_RATE /
+                    (double)candidate.fft_size,
+                1u << candidate.qam_bits,
+                1000.0 * (double)candidate.cyclic_prefix /
+                    (double)UM_SAMPLE_RATE,
+                fec_name(candidate.fec_rate), candidate.window_samples,
+                candidate.symbol_repetitions,
+                reliable != 0
+                    ? "pass"
+                    : status == UM_OK ? "marginal"
+                                      : um_status_string(status),
+                metrics.estimated_snr_db, metrics.evm_rms, payload_bps,
+                score);
+            logger(logger_context, line);
+        }
+        if (baseline != 0 && reliable == 0) {
+            free(viable);
+            return status != UM_OK ? status : UM_ERR_RELIABILITY;
+        }
     }
     if (viable_count != 0u) {
         size_t rank;
@@ -486,8 +424,11 @@ done:
                     sizeof(verification_probe), &duration, &payload_bps,
                     &metrics);
                 reliable = status == UM_OK &&
-                           um_modem_metrics_have_margin(
-                               &viable[rank].config, &metrics) != 0;
+                           (viable[rank].baseline != 0
+                                ? um_modem_metrics_have_baseline_margin(
+                                      &metrics)
+                                : um_modem_metrics_have_margin(
+                                      &viable[rank].config, &metrics)) != 0;
                 ++result->verification_frames;
                 result->estimated_seconds += duration;
                 if (logger != NULL) {

@@ -1,4 +1,5 @@
 *.o
 *.wav
 test_modem
+test_live_audio
 universal-modem

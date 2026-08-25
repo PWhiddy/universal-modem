@@ -365,6 +365,52 @@ static int receive_expected(live_context *context,
     return live_interrupted ? UM_ERR_INTERRUPTED : UM_ERR_TIMEOUT;
 }
 
+static int receive_calibration_ready(live_context *context,
+                                     const um_modem_config *config,
+                                     unsigned direction, size_t candidate,
+                                     unsigned timeout_ms,
+                                     um_live_wire_message *message)
+{
+    uint64_t deadline = monotonic_milliseconds() + timeout_ms;
+    while (!live_interrupted && monotonic_milliseconds() < deadline) {
+        uint64_t now = monotonic_milliseconds();
+        unsigned remaining = (unsigned)(deadline - now);
+        int status = receive_wire(context, config, context->session_id,
+                                  remaining, message, NULL);
+        if (status == UM_ERR_HEADER || status == UM_ERR_CRC) {
+            live_log(context,
+                     "Rejected damaged frame while waiting for CALIB_READY: "
+                     "%s",
+                     um_status_string(status));
+            continue;
+        }
+        if (status != UM_OK) {
+            return status;
+        }
+        if (message->type == UM_WIRE_CALIB_READY &&
+            message->sequence == (uint16_t)candidate) {
+            return UM_OK;
+        }
+        /* A zero-rank report is an explicit early calibration rejection. */
+        if (message->type == UM_WIRE_CALIB_REPORT &&
+            message->sequence == (uint16_t)direction &&
+            message->body_length == 4u &&
+            read_u16(message->body) == 0u && message->body[2] == 0u &&
+            message->body[3] != 0u) {
+            live_log(context,
+                     "calibration peer aborted at candidate=%zu reason=%s",
+                     candidate + 1u,
+                     message->body[3] == 1u ? "baseline decode failed"
+                                             : "baseline margin failed");
+            return message->body[3] == 1u ? UM_ERR_CRC
+                                          : UM_ERR_RELIABILITY;
+        }
+        live_log(context, "Ignoring %s while waiting for CALIB_READY",
+                 wire_name(message->type));
+    }
+    return live_interrupted ? UM_ERR_INTERRUPTED : UM_ERR_TIMEOUT;
+}
+
 static uint32_t make_session_id(void)
 {
     struct timespec now;
@@ -509,6 +555,24 @@ static float live_candidate_score(const um_modem_config *config,
     return raw * quality;
 }
 
+static int send_calibration_abort(live_context *context,
+                                  const um_modem_config *bootstrap,
+                                  unsigned direction, size_t candidate,
+                                  uint8_t reason)
+{
+    uint8_t report[4] = {0u, 0u, 0u, reason};
+    int status;
+    sleep_milliseconds(LIVE_CALIBRATION_SETTLE_MS);
+    status = send_wire(context, bootstrap, UM_WIRE_CALIB_REPORT,
+                       (uint16_t)direction, report, sizeof(report), 1, NULL);
+    if (status != UM_OK) {
+        live_log(context,
+                 "failed to signal calibration abort at candidate=%zu: %s",
+                 candidate + 1u, um_status_string(status));
+    }
+    return status;
+}
+
 static void live_rank_candidate(live_ranked_candidate *ranked,
                                 size_t *rank_count, size_t candidate,
                                 float score)
@@ -610,9 +674,9 @@ static int calibration_sender(live_context *context, unsigned direction,
         um_modem_config config;
         uint8_t probe[16];
         float duration = 0.0f;
-        status = receive_expected(context, &calibration_control,
-                                  UM_WIRE_CALIB_READY, (uint16_t)candidate,
-                                  3500u, &message, NULL);
+        status = receive_calibration_ready(
+            context, &calibration_control, direction, candidate, 5000u,
+            &message);
         if (status != UM_OK) {
             break;
         }
@@ -696,7 +760,7 @@ static int calibration_sender(live_context *context, unsigned direction,
                 }
                 status = receive_expected(context, &bootstrap,
                                            UM_WIRE_CALIB_VERIFY_RESULT,
-                                           verify_sequence, 2500u, &message,
+                                           verify_sequence, 4500u, &message,
                                            NULL);
                 if (status != UM_OK || message.body_length != 1u) {
                     return status != UM_OK ? status : UM_ERR_HEADER;
@@ -778,7 +842,11 @@ static int calibration_receiver(live_context *context, unsigned direction,
             probe.body_length == sizeof(expected) &&
             memcmp(probe.body, expected, sizeof(expected)) == 0) {
             float score = live_candidate_score(&config, &metrics);
-            if (um_modem_metrics_have_margin(&config, &metrics) == 0) {
+            int has_margin =
+                candidate == 0u
+                    ? um_modem_metrics_have_baseline_margin(&metrics)
+                    : um_modem_metrics_have_margin(&config, &metrics);
+            if (has_margin == 0) {
                 live_log(context,
                          "calib rx=%zu/%zu MARGINAL qam=%u fec=%s "
                          "repeats=%u sync=%.3f snr=%.1fdB evm=%.3f; "
@@ -789,10 +857,16 @@ static int calibration_receiver(live_context *context, unsigned direction,
                          metrics.sync_correlation, metrics.estimated_snr_db,
                          metrics.evm_rms);
                 if (candidate == 0u) {
+                    int abort_status;
                     live_log(context,
                              "calib baseline lacks reliability margin; not "
                              "testing faster modes");
-                    return UM_ERR_CRC;
+                    abort_status = send_calibration_abort(
+                        context, &bootstrap, direction, candidate, 2u);
+                    if (abort_status != UM_OK) {
+                        return abort_status;
+                    }
+                    return UM_ERR_RELIABILITY;
                 }
                 continue;
             }
@@ -806,7 +880,7 @@ static int calibration_receiver(live_context *context, unsigned direction,
                      "calib rx=%zu/%zu PASS qam=%u fec=%s cp=%u window=%u "
                      "repeats=%u "
                      "band=%.0f-%.0fHz level=%.1fdBFS norm=%.2fx "
-                     "clip=%.3f%% snr=%.1fdB evm=%.3f score=%.0f",
+                     "clip=%.3f%% snr=%.1fdB evm=%.3f score=%.0f gate=%s",
                      candidate + 1u, expected_count, 1u << config.qam_bits,
                      fec_name(config.fec_rate), config.cyclic_prefix,
                      config.window_samples, config.symbol_repetitions,
@@ -819,7 +893,8 @@ static int calibration_receiver(live_context *context, unsigned direction,
                          : -240.0,
                      metrics.normalization_gain,
                      100.0 * (double)metrics.clipped_sample_fraction,
-                     metrics.estimated_snr_db, metrics.evm_rms, score);
+                     metrics.estimated_snr_db, metrics.evm_rms, score,
+                     candidate == 0u ? "crc+sync/snr" : "snr/evm");
         } else {
             if (status == UM_OK) {
                 status = UM_ERR_CRC;
@@ -844,8 +919,14 @@ static int calibration_receiver(live_context *context, unsigned direction,
                      100.0 * (double)metrics.clipped_sample_fraction,
                      um_status_string(status));
             if (candidate == 0u) {
+                int abort_status;
                 live_log(context,
                          "calib baseline failed; not testing faster modes");
+                abort_status = send_calibration_abort(
+                    context, &bootstrap, direction, candidate, 1u);
+                if (abort_status != UM_OK) {
+                    return abort_status;
+                }
                 return status;
             }
         }
@@ -918,7 +999,11 @@ static int calibration_receiver(live_context *context, unsigned direction,
                     verify.sequence == verify_sequence &&
                     verify.body_length == sizeof(expected) &&
                     memcmp(verify.body, expected, sizeof(expected)) == 0 &&
-                    um_modem_metrics_have_margin(selected, &verify_metrics) !=
+                    (ranked[rank].index == 0u
+                         ? um_modem_metrics_have_baseline_margin(
+                               &verify_metrics)
+                         : um_modem_metrics_have_margin(selected,
+                                                        &verify_metrics)) !=
                         0) {
                     result_body[0] = 1u;
                 }
@@ -936,6 +1021,14 @@ static int calibration_receiver(live_context *context, unsigned direction,
                 }
                 if (result_body[0] == 0u) {
                     verified = 0;
+                    live_log(context,
+                             "calib verify rank=%zu trial=%u/%u FAIL "
+                             "status=%s sync=%.3f snr=%.1fdB evm=%.3f",
+                             rank + 1u, trial + 1u, LIVE_VERIFY_TRIALS,
+                             um_status_string(status),
+                             verify_metrics.sync_correlation,
+                             verify_metrics.estimated_snr_db,
+                             verify_metrics.evm_rms);
                     break;
                 }
                 live_log(context,

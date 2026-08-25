@@ -28,7 +28,8 @@ static void forward_prefixed_log(void *context, const char *message)
 static int expected_signal_failure(int status)
 {
     return status == UM_ERR_SYNC || status == UM_ERR_TRUNCATED ||
-           status == UM_ERR_HEADER || status == UM_ERR_CRC;
+           status == UM_ERR_HEADER || status == UM_ERR_CRC ||
+           status == UM_ERR_RELIABILITY;
 }
 
 static void begin_ladder(um_distortion_ladder_result *result)

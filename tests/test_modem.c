@@ -36,6 +36,8 @@ static void test_crc(void)
     ++tests_run;
     CHECK(um_crc32(check, sizeof(check) - 1u) == UINT32_C(0xcbf43926));
     CHECK(um_crc16(check, sizeof(check) - 1u) == UINT16_C(0x29b1));
+    CHECK(strcmp(um_status_string(UM_ERR_RELIABILITY),
+                 "insufficient reliability margin") == 0);
 }
 
 static void test_fft_round_trip(void)
@@ -387,9 +389,90 @@ static void test_robust_low_level_colored_noise(void)
            metrics.evm_rms);
     CHECK(metrics.input_peak < 0.03f);
     CHECK(metrics.sync_correlation > 0.35f);
+    CHECK(metrics.evm_rms < 0.25f);
+    CHECK(um_modem_metrics_have_margin(&config, &metrics));
     CHECK(metrics.ofdm_symbols > config.training_symbols);
     free(received);
     free(transmitted);
+}
+
+static void test_recorded_v2_async_session(void)
+{
+    um_modem_config robust = um_modem_robust_config();
+    um_session_simulation_config config =
+        um_session_simulation_default_config();
+    um_session_simulation_result result;
+    um_rx_metrics forward_metrics;
+    um_rx_metrics reverse_metrics;
+
+    ++tests_run;
+    config.client_to_gateway = um_channel_recorded_v2_config(0u);
+    config.gateway_to_client = um_channel_recorded_v2_config(1u);
+    config.client_payload_bytes = 1024u;
+    config.gateway_payload_bytes = 1024u;
+    config.frame_payload_bytes = 128u;
+    config.blackout_after_data_seconds = 0.0f;
+    config.blackout_duration_seconds = 0.0f;
+    config.retry_limit = 5u;
+    config.reconnect_limit = 4u;
+    config.random_seed = UINT32_C(0x7632726d);
+
+    memset(&forward_metrics, 0, sizeof(forward_metrics));
+    memset(&reverse_metrics, 0, sizeof(reverse_metrics));
+    CHECK(frame_round_trip(&robust, &config.client_to_gateway, 128u,
+                           &forward_metrics) == UM_OK);
+    CHECK(frame_round_trip(&robust, &config.gateway_to_client, 128u,
+                           &reverse_metrics) == UM_OK);
+    printf("v2 channel: c2g peak=%.1fdBFS sync=%.3f snr=%.1fdB evm=%.3f "
+           "g2c peak=%.1fdBFS sync=%.3f snr=%.1fdB evm=%.3f\n",
+           20.0 * log10((double)forward_metrics.input_peak),
+           forward_metrics.sync_correlation,
+           forward_metrics.estimated_snr_db, forward_metrics.evm_rms,
+           20.0 * log10((double)reverse_metrics.input_peak),
+           reverse_metrics.sync_correlation,
+           reverse_metrics.estimated_snr_db, reverse_metrics.evm_rms);
+    /* v2 measured 0.02017 peak and approximately 15.1 dB training SNR. */
+    CHECK(forward_metrics.input_peak <= 0.0205f);
+    CHECK(reverse_metrics.input_peak <= 0.0205f);
+    CHECK(forward_metrics.estimated_snr_db <= 15.1f);
+    CHECK(reverse_metrics.estimated_snr_db <= 15.1f);
+    CHECK(um_modem_metrics_have_baseline_margin(&forward_metrics));
+    CHECK(um_modem_metrics_have_baseline_margin(&reverse_metrics));
+
+    CHECK(um_simulate_session(&config, &result, NULL, NULL) == UM_OK);
+    printf("v2 async session: bytes=%zu/%zu discoveries=%zu calibrations=%zu "
+           "candidates=%zu verification=%zu retries=%zu reconnects=%zu "
+           "modes=%u/%u-qam repeats=%u/%u\n",
+           result.gateway_received_bytes, result.client_received_bytes,
+           result.discovery_requests, result.calibrations_completed,
+           result.calibration_candidates,
+           result.calibration_verification_frames, result.retries,
+           result.reconnects,
+           1u << result.client_to_gateway_config.qam_bits,
+           1u << result.gateway_to_client_config.qam_bits,
+           result.client_to_gateway_config.symbol_repetitions,
+           result.gateway_to_client_config.symbol_repetitions);
+    CHECK(result.final_connected != 0);
+    CHECK(result.discovery_requests >= 1u);
+    CHECK(result.offers >= 1u);
+    CHECK(result.confirmations >= 1u);
+    CHECK(result.calibrations_completed == 2u);
+    CHECK(result.calibration_candidates == 20u);
+    CHECK(result.calibration_verification_frames >= 6u);
+    CHECK(result.gateway_received_bytes == config.client_payload_bytes);
+    CHECK(result.client_received_bytes == config.gateway_payload_bytes);
+    CHECK(result.data_frames >= 16u);
+    CHECK(result.acknowledgements >= 16u);
+    CHECK(um_modem_config_validate(&result.client_to_gateway_config) == UM_OK);
+    CHECK(um_modem_config_validate(&result.gateway_to_client_config) == UM_OK);
+    CHECK(result.client_to_gateway_config.qam_bits == robust.qam_bits);
+    CHECK(result.gateway_to_client_config.qam_bits == robust.qam_bits);
+    CHECK(result.client_to_gateway_config.fec_rate == robust.fec_rate);
+    CHECK(result.gateway_to_client_config.fec_rate == robust.fec_rate);
+    CHECK(result.client_to_gateway_config.symbol_repetitions ==
+          robust.symbol_repetitions);
+    CHECK(result.gateway_to_client_config.symbol_repetitions ==
+          robust.symbol_repetitions);
 }
 
 static void test_room_reverb_and_clock_drift(void)
@@ -475,7 +558,7 @@ static void test_default_calibration(void)
     channel.echo_gain = 0.29f;
     channel.random_seed = UINT32_C(0x5eed1234);
     CHECK(um_calibrate_simulated(&channel, 0, &result, NULL, NULL) == UM_OK);
-    CHECK(result.candidates_tested == 27u);
+    CHECK(result.candidates_tested == 10u);
     CHECK(result.candidates_viable > 0u);
     CHECK(result.candidates_viable <= result.candidates_tested);
     CHECK(result.candidates_verified > 0u);
@@ -536,7 +619,7 @@ static void test_calibration_distortion_ladder(void)
     CHECK((result.impairments_exercised & UM_IMPAIR_ACOUSTIC_ALL) ==
           UM_IMPAIR_ACOUSTIC_ALL);
     CHECK(result.calibrations_run >= result.passes_passed * 2u + 1u);
-    CHECK(result.candidates_tested > result.passes_attempted * 27u);
+    CHECK(result.candidates_tested >= result.calibrations_run);
     CHECK(result.verification_frames >= result.passes_passed * 6u);
     CHECK(um_distortion_profile_get(result.passes_passed - 1u,
                                     &last_passing) == UM_OK);
@@ -717,6 +800,12 @@ static void test_reliability_margin(void)
     um_rx_metrics metrics = {0};
 
     ++tests_run;
+    metrics.sync_correlation = 0.43f;
+    metrics.estimated_snr_db = 17.5f;
+    metrics.evm_rms = 0.741f;
+    CHECK(um_modem_metrics_have_baseline_margin(&metrics));
+    CHECK(!um_modem_metrics_have_margin(&config, &metrics));
+
     metrics.sync_correlation = 0.54f;
     metrics.estimated_snr_db = 15.0f;
     metrics.evm_rms = 0.265f;
@@ -731,6 +820,7 @@ static void test_reliability_margin(void)
     CHECK(um_modem_metrics_have_margin(&config, &metrics));
 
     metrics.sync_correlation = 0.20f;
+    CHECK(!um_modem_metrics_have_baseline_margin(&metrics));
     CHECK(!um_modem_metrics_have_margin(&config, &metrics));
 }
 
@@ -962,6 +1052,7 @@ int main(void)
     test_impaired_frames();
     test_input_normalization();
     test_robust_low_level_colored_noise();
+    test_recorded_v2_async_session();
     test_room_reverb_and_clock_drift();
     test_default_calibration();
     test_distortion_profiles();

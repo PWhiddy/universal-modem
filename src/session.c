@@ -489,6 +489,9 @@ int um_simulate_session(const um_session_simulation_config *config,
     if (status != UM_OK) {
         goto done;
     }
+    ++result->calibrations_completed;
+    result->calibration_candidates += forward.candidates_tested;
+    result->calibration_verification_frames += forward.verification_frames;
     session.now += forward.estimated_seconds;
     result->client_to_gateway_config = forward.config;
     session_log(&session,
@@ -503,6 +506,9 @@ int um_simulate_session(const um_session_simulation_config *config,
     if (status != UM_OK) {
         goto done;
     }
+    ++result->calibrations_completed;
+    result->calibration_candidates += reverse.candidates_tested;
+    result->calibration_verification_frames += reverse.verification_frames;
     session.now += reverse.estimated_seconds;
     result->gateway_to_client_config = reverse.config;
     session_log(&session,

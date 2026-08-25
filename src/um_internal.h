@@ -78,6 +78,8 @@ size_t um_gcd_size(size_t a, size_t b);
 size_t um_interleave_stride(size_t count);
 
 um_modem_config um_modem_robust_config(void);
+um_channel_config um_channel_recorded_v2_config(unsigned direction);
+int um_modem_metrics_have_baseline_margin(const um_rx_metrics *metrics);
 int um_modem_metrics_have_margin(const um_modem_config *config,
                                  const um_rx_metrics *metrics);
 

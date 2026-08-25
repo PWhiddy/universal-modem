@@ -33,6 +33,7 @@ LIB_SOURCES := \
 
 LIB_SOURCES += src/session.c src/validation.c
 LIB_OBJECTS := $(LIB_SOURCES:.c=.o)
+SIM_LIB_OBJECTS := $(filter-out src/audio.o,$(LIB_OBJECTS))
 
 .PHONY: all clean test check
 
@@ -44,14 +45,20 @@ universal-modem: src/main.o $(LIB_OBJECTS)
 test_modem: tests/test_modem.o $(LIB_OBJECTS)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
-test check: test_modem
+test_live_audio: tests/test_live_audio.o $(SIM_LIB_OBJECTS)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+test check: test_modem test_live_audio
 	./test_modem
+	./test_live_audio
 
 %.o: %.c include/um.h src/um_internal.h
 	$(CC) $(CPPFLAGS) $(CSTD) $(CFLAGS) $(WARNINGS) -c $< -o $@
 
 src/audio.o src/live.o: src/audio.h
-src/live.o src/live_wire.o tests/test_modem.o: src/live_wire.h
+src/live.o src/live_wire.o tests/test_modem.o tests/test_live_audio.o: src/live_wire.h
+tests/test_live_audio.o: src/audio.h
 
 clean:
-	rm -f $(LIB_OBJECTS) src/main.o tests/test_modem.o universal-modem test_modem
+	rm -f $(LIB_OBJECTS) src/main.o tests/test_modem.o tests/test_live_audio.o \
+		universal-modem test_modem test_live_audio

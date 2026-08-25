@@ -96,6 +96,8 @@ const char *um_status_string(int status)
         return "unsupported on this system";
     case UM_ERR_INTERRUPTED:
         return "interrupted";
+    case UM_ERR_RELIABILITY:
+        return "insufficient reliability margin";
     default:
         return "unknown error";
     }

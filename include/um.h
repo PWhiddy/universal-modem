@@ -29,7 +29,8 @@ typedef enum {
     UM_ERR_TIMEOUT = -9,
     UM_ERR_AUDIO = -10,
     UM_ERR_UNSUPPORTED = -11,
-    UM_ERR_INTERRUPTED = -12
+    UM_ERR_INTERRUPTED = -12,
+    UM_ERR_RELIABILITY = -13
 } um_status;
 
 typedef enum {
@@ -71,6 +72,13 @@ typedef struct {
     float noise_stddev;
     unsigned echo_delay;
     float echo_gain;
+    unsigned secondary_echo_delay;
+    float secondary_echo_gain;
+    float lowpass_hz;
+    unsigned lowpass_stages;
+    float interference_hz[2];
+    float interference_amplitude[2];
+    float sample_rate_offset_ppm;
     float clip_level;
     size_t dropout_start;
     size_t dropout_length;
@@ -143,6 +151,9 @@ typedef struct {
     size_t retries;
     size_t reconnects;
     size_t decode_failures;
+    size_t calibrations_completed;
+    size_t calibration_candidates;
+    size_t calibration_verification_frames;
     float elapsed_seconds;
     int final_connected;
 } um_session_simulation_result;
