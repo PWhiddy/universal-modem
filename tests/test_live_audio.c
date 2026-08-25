@@ -18,6 +18,9 @@ enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
 
 #define SIM_REQUEST_BYTES UM_NETWORK_MTU
 #define SIM_RESPONSE_BYTES 413u
+#define SIM_BACKGROUND_BYTES 64u
+#define SIM_BACKGROUND_PACKETS 16u
+#define SIM_PROXY_PACKETS 5u
 
 /* CoreAudio capture callbacks can resume after AudioQueueStart returns. */
 #define SIM_CAPTURE_START_MS 60u
@@ -49,6 +52,8 @@ typedef struct {
     unsigned commit_drops;
     int network_opened[SIM_ENDPOINTS];
     int network_input_ready[SIM_ENDPOINTS];
+    unsigned network_background_remaining[SIM_ENDPOINTS];
+    unsigned network_targets_read[SIM_ENDPOINTS];
     unsigned network_reads[SIM_ENDPOINTS];
     unsigned network_writes[SIM_ENDPOINTS];
     unsigned network_matches[SIM_ENDPOINTS];
@@ -56,36 +61,11 @@ typedef struct {
 } simulated_bus;
 
 static simulated_bus bus = {
-    PTHREAD_MUTEX_INITIALIZER,
-    PTHREAD_COND_INITIALIZER,
-    {NULL, NULL},
-    {0u, 0u},
-    {0u, 0u},
-    {0, 0},
-    {0, 0},
-    {{0}, {0}},
-    0u,
-    -1,
-    0,
-    0u,
-    -1,
-    0,
-    0u,
-    -1,
-    0,
-    0u,
-    0,
-    0u,
-    0,
-    0u,
-    0,
-    0u,
-    {0, 0},
-    {0, 0},
-    {0u, 0u},
-    {0u, 0u},
-    {0u, 0u},
-    0
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .changed = PTHREAD_COND_INITIALIZER,
+    .verify_drop_endpoint = -1,
+    .baseline_drop_endpoint = -1,
+    .proxy_drop_endpoint = -1
 };
 
 struct um_audio {
@@ -128,7 +108,9 @@ typedef struct {
     unsigned reconnecting;
 } runner;
 
-static void make_ipv4_packet(uint8_t *packet, size_t length, uint8_t seed)
+static void make_ipv4_packet(uint8_t *packet, size_t length, uint8_t seed,
+                             uint16_t source_port,
+                             uint16_t destination_port)
 {
     size_t index;
     memset(packet, 0, length);
@@ -137,8 +119,66 @@ static void make_ipv4_packet(uint8_t *packet, size_t length, uint8_t seed)
     packet[3] = (uint8_t)length;
     packet[8] = 64u;
     packet[9] = 17u;
-    for (index = 20u; index < length; ++index) {
+    packet[12] = 10u;
+    packet[15] = 2u;
+    packet[16] = 1u;
+    packet[17] = 1u;
+    packet[18] = 1u;
+    packet[19] = 1u;
+    packet[20] = (uint8_t)(source_port >> 8u);
+    packet[21] = (uint8_t)source_port;
+    packet[22] = (uint8_t)(destination_port >> 8u);
+    packet[23] = (uint8_t)destination_port;
+    packet[24] = (uint8_t)((length - 20u) >> 8u);
+    packet[25] = (uint8_t)(length - 20u);
+    for (index = 28u; index < length; ++index) {
         packet[index] = (uint8_t)(seed + index * 29u);
+    }
+}
+
+static void make_ipv4_tcp_packet(uint8_t *packet, size_t length,
+                                 uint8_t seed, uint16_t source_port,
+                                 uint16_t destination_port)
+{
+    size_t index;
+    memset(packet, 0, length);
+    packet[0] = 0x45u;
+    packet[2] = (uint8_t)(length >> 8u);
+    packet[3] = (uint8_t)length;
+    packet[8] = 64u;
+    packet[9] = 6u;
+    packet[12] = 10u;
+    packet[15] = 2u;
+    packet[16] = 1u;
+    packet[17] = 1u;
+    packet[18] = 1u;
+    packet[19] = 1u;
+    packet[20] = (uint8_t)(source_port >> 8u);
+    packet[21] = (uint8_t)source_port;
+    packet[22] = (uint8_t)(destination_port >> 8u);
+    packet[23] = (uint8_t)destination_port;
+    packet[32] = 0x50u;
+    packet[33] = 0x18u;
+    for (index = 40u; index < length; ++index) {
+        packet[index] = (uint8_t)(seed + index * 31u);
+    }
+}
+
+static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
+                              unsigned target_index)
+{
+    if (target_index == 0u) {
+        make_ipv4_packet(packet, length,
+                         endpoint == SIM_CLIENT ? 0x31u : 0xa7u,
+                         endpoint == SIM_CLIENT ? 53000u : 53u,
+                         endpoint == SIM_CLIENT ? 53u : 53000u);
+    } else {
+        make_ipv4_tcp_packet(
+            packet, length,
+            (uint8_t)((endpoint == SIM_CLIENT ? 0x50u : 0xb0u) +
+                      target_index),
+            endpoint == SIM_CLIENT ? 50000u : 443u,
+            endpoint == SIM_CLIENT ? 443u : 50000u);
     }
 }
 
@@ -254,9 +294,17 @@ static void test_log(void *context, const char *message)
         ++run->proxy_completed;
     }
     if (strstr(message, "proxy ") != NULL &&
-        strstr(message, " fragment seq=") != NULL &&
-        strstr(message, " retry=") != NULL) {
+        strstr(message, " cumulative-ack retry=") != NULL) {
         ++run->proxy_retries;
+    }
+    if (run->options.role == UM_LIVE_GATEWAY &&
+        strstr(message, "proxy client->gateway packet=1 ") != NULL) {
+        (void)pthread_mutex_lock(&bus.mutex);
+        if (bus.proxy_drop_endpoint >= 0 && bus.proxy_drops == 1u) {
+            bus.proxy_drop_endpoint = SIM_GATEWAY;
+            bus.proxy_drop_armed = 1;
+        }
+        (void)pthread_mutex_unlock(&bus.mutex);
     }
     if (strstr(message, "proxy start retry=") != NULL) {
         ++run->proxy_start_retries;
@@ -566,6 +614,7 @@ int um_network_open(um_network **network, um_live_role role,
         return UM_ERR_NETWORK;
     }
     bus.network_opened[endpoint] = 1;
+    bus.network_background_remaining[endpoint] = SIM_BACKGROUND_PACKETS;
     if (endpoint == SIM_CLIENT) {
         bus.network_input_ready[endpoint] = 1;
     }
@@ -589,6 +638,7 @@ void um_network_close(um_network *network)
     (void)pthread_mutex_lock(&bus.mutex);
     bus.network_opened[network->endpoint] = 0;
     bus.network_input_ready[network->endpoint] = 0;
+    bus.network_background_remaining[network->endpoint] = 0u;
     (void)pthread_cond_broadcast(&bus.changed);
     (void)pthread_mutex_unlock(&bus.mutex);
     free(network);
@@ -600,20 +650,22 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
     struct timespec deadline;
     uint8_t generated[UM_NETWORK_MTU];
     size_t length;
+    unsigned background_number = 0u;
+    unsigned target_index = 0u;
+    int background = 0;
     int wait_status = 0;
     if (network == NULL || packet == NULL || packet_length == NULL) {
         return UM_ERR_ARGUMENT;
     }
     *packet_length = 0u;
-    length = network->endpoint == SIM_CLIENT ? SIM_REQUEST_BYTES
-                                             : SIM_RESPONSE_BYTES;
-    if (capacity < length) {
+    if (capacity < UM_NETWORK_MTU) {
         return UM_ERR_CAPACITY;
     }
     (void)clock_gettime(CLOCK_REALTIME, &deadline);
     add_milliseconds(&deadline, timeout_ms);
     (void)pthread_mutex_lock(&bus.mutex);
     while (bus.network_input_ready[network->endpoint] == 0 &&
+           bus.network_background_remaining[network->endpoint] == 0u &&
            bus.network_opened[network->endpoint] != 0 &&
            wait_status != ETIMEDOUT && timeout_ms != 0u) {
         wait_status = pthread_cond_timedwait(&bus.changed, &bus.mutex,
@@ -623,16 +675,36 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
         (void)pthread_mutex_unlock(&bus.mutex);
         return UM_ERR_NETWORK;
     }
-    if (bus.network_input_ready[network->endpoint] == 0) {
+    if (bus.network_input_ready[network->endpoint] == 0 &&
+        bus.network_background_remaining[network->endpoint] == 0u) {
         (void)pthread_mutex_unlock(&bus.mutex);
         return UM_ERR_TIMEOUT;
     }
-    bus.network_input_ready[network->endpoint] = 0;
+    if (bus.network_background_remaining[network->endpoint] != 0u) {
+        background = 1;
+        background_number =
+            bus.network_background_remaining[network->endpoint];
+        --bus.network_background_remaining[network->endpoint];
+    } else {
+        --bus.network_input_ready[network->endpoint];
+        target_index = bus.network_targets_read[network->endpoint]++;
+    }
     ++bus.network_reads[network->endpoint];
     (void)pthread_mutex_unlock(&bus.mutex);
 
-    make_ipv4_packet(generated, length,
-                     network->endpoint == SIM_CLIENT ? 0x31u : 0xa7u);
+    if (background != 0) {
+        length = SIM_BACKGROUND_BYTES;
+        make_ipv4_packet(
+            generated, length,
+            (uint8_t)(0x40u + background_number +
+                      (unsigned)network->endpoint * 0x30u),
+            (uint16_t)(40000u + background_number), 443u);
+    } else {
+        length = network->endpoint == SIM_CLIENT ? SIM_REQUEST_BYTES
+                                                 : SIM_RESPONSE_BYTES;
+        make_proxy_target(generated, length, network->endpoint,
+                          target_index);
+    }
     memcpy(packet, generated, length);
     *packet_length = length;
     return UM_OK;
@@ -643,6 +715,7 @@ int um_network_write(um_network *network, const uint8_t *packet,
 {
     uint8_t expected[UM_NETWORK_MTU];
     size_t expected_length;
+    unsigned target_index;
     int matches;
     (void)timeout_ms;
     if (network == NULL || packet == NULL) {
@@ -651,20 +724,26 @@ int um_network_write(um_network *network, const uint8_t *packet,
     expected_length = network->endpoint == SIM_GATEWAY
                           ? SIM_REQUEST_BYTES
                           : SIM_RESPONSE_BYTES;
-    make_ipv4_packet(expected, expected_length,
-                     network->endpoint == SIM_GATEWAY ? 0x31u : 0xa7u);
-    matches = packet_length == expected_length &&
-              memcmp(packet, expected, expected_length) == 0;
     (void)pthread_mutex_lock(&bus.mutex);
     if (bus.network_opened[network->endpoint] == 0) {
         (void)pthread_mutex_unlock(&bus.mutex);
         return UM_ERR_NETWORK;
     }
-    ++bus.network_writes[network->endpoint];
+    target_index = bus.network_writes[network->endpoint]++;
+    make_proxy_target(expected, expected_length,
+                      network->endpoint == SIM_GATEWAY ? SIM_CLIENT
+                                                       : SIM_GATEWAY,
+                      target_index);
+    matches = packet_length == expected_length &&
+              memcmp(packet, expected, expected_length) == 0;
     if (matches != 0) {
         ++bus.network_matches[network->endpoint];
         if (network->endpoint == SIM_GATEWAY) {
-            bus.network_input_ready[SIM_GATEWAY] = 1;
+            ++bus.network_input_ready[SIM_GATEWAY];
+            if (target_index == 0u) {
+                bus.network_input_ready[SIM_CLIENT] +=
+                    SIM_PROXY_PACKETS - 1u;
+            }
         }
         (void)pthread_cond_broadcast(&bus.changed);
     }
@@ -728,7 +807,8 @@ static void configure_runner(runner *run, const char *name,
     run->options.input_device = device;
     run->options.output_device = device;
     run->options.link_test = link_test;
-    run->options.proxy_test_packets = link_test == 0 ? 1u : 0u;
+    run->options.proxy_test_packets =
+        link_test == 0 ? SIM_PROXY_PACKETS : 0u;
     run->options.test_bytes = 256u;
     run->options.chunk_bytes = link_test != 0 ? 64u : 128u;
     run->options.retry_limit = 5u;
@@ -781,7 +861,7 @@ static int run_pair(const char *label,
     bus.baseline_drop_armed = 0;
     bus.baseline_drops = 0u;
     bus.proxy_drop_endpoint = inject_proxy_retry != 0
-                                  ? SIM_GATEWAY
+                                  ? SIM_CLIENT
                                   : -1;
     bus.proxy_drop_armed = 0;
     bus.proxy_drops = 0u;
@@ -793,6 +873,9 @@ static int run_pair(const char *label,
     bus.commit_drops = 0u;
     memset(bus.network_opened, 0, sizeof(bus.network_opened));
     memset(bus.network_input_ready, 0, sizeof(bus.network_input_ready));
+    memset(bus.network_background_remaining, 0,
+           sizeof(bus.network_background_remaining));
+    memset(bus.network_targets_read, 0, sizeof(bus.network_targets_read));
     memset(bus.network_reads, 0, sizeof(bus.network_reads));
     memset(bus.network_writes, 0, sizeof(bus.network_writes));
     memset(bus.network_matches, 0, sizeof(bus.network_matches));
@@ -826,7 +909,7 @@ static int run_pair(const char *label,
 
     (void)pthread_mutex_lock(&bus.mutex);
     (void)clock_gettime(CLOCK_REALTIME, &deadline);
-    add_milliseconds(&deadline, link_test != 0 ? 60000u : 120000u);
+    add_milliseconds(&deadline, link_test != 0 ? 60000u : 180000u);
     while (bus.runners_done < 2) {
         status = pthread_cond_timedwait(&bus.changed, &bus.mutex, &deadline);
         if (status == ETIMEDOUT) {
@@ -862,14 +945,16 @@ static int run_pair(const char *label,
         (link_test == 0 &&
          (bus.network_opened[SIM_CLIENT] != 0 ||
           bus.network_opened[SIM_GATEWAY] != 0 ||
-          bus.network_reads[SIM_CLIENT] != 1u ||
-          bus.network_reads[SIM_GATEWAY] != 1u ||
-          bus.network_writes[SIM_CLIENT] != 1u ||
-          bus.network_writes[SIM_GATEWAY] != 1u ||
-          bus.network_matches[SIM_CLIENT] != 1u ||
-          bus.network_matches[SIM_GATEWAY] != 1u)) ||
+          bus.network_reads[SIM_CLIENT] !=
+              SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS ||
+          bus.network_reads[SIM_GATEWAY] !=
+              SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS ||
+          bus.network_writes[SIM_CLIENT] != SIM_PROXY_PACKETS ||
+          bus.network_writes[SIM_GATEWAY] != SIM_PROXY_PACKETS ||
+          bus.network_matches[SIM_CLIENT] != SIM_PROXY_PACKETS ||
+          bus.network_matches[SIM_GATEWAY] != SIM_PROXY_PACKETS)) ||
         (inject_proxy_retry != 0 &&
-         (bus.proxy_drops != 1u || bus.begin_ack_drops != 1u ||
+         (bus.proxy_drops != 2u || bus.begin_ack_drops != 1u ||
           bus.turn_ack_drops != 1u ||
           bus.commit_drops != 1u ||
           client.proxy_start_retries + gateway.proxy_start_retries == 0u ||
@@ -891,7 +976,8 @@ static int run_pair(const char *label,
            "cache-skips=%u recovery-probes=%u\n",
            label,
            link_test != 0 ? "256+256-byte explicit link test"
-                          : "576+413-byte fragmented IP proxy exchange",
+                          : "prioritized DNS exchange plus four-packet TCP "
+                            "burst through saturated background queues",
            client.adaptive_upgrades, gateway.adaptive_upgrades,
            client.baseline_selections, gateway.baseline_selections,
            client.verification_fallbacks + gateway.verification_fallbacks,

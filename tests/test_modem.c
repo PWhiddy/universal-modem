@@ -981,6 +981,10 @@ static void test_live_wire_protocol(void)
     capability[3] ^= 1u;
     CHECK(um_live_handshake_validate(capability, sizeof(capability), 0) ==
           UM_ERR_UNSUPPORTED);
+    um_live_handshake_body(capability, 0);
+    capability[5] ^= 1u;
+    CHECK(um_live_handshake_validate(capability, sizeof(capability), 0) ==
+          UM_ERR_UNSUPPORTED);
     um_live_handshake_body(capability, 1);
     CHECK(um_live_handshake_validate(capability, sizeof(capability), 0) ==
           UM_ERR_UNSUPPORTED);

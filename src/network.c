@@ -865,39 +865,48 @@ static int mac_configure_dns(um_network *network)
 {
     CFMutableDictionaryRef dictionary = NULL;
     CFStringRef interface = NULL;
-    CFStringRef servers[2] = {CFSTR("1.1.1.1"), CFSTR("8.8.8.8")};
+    CFStringRef service_id = NULL;
+    CFStringRef servers[1] = {CFSTR("1.1.1.1")};
     CFStringRef domains[1] = {CFSTR("")};
     int order_value = 1;
+    int timeout_value = 60;
     CFNumberRef order = NULL;
+    CFNumberRef timeout = NULL;
     CFArrayRef server_array = NULL;
     CFArrayRef domain_array = NULL;
     CFArrayRef order_array = NULL;
+    CFPropertyListRef published = NULL;
     Boolean set = 0;
     network->dynamic_store =
         SCDynamicStoreCreate(NULL, CFSTR("UniversalModem"), NULL, NULL);
     if (network->dynamic_store == NULL) {
         return UM_ERR_NETWORK;
     }
-    network->dns_key = CFStringCreateWithFormat(
-        NULL, NULL, CFSTR("State:/Network/Service/UniversalModem-%d/DNS"),
-        (int)getpid());
+    service_id = CFStringCreateWithFormat(
+        NULL, NULL, CFSTR("UniversalModem-%d"), (int)getpid());
+    if (service_id != NULL) {
+        network->dns_key = SCDynamicStoreKeyCreateNetworkServiceEntity(
+            NULL, kSCDynamicStoreDomainState, service_id, kSCEntNetDNS);
+    }
     interface = CFStringCreateWithCString(NULL, network->interface_name,
                                           kCFStringEncodingUTF8);
     dictionary = CFDictionaryCreateMutable(
         NULL, 0u, &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
-    server_array = CFArrayCreate(NULL, (const void **)servers, 2u,
+    server_array = CFArrayCreate(NULL, (const void **)servers, 1u,
                                  &kCFTypeArrayCallBacks);
     domain_array = CFArrayCreate(NULL, (const void **)domains, 1u,
                                  &kCFTypeArrayCallBacks);
     order = CFNumberCreate(NULL, kCFNumberIntType, &order_value);
+    timeout = CFNumberCreate(NULL, kCFNumberIntType, &timeout_value);
     if (order != NULL) {
         const void *orders[1] = {order};
         order_array = CFArrayCreate(NULL, orders, 1u,
                                     &kCFTypeArrayCallBacks);
     }
     if (network->dns_key != NULL && interface != NULL && dictionary != NULL &&
-        server_array != NULL && domain_array != NULL && order_array != NULL) {
+        server_array != NULL && domain_array != NULL && order_array != NULL &&
+        timeout != NULL) {
         CFDictionarySetValue(dictionary, kSCPropNetDNSServerAddresses,
                              server_array);
         CFDictionarySetValue(dictionary,
@@ -907,8 +916,21 @@ static int mac_configure_dns(um_network *network)
                              kSCPropNetDNSSupplementalMatchOrders,
                              order_array);
         CFDictionarySetValue(dictionary, kSCPropInterfaceName, interface);
-        set = SCDynamicStoreSetValue(network->dynamic_store,
-                                     network->dns_key, dictionary);
+        CFDictionarySetValue(dictionary, kSCPropNetDNSServerTimeout,
+                             timeout);
+        set = SCDynamicStoreAddTemporaryValue(network->dynamic_store,
+                                              network->dns_key, dictionary);
+        if (set) {
+            published = SCDynamicStoreCopyValue(network->dynamic_store,
+                                                network->dns_key);
+            set = published != NULL && CFEqual(published, dictionary);
+        }
+    }
+    if (published != NULL) {
+        CFRelease(published);
+    }
+    if (timeout != NULL) {
+        CFRelease(timeout);
     }
     if (order_array != NULL) {
         CFRelease(order_array);
@@ -928,13 +950,18 @@ static int mac_configure_dns(um_network *network)
     if (interface != NULL) {
         CFRelease(interface);
     }
+    if (service_id != NULL) {
+        CFRelease(service_id);
+    }
     if (!set) {
         network_log(network, "Could not publish scoped DNS through "
                              "SystemConfiguration");
         return UM_ERR_NETWORK;
     }
-    network_log(network, "DNS routed through %s using %s and %s",
-                network->interface_name, UM_DNS_PRIMARY, UM_DNS_SECONDARY);
+    network_log(network,
+                "Published catch-all DNS on %s using %s timeout=%ds; "
+                "verify resolver adoption with 'scutil --dns'",
+                network->interface_name, UM_DNS_PRIMARY, timeout_value);
     return UM_OK;
 }
 
