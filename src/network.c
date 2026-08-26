@@ -91,6 +91,7 @@ struct um_network {
     int forwarding_changed;
     int forwarding_original;
     SCDynamicStoreRef dynamic_store;
+    CFStringRef ipv4_key;
     CFStringRef dns_key;
 #endif
 };
@@ -999,20 +1000,29 @@ static int mac_configure_pf(um_network *network)
 
 static int mac_configure_dns(um_network *network)
 {
-    CFMutableDictionaryRef dictionary = NULL;
+    CFMutableDictionaryRef dns_dictionary = NULL;
+    CFMutableDictionaryRef ipv4_dictionary = NULL;
     CFStringRef interface = NULL;
     CFStringRef service_id = NULL;
     CFStringRef servers[2] = {CFSTR("1.1.1.1"), CFSTR("8.8.8.8")};
     CFStringRef domains[1] = {CFSTR("")};
+    CFStringRef addresses[1] = {CFSTR("10.77.0.2")};
+    CFStringRef subnet_masks[1] = {CFSTR("255.255.255.252")};
+    CFStringRef destinations[1] = {CFSTR("10.77.0.1")};
     int order_value = 1;
     int timeout_value = 60;
     CFNumberRef order = NULL;
     CFNumberRef timeout = NULL;
     CFArrayRef server_array = NULL;
     CFArrayRef domain_array = NULL;
+    CFArrayRef address_array = NULL;
+    CFArrayRef subnet_mask_array = NULL;
+    CFArrayRef destination_array = NULL;
     CFArrayRef order_array = NULL;
-    CFPropertyListRef published = NULL;
-    Boolean set = 0;
+    CFPropertyListRef published_dns = NULL;
+    CFPropertyListRef published_ipv4 = NULL;
+    Boolean dns_set = 0;
+    Boolean ipv4_set = 0;
     network->dynamic_store =
         SCDynamicStoreCreate(NULL, CFSTR("UniversalModem"), NULL, NULL);
     if (network->dynamic_store == NULL) {
@@ -1021,18 +1031,29 @@ static int mac_configure_dns(um_network *network)
     service_id = CFStringCreateWithFormat(
         NULL, NULL, CFSTR("UniversalModem-%d"), (int)getpid());
     if (service_id != NULL) {
+        network->ipv4_key = SCDynamicStoreKeyCreateNetworkServiceEntity(
+            NULL, kSCDynamicStoreDomainState, service_id, kSCEntNetIPv4);
         network->dns_key = SCDynamicStoreKeyCreateNetworkServiceEntity(
             NULL, kSCDynamicStoreDomainState, service_id, kSCEntNetDNS);
     }
     interface = CFStringCreateWithCString(NULL, network->interface_name,
                                           kCFStringEncodingUTF8);
-    dictionary = CFDictionaryCreateMutable(
+    dns_dictionary = CFDictionaryCreateMutable(
+        NULL, 0u, &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    ipv4_dictionary = CFDictionaryCreateMutable(
         NULL, 0u, &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
     server_array = CFArrayCreate(NULL, (const void **)servers, 2u,
                                  &kCFTypeArrayCallBacks);
     domain_array = CFArrayCreate(NULL, (const void **)domains, 1u,
                                  &kCFTypeArrayCallBacks);
+    address_array = CFArrayCreate(NULL, (const void **)addresses, 1u,
+                                  &kCFTypeArrayCallBacks);
+    subnet_mask_array = CFArrayCreate(NULL, (const void **)subnet_masks, 1u,
+                                      &kCFTypeArrayCallBacks);
+    destination_array = CFArrayCreate(NULL, (const void **)destinations, 1u,
+                                      &kCFTypeArrayCallBacks);
     order = CFNumberCreate(NULL, kCFNumberIntType, &order_value);
     timeout = CFNumberCreate(NULL, kCFNumberIntType, &timeout_value);
     if (order != NULL) {
@@ -1040,30 +1061,60 @@ static int mac_configure_dns(um_network *network)
         order_array = CFArrayCreate(NULL, orders, 1u,
                                     &kCFTypeArrayCallBacks);
     }
-    if (network->dns_key != NULL && interface != NULL && dictionary != NULL &&
-        server_array != NULL && domain_array != NULL && order_array != NULL &&
-        timeout != NULL) {
-        CFDictionarySetValue(dictionary, kSCPropNetDNSServerAddresses,
+    if (network->ipv4_key != NULL && network->dns_key != NULL &&
+        interface != NULL && dns_dictionary != NULL &&
+        ipv4_dictionary != NULL && server_array != NULL &&
+        domain_array != NULL && address_array != NULL &&
+        subnet_mask_array != NULL && destination_array != NULL &&
+        order_array != NULL && timeout != NULL) {
+        CFDictionarySetValue(ipv4_dictionary,
+                             kSCPropNetIPv4ConfigMethod,
+                             kSCValNetIPv4ConfigMethodManual);
+        CFDictionarySetValue(ipv4_dictionary, kSCPropNetIPv4Addresses,
+                             address_array);
+        CFDictionarySetValue(ipv4_dictionary, kSCPropNetIPv4SubnetMasks,
+                             subnet_mask_array);
+        CFDictionarySetValue(ipv4_dictionary, kSCPropNetIPv4DestAddresses,
+                             destination_array);
+        CFDictionarySetValue(ipv4_dictionary, kSCPropNetIPv4Router,
+                             CFSTR("10.77.0.1"));
+        CFDictionarySetValue(ipv4_dictionary, kSCPropInterfaceName,
+                             interface);
+        CFDictionarySetValue(dns_dictionary, kSCPropNetDNSServerAddresses,
                              server_array);
-        CFDictionarySetValue(dictionary,
+        CFDictionarySetValue(dns_dictionary,
                              kSCPropNetDNSSupplementalMatchDomains,
                              domain_array);
-        CFDictionarySetValue(dictionary,
+        CFDictionarySetValue(dns_dictionary,
                              kSCPropNetDNSSupplementalMatchOrders,
                              order_array);
-        CFDictionarySetValue(dictionary, kSCPropInterfaceName, interface);
-        CFDictionarySetValue(dictionary, kSCPropNetDNSServerTimeout,
+        CFDictionarySetValue(dns_dictionary, kSCPropInterfaceName, interface);
+        CFDictionarySetValue(dns_dictionary, kSCPropNetDNSServerTimeout,
                              timeout);
-        set = SCDynamicStoreAddTemporaryValue(network->dynamic_store,
-                                              network->dns_key, dictionary);
-        if (set) {
-            published = SCDynamicStoreCopyValue(network->dynamic_store,
-                                                network->dns_key);
-            set = published != NULL && CFEqual(published, dictionary);
+        ipv4_set = SCDynamicStoreAddTemporaryValue(
+            network->dynamic_store, network->ipv4_key, ipv4_dictionary);
+        if (ipv4_set) {
+            published_ipv4 = SCDynamicStoreCopyValue(
+                network->dynamic_store, network->ipv4_key);
+            ipv4_set = published_ipv4 != NULL &&
+                       CFEqual(published_ipv4, ipv4_dictionary);
+        }
+        if (ipv4_set) {
+            dns_set = SCDynamicStoreAddTemporaryValue(
+                network->dynamic_store, network->dns_key, dns_dictionary);
+        }
+        if (dns_set) {
+            published_dns = SCDynamicStoreCopyValue(network->dynamic_store,
+                                                    network->dns_key);
+            dns_set = published_dns != NULL &&
+                      CFEqual(published_dns, dns_dictionary);
         }
     }
-    if (published != NULL) {
-        CFRelease(published);
+    if (published_dns != NULL) {
+        CFRelease(published_dns);
+    }
+    if (published_ipv4 != NULL) {
+        CFRelease(published_ipv4);
     }
     if (timeout != NULL) {
         CFRelease(timeout);
@@ -1077,11 +1128,23 @@ static int mac_configure_dns(um_network *network)
     if (domain_array != NULL) {
         CFRelease(domain_array);
     }
+    if (destination_array != NULL) {
+        CFRelease(destination_array);
+    }
+    if (subnet_mask_array != NULL) {
+        CFRelease(subnet_mask_array);
+    }
+    if (address_array != NULL) {
+        CFRelease(address_array);
+    }
     if (server_array != NULL) {
         CFRelease(server_array);
     }
-    if (dictionary != NULL) {
-        CFRelease(dictionary);
+    if (ipv4_dictionary != NULL) {
+        CFRelease(ipv4_dictionary);
+    }
+    if (dns_dictionary != NULL) {
+        CFRelease(dns_dictionary);
     }
     if (interface != NULL) {
         CFRelease(interface);
@@ -1089,15 +1152,16 @@ static int mac_configure_dns(um_network *network)
     if (service_id != NULL) {
         CFRelease(service_id);
     }
-    if (!set) {
-        network_log(network, "Could not publish scoped DNS through "
+    if (!ipv4_set || !dns_set) {
+        network_log(network, "Could not publish IPv4-usable DNS through "
                              "SystemConfiguration");
         return UM_ERR_NETWORK;
     }
     network_log(network,
-                "Published catch-all DNS on %s using %s and %s "
+                "Published IPv4 service state and catch-all DNS on %s "
+                "using %s and %s "
                 "timeout=%ds/server; "
-                "verify resolver adoption with 'scutil --dns'",
+                "verify 'Request A records' with 'scutil --dns'",
                 network->interface_name, UM_DNS_PRIMARY,
                 UM_DNS_SECONDARY, timeout_value);
     return UM_OK;
@@ -1155,6 +1219,14 @@ static void mac_cleanup(um_network *network)
     if (network->dns_key != NULL) {
         CFRelease(network->dns_key);
         network->dns_key = NULL;
+    }
+    if (network->ipv4_key != NULL && network->dynamic_store != NULL) {
+        (void)SCDynamicStoreRemoveValue(network->dynamic_store,
+                                        network->ipv4_key);
+    }
+    if (network->ipv4_key != NULL) {
+        CFRelease(network->ipv4_key);
+        network->ipv4_key = NULL;
     }
     if (network->dynamic_store != NULL) {
         CFRelease(network->dynamic_store);
