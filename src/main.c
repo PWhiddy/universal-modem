@@ -1,4 +1,5 @@
 #include "um.h"
+#include "network.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -273,7 +274,12 @@ int main(int argc, char **argv)
     }
 
     if (list_audio != 0) {
-        int status = um_audio_list_devices(print_log, stdout);
+        int status = um_network_prepare_audio_user(print_log, stdout);
+        if (status != UM_OK) {
+            fprintf(stderr, "could not select the invoking user for audio\n");
+            return 1;
+        }
+        status = um_audio_list_devices(print_log, stdout);
         return status == UM_OK ? 0 : 1;
     }
 
@@ -303,7 +309,11 @@ int main(int argc, char **argv)
         session_simulation == 0) {
         um_live_audio_options options = um_live_audio_default_options(
             endpoint == 1 ? UM_LIVE_GATEWAY : UM_LIVE_CLIENT);
-        int status;
+        int status = um_network_prepare_audio_user(print_log, stdout);
+        if (status != UM_OK) {
+            fprintf(stderr, "could not select the invoking user for audio\n");
+            return 1;
+        }
         if (noise_was_set != 0) {
             fprintf(stderr, "--noise only applies to --simulate\n");
             return 2;

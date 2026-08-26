@@ -1,4 +1,8 @@
-#if defined(__APPLE__)
+#if defined(__linux__)
+#define _GNU_SOURCE
+#define _DEFAULT_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#elif defined(__APPLE__)
 #define _DARWIN_C_SOURCE
 #else
 #define _DEFAULT_SOURCE
@@ -20,8 +24,10 @@
 #include <unistd.h>
 
 #if defined(__linux__)
+#include <grp.h>
 #include <linux/if_tun.h>
 #include <net/if.h>
+#include <pwd.h>
 #include <sys/ioctl.h>
 #elif defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
@@ -41,6 +47,14 @@
 #define UM_TUN_CLIENT_ADDRESS "10.77.0.2"
 #define UM_DNS_PRIMARY "1.1.1.1"
 #define UM_DNS_SECONDARY "8.8.8.8"
+
+#if defined(__linux__)
+static struct {
+    uid_t uid;
+    gid_t gid;
+    int active;
+} linux_audio_user;
+#endif
 
 struct um_network {
     int fd;
@@ -92,6 +106,128 @@ static void network_log(um_network *network, const char *format, ...)
     (void)vsnprintf(line, sizeof(line), format, arguments);
     va_end(arguments);
     network->logger(network->logger_context, line);
+}
+
+#if defined(__linux__)
+static int parse_sudo_id(const char *text, unsigned long *value)
+{
+    char *end = NULL;
+    unsigned long parsed;
+    if (text == NULL || *text == '\0') {
+        return 0;
+    }
+    errno = 0;
+    parsed = strtoul(text, &end, 10);
+    if (errno != 0 || end == text || *end != '\0') {
+        return 0;
+    }
+    *value = parsed;
+    return 1;
+}
+
+static int linux_enter_network_privilege(void)
+{
+    if (linux_audio_user.active == 0) {
+        return UM_OK;
+    }
+    if (setresuid(0, 0, 0) != 0 || setresgid(0, 0, 0) != 0) {
+        return UM_ERR_NETWORK;
+    }
+    return UM_OK;
+}
+
+static int linux_leave_network_privilege(void)
+{
+    if (linux_audio_user.active == 0) {
+        return UM_OK;
+    }
+    if (setresgid(linux_audio_user.gid, linux_audio_user.gid, 0) != 0 ||
+        setresuid(linux_audio_user.uid, linux_audio_user.uid, 0) != 0) {
+        return UM_ERR_NETWORK;
+    }
+    return UM_OK;
+}
+#endif
+
+int um_network_prepare_audio_user(um_log_callback logger,
+                                  void *logger_context)
+{
+#if defined(__linux__)
+    const char *uid_text;
+    const char *gid_text;
+    unsigned long uid_value;
+    unsigned long gid_value;
+    struct passwd *account;
+    char runtime[64];
+    char username[256];
+    struct stat runtime_status;
+    char line[512];
+
+    if (geteuid() != 0 || getuid() != 0) {
+        return UM_OK;
+    }
+    uid_text = getenv("SUDO_UID");
+    gid_text = getenv("SUDO_GID");
+    if (uid_text == NULL && gid_text == NULL) {
+        return UM_OK;
+    }
+    if (!parse_sudo_id(uid_text, &uid_value) ||
+        !parse_sudo_id(gid_text, &gid_value) ||
+        (unsigned long)(uid_t)uid_value != uid_value ||
+        (unsigned long)(gid_t)gid_value != gid_value) {
+        return UM_ERR_NETWORK;
+    }
+    if (uid_value == 0ul || gid_value == 0ul) {
+        return uid_value == 0ul && gid_value == 0ul ? UM_OK : UM_ERR_NETWORK;
+    }
+    account = getpwuid((uid_t)uid_value);
+    if (account == NULL || account->pw_name == NULL ||
+        account->pw_dir == NULL || *account->pw_dir == '\0') {
+        return UM_ERR_NETWORK;
+    }
+    if ((size_t)snprintf(username, sizeof(username), "%s",
+                         account->pw_name) >= sizeof(username)) {
+        return UM_ERR_NETWORK;
+    }
+    if (setenv("HOME", account->pw_dir, 1) != 0 ||
+        setenv("USER", username, 1) != 0 ||
+        setenv("LOGNAME", username, 1) != 0) {
+        return UM_ERR_NETWORK;
+    }
+    (void)snprintf(runtime, sizeof(runtime), "/run/user/%lu", uid_value);
+    if (stat(runtime, &runtime_status) == 0 &&
+        S_ISDIR(runtime_status.st_mode) &&
+        runtime_status.st_uid == (uid_t)uid_value) {
+        if (setenv("XDG_RUNTIME_DIR", runtime, 1) != 0) {
+            return UM_ERR_NETWORK;
+        }
+    } else if (unsetenv("XDG_RUNTIME_DIR") != 0) {
+        return UM_ERR_NETWORK;
+    }
+    (void)snprintf(line, sizeof(line),
+                   "Audio/modem running as %s uid=%lu; root is used only "
+                   "for network setup and cleanup",
+                   username, uid_value);
+    if (initgroups(username, (gid_t)gid_value) != 0) {
+        return UM_ERR_NETWORK;
+    }
+
+    linux_audio_user.uid = (uid_t)uid_value;
+    linux_audio_user.gid = (gid_t)gid_value;
+    linux_audio_user.active = 1;
+    if (linux_leave_network_privilege() != UM_OK) {
+        linux_audio_user.active = 0;
+        return UM_ERR_NETWORK;
+    }
+    if (logger != NULL) {
+        logger(logger_context, line);
+    }
+    return UM_OK;
+#else
+    (void)logger;
+    (void)logger_context;
+    return UM_OK;
+#endif
 }
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -1086,9 +1222,16 @@ int um_network_open(um_network **network, um_live_role role,
     opened->logger = logger;
     opened->logger_context = logger_context;
 #if defined(__linux__)
+    status = linux_enter_network_privilege();
+    if (status != UM_OK) {
+        network_log(opened, "Could not regain root for network setup");
+        free(opened);
+        return status;
+    }
     if (geteuid() != 0) {
         network_log(opened, "Network proxy mode requires root; restart with "
                             "sudo or use --link-test");
+        (void)linux_leave_network_privilege();
         free(opened);
         return UM_ERR_NETWORK;
     }
@@ -1098,6 +1241,7 @@ int um_network_open(um_network **network, um_live_role role,
     opened->resolvectl_path = find_executable(linux_resolvectl_paths);
     if (opened->ip_path == NULL) {
         network_log(opened, "The system ip utility is required");
+        (void)linux_leave_network_privilege();
         free(opened);
         return UM_ERR_NETWORK;
     }
@@ -1155,17 +1299,34 @@ int um_network_open(um_network **network, um_live_role role,
                 role == UM_LIVE_CLIENT ? UM_TUN_GATEWAY_ADDRESS
                                        : UM_TUN_CLIENT_ADDRESS,
                 UM_NETWORK_MTU);
+#if defined(__linux__)
+    status = linux_leave_network_privilege();
+    if (status != UM_OK) {
+        network_log(opened, "Could not return to the audio user after "
+                            "network setup");
+        um_network_close(opened);
+        return status;
+    }
+#endif
     *network = opened;
     return UM_OK;
 }
 
 void um_network_close(um_network *network)
 {
+#if defined(__linux__)
+    int privilege_status;
+#endif
     if (network == NULL) {
         return;
     }
 #if defined(__linux__)
-    linux_cleanup(network);
+    privilege_status = linux_enter_network_privilege();
+    if (privilege_status == UM_OK) {
+        linux_cleanup(network);
+    } else {
+        network_log(network, "Could not regain root for network cleanup");
+    }
 #elif defined(__APPLE__)
     mac_cleanup(network);
 #endif
@@ -1174,6 +1335,13 @@ void um_network_close(um_network *network)
         network->fd = -1;
     }
     network_log(network, "Network proxy configuration removed");
+#if defined(__linux__)
+    if (privilege_status == UM_OK &&
+        linux_leave_network_privilege() != UM_OK) {
+        network_log(network, "Could not return to the audio user after "
+                             "network cleanup");
+    }
+#endif
     free(network);
 }
 
