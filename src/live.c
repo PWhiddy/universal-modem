@@ -111,10 +111,12 @@ typedef struct {
     size_t queue_dropped;
     size_t queue_duplicates;
     size_t dns_retries_suppressed;
+    size_t multicast_dropped;
     size_t queue_priority_evictions;
     size_t queue_logged_dropped;
     size_t queue_logged_duplicates;
     size_t dns_retries_logged_suppressed;
+    size_t multicast_logged_dropped;
     size_t queue_logged_priority_evictions;
     uint64_t started_ms;
     int have_last_completed_packet;
@@ -2040,8 +2042,10 @@ static int dns_packet_key(const uint8_t *packet, size_t length,
 static int dns_keys_equal(const live_proxy_dns_key *left,
                           const live_proxy_dns_key *right)
 {
+    /* A resolver may retry one logical transaction against another server.
+     * A response from either server completes that transaction, so the
+     * server address is deliberately not part of the comparison. */
     return left->client_address == right->client_address &&
-           left->server_address == right->server_address &&
            left->question_hash == right->question_hash &&
            left->client_port == right->client_port &&
            left->transaction_id == right->transaction_id &&
@@ -2093,6 +2097,58 @@ static int describe_dns(const uint8_t *packet, size_t length,
     return 1;
 }
 
+static void describe_icmp_packet(const uint8_t *packet, size_t length,
+                                 size_t transport_offset, unsigned version,
+                                 const char *family, char *description,
+                                 size_t description_capacity)
+{
+    unsigned type;
+    unsigned code;
+    if (transport_offset + 2u > length) {
+        (void)snprintf(description, description_capacity, "%s/ICMP", family);
+        return;
+    }
+    type = packet[transport_offset];
+    code = packet[transport_offset + 1u];
+    if (version == 4u) {
+        const uint8_t *quoted;
+        size_t quoted_length;
+        size_t quoted_header_length;
+        unsigned quoted_protocol;
+        if (type == 3u && transport_offset + 8u + 20u <= length) {
+            quoted = &packet[transport_offset + 8u];
+            quoted_length = length - transport_offset - 8u;
+            quoted_header_length = (size_t)(quoted[0] & 0x0fu) * 4u;
+            quoted_protocol = quoted[9];
+            if ((quoted[0] >> 4u) == 4u &&
+                quoted_header_length >= 20u &&
+                quoted_header_length + 4u <= quoted_length &&
+                (quoted_protocol == 6u || quoted_protocol == 17u)) {
+                (void)snprintf(
+                    description, description_capacity,
+                    "%s/ICMP %u.%u.%u.%u->%u.%u.%u.%u type=%u code=%u "
+                    "quoted=%s %u.%u.%u.%u:%u->%u.%u.%u.%u:%u",
+                    family, packet[12], packet[13], packet[14], packet[15],
+                    packet[16], packet[17], packet[18], packet[19], type,
+                    code, quoted_protocol == 6u ? "TCP" : "UDP", quoted[12],
+                    quoted[13], quoted[14], quoted[15],
+                    (unsigned)read_u16(&quoted[quoted_header_length]),
+                    quoted[16], quoted[17], quoted[18], quoted[19],
+                    (unsigned)read_u16(&quoted[quoted_header_length + 2u]));
+                return;
+            }
+        }
+        (void)snprintf(description, description_capacity,
+                       "%s/ICMP %u.%u.%u.%u->%u.%u.%u.%u type=%u code=%u",
+                       family, packet[12], packet[13], packet[14], packet[15],
+                       packet[16], packet[17], packet[18], packet[19], type,
+                       code);
+        return;
+    }
+    (void)snprintf(description, description_capacity,
+                   "%s/ICMP type=%u code=%u", family, type, code);
+}
+
 static void describe_proxy_packet(const uint8_t *packet, size_t length,
                                   char *description,
                                   size_t description_capacity)
@@ -2141,7 +2197,8 @@ static void describe_proxy_packet(const uint8_t *packet, size_t length,
                 have_dns_description != 0 ? dns_description : "");
         }
     } else if (protocol == 1u || protocol == 58u) {
-        (void)snprintf(description, description_capacity, "%s/ICMP", family);
+        describe_icmp_packet(packet, length, transport_offset, version,
+                             family, description, description_capacity);
     } else {
         (void)snprintf(description, description_capacity, "%s/proto-%u",
                        family, protocol);
@@ -2243,6 +2300,14 @@ static int enqueue_proxy_packet(live_proxy_state *state,
     if (validate_ip_packet(packet, packet_length) != UM_OK) {
         return UM_ERR_HEADER;
     }
+    /* Link-local multicast has no useful path through an Internet gateway.
+     * In particular, mDNS and SSDP daemons advertise on every new TUN and
+     * otherwise consume the acoustic link indefinitely. */
+    if ((packet[0] >> 4u) == 4u &&
+        (packet[16] & UINT8_C(0xf0)) == UINT8_C(0xe0)) {
+        ++state->multicast_dropped;
+        return UM_OK;
+    }
     if (dns_query_recently_completed(state, packet, packet_length) != 0) {
         ++state->dns_retries_suppressed;
         return UM_OK;
@@ -2308,20 +2373,23 @@ static int drain_proxy_ingress(live_context *context,
         state->queue_duplicates != state->queue_logged_duplicates ||
         state->dns_retries_suppressed !=
             state->dns_retries_logged_suppressed ||
+        state->multicast_dropped != state->multicast_logged_dropped ||
         state->queue_priority_evictions !=
             state->queue_logged_priority_evictions) {
         live_log(context,
                  "proxy ingress queue pending=%zu dropped=%zu "
                  "duplicates=%zu dns-retries-suppressed=%zu "
-                 "priority-evictions=%zu",
+                 "multicast-dropped=%zu priority-evictions=%zu",
                  state->queue_count, state->queue_dropped,
                  state->queue_duplicates,
                  state->dns_retries_suppressed,
+                 state->multicast_dropped,
                  state->queue_priority_evictions);
         state->queue_logged_dropped = state->queue_dropped;
         state->queue_logged_duplicates = state->queue_duplicates;
         state->dns_retries_logged_suppressed =
             state->dns_retries_suppressed;
+        state->multicast_logged_dropped = state->multicast_dropped;
         state->queue_logged_priority_evictions =
             state->queue_priority_evictions;
     }

@@ -114,6 +114,7 @@ typedef struct {
     unsigned dns_query_logs;
     unsigned dns_response_logs;
     unsigned dns_retries_suppressed;
+    unsigned multicast_dropped;
     unsigned reconnecting;
 } runner;
 
@@ -461,6 +462,15 @@ static void test_log(void *context, const char *message)
             run->dns_retries_suppressed = count;
         }
     }
+    {
+        const char *dropped = strstr(message, "multicast-dropped=");
+        unsigned count;
+        if (dropped != NULL &&
+            sscanf(dropped + strlen("multicast-dropped="),
+                   "%u", &count) == 1) {
+            run->multicast_dropped = count;
+        }
+    }
     if (run->options.role == UM_LIVE_CLIENT &&
         (strstr(message, "proxy token commit sequence=") != NULL ||
          strstr(message, "proxy packet token commit sequence=") != NULL)) {
@@ -793,6 +803,7 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
     unsigned background_number = 0u;
     unsigned target_index = 0u;
     int background = 0;
+    int dns_retry = 0;
     int wait_status = 0;
     if (network == NULL || packet == NULL || packet_length == NULL) {
         return UM_ERR_ARGUMENT;
@@ -830,6 +841,7 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
     } else if (bus.network_dns_retry_ready[network->endpoint] != 0) {
         bus.network_dns_retry_ready[network->endpoint] = 0;
         ++bus.network_dns_retry_reads[network->endpoint];
+        dns_retry = 1;
         target_index = 0u;
     } else {
         --bus.network_input_ready[network->endpoint];
@@ -845,11 +857,25 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
             (uint8_t)(0x40u + background_number +
                       (unsigned)network->endpoint * 0x30u),
             (uint16_t)(40000u + background_number), 443u);
+        if (background_number == SIM_BACKGROUND_PACKETS) {
+            generated[16] = 224u;
+            generated[17] = 0u;
+            generated[18] = 0u;
+            generated[19] = 251u;
+            finalize_ipv4_checksums(generated, length);
+        }
     } else {
         length = network->endpoint == SIM_CLIENT ? SIM_REQUEST_BYTES
                                                  : SIM_RESPONSE_BYTES;
         make_proxy_target(generated, length, network->endpoint,
                           target_index);
+        if (dns_retry != 0) {
+            generated[16] = 8u;
+            generated[17] = 8u;
+            generated[18] = 8u;
+            generated[19] = 8u;
+            finalize_ipv4_checksums(generated, length);
+        }
     }
     memcpy(packet, generated, length);
     *packet_length = length;
@@ -1112,7 +1138,9 @@ static int run_pair(const char *label,
           bus.network_matches[SIM_GATEWAY] != SIM_PROXY_PACKETS ||
           bus.network_dns_retries_injected != 1u ||
           bus.network_dns_retry_reads[SIM_CLIENT] != 1u ||
-          client.dns_retries_suppressed != 1u)) ||
+          client.dns_retries_suppressed != 1u ||
+          client.multicast_dropped != 1u ||
+          gateway.multicast_dropped != 1u)) ||
         (inject_proxy_retry != 0 &&
          (bus.proxy_drops != 2u || bus.begin_ack_drops != 1u ||
           bus.commit_drops != 1u ||
@@ -1139,8 +1167,8 @@ static int run_pair(const char *label,
            "cache-skips=%u recovery-probes=%u offer-refreshes=%u\n",
            label,
            link_test != 0 ? "256+256-byte explicit link test"
-                          : "prioritized DNS exchange plus four-packet TCP "
-                            "burst through saturated background queues",
+                          : "cross-resolver DNS coalescing plus four-packet "
+                            "TCP burst through multicast-saturated queues",
            client.adaptive_upgrades, gateway.adaptive_upgrades,
            client.baseline_selections, gateway.baseline_selections,
            client.verification_fallbacks + gateway.verification_fallbacks,

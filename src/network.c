@@ -1002,7 +1002,7 @@ static int mac_configure_dns(um_network *network)
     CFMutableDictionaryRef dictionary = NULL;
     CFStringRef interface = NULL;
     CFStringRef service_id = NULL;
-    CFStringRef servers[1] = {CFSTR("1.1.1.1")};
+    CFStringRef servers[2] = {CFSTR("1.1.1.1"), CFSTR("8.8.8.8")};
     CFStringRef domains[1] = {CFSTR("")};
     int order_value = 1;
     int timeout_value = 60;
@@ -1029,7 +1029,7 @@ static int mac_configure_dns(um_network *network)
     dictionary = CFDictionaryCreateMutable(
         NULL, 0u, &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
-    server_array = CFArrayCreate(NULL, (const void **)servers, 1u,
+    server_array = CFArrayCreate(NULL, (const void **)servers, 2u,
                                  &kCFTypeArrayCallBacks);
     domain_array = CFArrayCreate(NULL, (const void **)domains, 1u,
                                  &kCFTypeArrayCallBacks);
@@ -1095,9 +1095,11 @@ static int mac_configure_dns(um_network *network)
         return UM_ERR_NETWORK;
     }
     network_log(network,
-                "Published catch-all DNS on %s using %s timeout=%ds; "
+                "Published catch-all DNS on %s using %s and %s "
+                "timeout=%ds/server; "
                 "verify resolver adoption with 'scutil --dns'",
-                network->interface_name, UM_DNS_PRIMARY, timeout_value);
+                network->interface_name, UM_DNS_PRIMARY,
+                UM_DNS_SECONDARY, timeout_value);
     return UM_OK;
 }
 
