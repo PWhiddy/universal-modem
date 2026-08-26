@@ -48,6 +48,14 @@
 #define UM_DNS_PRIMARY "1.1.1.1"
 #define UM_DNS_SECONDARY "8.8.8.8"
 
+#if defined(__APPLE__)
+/* XNU otherwise permits only one packet to wait on the utun control socket.
+ * The acoustic link holds the token for seconds at a time, so that default
+ * creates kernel-side head-of-line blocking before the priority queue can
+ * inspect newly generated DNS and control traffic. */
+#define UM_UTUN_PENDING_PACKETS 512u
+#endif
+
 #if defined(__linux__)
 static struct {
     uid_t uid;
@@ -819,6 +827,7 @@ static int mac_open_utun(um_network *network)
     struct ctl_info info;
     struct sockaddr_ctl address;
     socklen_t name_length;
+    uint32_t pending_packets = UM_UTUN_PENDING_PACKETS;
     int descriptor = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
     if (descriptor < 0) {
         network_log(network, "Could not create utun control socket: %s",
@@ -847,6 +856,15 @@ static int mac_open_utun(um_network *network)
         (void)close(descriptor);
         return UM_ERR_NETWORK;
     }
+    if (setsockopt(descriptor, SYSPROTO_CONTROL,
+                   UTUN_OPT_MAX_PENDING_PACKETS, &pending_packets,
+                   (socklen_t)sizeof(pending_packets)) != 0) {
+        network_log(network,
+                    "Could not enlarge utun ingress backlog: %s",
+                    strerror(errno));
+        (void)close(descriptor);
+        return UM_ERR_NETWORK;
+    }
     name_length = (socklen_t)sizeof(network->interface_name);
     if (getsockopt(descriptor, SYSPROTO_CONTROL, UTUN_OPT_IFNAME,
                    network->interface_name, &name_length) != 0 ||
@@ -862,6 +880,8 @@ static int mac_open_utun(um_network *network)
         return UM_ERR_NETWORK;
     }
     network->fd = descriptor;
+    network_log(network, "utun ingress backlog capacity=%u packets",
+                (unsigned)pending_packets);
     return UM_OK;
 }
 
