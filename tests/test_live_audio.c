@@ -113,6 +113,68 @@ typedef struct {
     unsigned reconnecting;
 } runner;
 
+static uint32_t test_checksum_add(uint32_t sum, const uint8_t *bytes,
+                                  size_t length)
+{
+    while (length >= 2u) {
+        sum += ((uint32_t)bytes[0] << 8u) | bytes[1];
+        bytes += 2u;
+        length -= 2u;
+    }
+    if (length != 0u) {
+        sum += (uint32_t)bytes[0] << 8u;
+    }
+    return sum;
+}
+
+static uint16_t test_checksum_finish(uint32_t sum)
+{
+    while ((sum >> 16u) != 0u) {
+        sum = (sum & UINT32_C(0xffff)) + (sum >> 16u);
+    }
+    return (uint16_t)~sum;
+}
+
+static void finalize_ipv4_checksums(uint8_t *packet, size_t length)
+{
+    size_t header_length = (size_t)(packet[0] & 0x0fu) * 4u;
+    size_t transport_length = length - header_length;
+    uint32_t sum;
+    uint16_t checksum;
+    packet[10] = 0u;
+    packet[11] = 0u;
+    checksum = test_checksum_finish(test_checksum_add(
+        0u, packet, header_length));
+    packet[10] = (uint8_t)(checksum >> 8u);
+    packet[11] = (uint8_t)checksum;
+    if (packet[9] != 6u && packet[9] != 17u) {
+        return;
+    }
+    if (packet[9] == 17u) {
+        packet[header_length + 6u] = 0u;
+        packet[header_length + 7u] = 0u;
+    } else {
+        packet[header_length + 16u] = 0u;
+        packet[header_length + 17u] = 0u;
+    }
+    sum = test_checksum_add(0u, &packet[12], 8u);
+    sum += packet[9];
+    sum += (uint32_t)transport_length;
+    sum = test_checksum_add(sum, packet + header_length,
+                            transport_length);
+    checksum = test_checksum_finish(sum);
+    if (checksum == 0u && packet[9] == 17u) {
+        checksum = UINT16_C(0xffff);
+    }
+    if (packet[9] == 17u) {
+        packet[header_length + 6u] = (uint8_t)(checksum >> 8u);
+        packet[header_length + 7u] = (uint8_t)checksum;
+    } else {
+        packet[header_length + 16u] = (uint8_t)(checksum >> 8u);
+        packet[header_length + 17u] = (uint8_t)checksum;
+    }
+}
+
 static void make_ipv4_packet(uint8_t *packet, size_t length, uint8_t seed,
                              uint16_t source_port,
                              uint16_t destination_port)
@@ -139,6 +201,7 @@ static void make_ipv4_packet(uint8_t *packet, size_t length, uint8_t seed,
     for (index = 28u; index < length; ++index) {
         packet[index] = (uint8_t)(seed + index * 29u);
     }
+    finalize_ipv4_checksums(packet, length);
 }
 
 static void make_ipv4_tcp_packet(uint8_t *packet, size_t length,
@@ -167,6 +230,7 @@ static void make_ipv4_tcp_packet(uint8_t *packet, size_t length,
     for (index = 40u; index < length; ++index) {
         packet[index] = (uint8_t)(seed + index * 31u);
     }
+    finalize_ipv4_checksums(packet, length);
 }
 
 static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
@@ -204,6 +268,7 @@ static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
             dns[40] = 216u;
             dns[41] = 34u;
         }
+        finalize_ipv4_checksums(packet, length);
     } else {
         make_ipv4_tcp_packet(
             packet, length,
@@ -754,6 +819,10 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
                                                  : SIM_RESPONSE_BYTES;
         make_proxy_target(generated, length, network->endpoint,
                           target_index);
+        if (network->endpoint == SIM_GATEWAY && target_index == 0u) {
+            generated[10] ^= 0x01u;
+            generated[26] ^= 0x01u;
+        }
     }
     memcpy(packet, generated, length);
     *packet_length = length;
