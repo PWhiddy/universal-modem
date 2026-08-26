@@ -22,7 +22,7 @@ static void usage(FILE *stream)
             "  --output-device ID   Playback device ID shown at startup\n"
             "  --link-test          Finite bidirectional data test; no TUN/routes\n"
             "  --test-bytes N       Link-test bytes each direction (default 1024)\n"
-            "  --chunk-bytes N      Maximum data body per frame (default 128)\n"
+            "  --chunk-bytes N      Maximum calibrated frame body (default 512)\n"
             "  --retries N          Attempts per acknowledged frame (default 4)\n"
             "  --calib-high         Use the extended real-audio calibration\n"
             "  calibration.config  Auto-loaded/saved; delete it to recalibrate\n");
@@ -182,7 +182,7 @@ int main(int argc, char **argv)
     const char *input_device = "default";
     const char *output_device = "default";
     size_t test_bytes = 1024u;
-    size_t chunk_bytes = 128u;
+    size_t chunk_bytes = 512u;
     unsigned retries = 4u;
     int i;
 

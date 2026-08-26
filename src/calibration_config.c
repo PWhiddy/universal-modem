@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "live_wire.h"
 #include "um_internal.h"
 
 #include <errno.h>
@@ -8,8 +9,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define CALIBRATION_CONFIG_VERSION 1u
-#define REQUIRED_FIELDS UINT32_C(0x7fff)
+#define CALIBRATION_CONFIG_VERSION 2u
+#define REQUIRED_FIELDS UINT32_C(0xffff)
 
 static const char *role_name(um_live_role role)
 {
@@ -67,7 +68,7 @@ static char *trim(char *text)
 
 static int set_field(const char *key, const char *value,
                      um_live_role expected_role, um_modem_config *config,
-                     uint32_t *fields)
+                     size_t *frame_body_bytes, uint32_t *fields)
 {
     unsigned parsed;
     uint32_t bit;
@@ -152,6 +153,14 @@ static int set_field(const char *key, const char *value,
         if (!parse_fec(value, &config->fec_rate)) {
             return 0;
         }
+    } else if (strcmp(key, "frame_body_bytes") == 0) {
+        bit = UINT32_C(1) << 15u;
+        if (!parse_unsigned(value, &parsed) ||
+            parsed < UM_LIVE_MIN_BODY ||
+            parsed > UM_LIVE_MAX_BODY) {
+            return 0;
+        }
+        *frame_body_bytes = parsed;
     } else {
         return 0;
     }
@@ -163,17 +172,20 @@ static int set_field(const char *key, const char *value,
 }
 
 int um_calibration_config_load(const char *path, um_live_role role,
-                               um_modem_config *config, int *found)
+                               um_modem_config *config,
+                               size_t *frame_body_bytes, int *found)
 {
     FILE *file;
     char line[256];
     uint32_t fields = 0u;
     int status = UM_OK;
-    if (path == NULL || config == NULL || found == NULL ||
+    if (path == NULL || config == NULL || frame_body_bytes == NULL ||
+        found == NULL ||
         (role != UM_LIVE_CLIENT && role != UM_LIVE_GATEWAY)) {
         return UM_ERR_ARGUMENT;
     }
     *found = 0;
+    *frame_body_bytes = 0u;
     file = fopen(path, "r");
     if (file == NULL) {
         return errno == ENOENT ? UM_OK : UM_ERR_CONFIG;
@@ -195,7 +207,8 @@ int um_calibration_config_load(const char *path, um_live_role role,
         value = trim(separator + 1);
         key = trim(key);
         if (*key == '\0' || *value == '\0' ||
-            set_field(key, value, role, config, &fields) == 0) {
+            set_field(key, value, role, config, frame_body_bytes,
+                      &fields) == 0) {
             status = UM_ERR_CONFIG;
             break;
         }
@@ -218,7 +231,8 @@ int um_calibration_config_load(const char *path, um_live_role role,
 }
 
 int um_calibration_config_save(const char *path, um_live_role role,
-                               const um_modem_config *config)
+                               const um_modem_config *config,
+                               size_t frame_body_bytes)
 {
     const char *fec;
     char *temporary;
@@ -227,7 +241,9 @@ int um_calibration_config_save(const char *path, um_live_role role,
     int status = UM_OK;
     if (path == NULL || config == NULL ||
         (role != UM_LIVE_CLIENT && role != UM_LIVE_GATEWAY) ||
-        um_modem_config_validate(config) != UM_OK) {
+        um_modem_config_validate(config) != UM_OK ||
+        frame_body_bytes < UM_LIVE_MIN_BODY ||
+        frame_body_bytes > UM_LIVE_MAX_BODY) {
         return UM_ERR_ARGUMENT;
     }
     fec = config->fec_rate == UM_FEC_RATE_1_2
@@ -263,13 +279,15 @@ int um_calibration_config_save(const char *path, um_live_role role,
                 "training_symbols=%u\n"
                 "symbol_repetitions=%u\n"
                 "qam=%u\n"
-                "fec_rate=%s\n",
+                "fec_rate=%s\n"
+                "frame_body_bytes=%zu\n",
                 CALIBRATION_CONFIG_VERSION, UM_LIVE_PROTOCOL_VERSION,
                 role_name(role), direction_name(role), config->fft_size,
                 config->first_bin, config->last_bin, config->cyclic_prefix,
                 config->window_samples, config->sync_samples,
                 config->sync_gap, config->training_symbols,
-                config->symbol_repetitions, 1u << config->qam_bits, fec) < 0 ||
+                config->symbol_repetitions, 1u << config->qam_bits, fec,
+                frame_body_bytes) < 0 ||
         fflush(file) != 0) {
         status = UM_ERR_CONFIG;
     }

@@ -2,6 +2,7 @@
 
 #include "um.h"
 #include "../src/audio.h"
+#include "../src/live_wire.h"
 #include "../src/network.h"
 #include "../src/um_internal.h"
 
@@ -16,11 +17,17 @@
 
 enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
 
-#define SIM_REQUEST_BYTES UM_NETWORK_MTU
-#define SIM_RESPONSE_BYTES 413u
+#define SIM_DNS_REQUEST_BYTES 64u
+#define SIM_DNS_RESPONSE_BYTES 96u
+#define SIM_LARGE_REQUEST_BYTES UM_NETWORK_MTU
+#define SIM_LARGE_RESPONSE_BYTES 413u
+#define SIM_SMALL_TCP_BYTES 60u
 #define SIM_BACKGROUND_BYTES 64u
 #define SIM_BACKGROUND_PACKETS 16u
-#define SIM_PROXY_PACKETS 5u
+#define SIM_FORWARDED_BACKGROUND_PACKETS (SIM_BACKGROUND_PACKETS - 1u)
+#define SIM_PROXY_PACKETS 10u
+#define SIM_FORWARDED_PACKETS \
+    (SIM_PROXY_PACKETS + SIM_FORWARDED_BACKGROUND_PACKETS)
 
 /* CoreAudio capture callbacks can resume after AudioQueueStart returns. */
 #define SIM_CAPTURE_START_MS 60u
@@ -51,6 +58,9 @@ typedef struct {
     unsigned begin_ack_drops;
     int commit_drop_armed;
     unsigned commit_drops;
+    int body_drop_endpoint;
+    int body_drop_armed;
+    unsigned body_drops;
     int network_opened[SIM_ENDPOINTS];
     int network_input_ready[SIM_ENDPOINTS];
     int network_dns_retry_ready[SIM_ENDPOINTS];
@@ -61,6 +71,8 @@ typedef struct {
     unsigned network_reads[SIM_ENDPOINTS];
     unsigned network_writes[SIM_ENDPOINTS];
     unsigned network_matches[SIM_ENDPOINTS];
+    unsigned network_background_matches[SIM_ENDPOINTS];
+    uint32_t network_background_seen[SIM_ENDPOINTS];
     int runners_done;
 } simulated_bus;
 
@@ -115,6 +127,8 @@ typedef struct {
     unsigned dns_response_logs;
     unsigned dns_retries_suppressed;
     unsigned multicast_dropped;
+    unsigned multi_packet_batches;
+    unsigned body_stepdowns;
     unsigned reconnecting;
 } runner;
 
@@ -294,6 +308,36 @@ static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
     }
 }
 
+static size_t proxy_target_length(int endpoint, unsigned target_index)
+{
+    if (target_index == 0u) {
+        return endpoint == SIM_CLIENT ? SIM_DNS_REQUEST_BYTES
+                                      : SIM_DNS_RESPONSE_BYTES;
+    }
+    if (target_index == 1u) {
+        return endpoint == SIM_CLIENT ? SIM_LARGE_REQUEST_BYTES
+                                      : SIM_LARGE_RESPONSE_BYTES;
+    }
+    return SIM_SMALL_TCP_BYTES;
+}
+
+static void make_proxy_background(uint8_t *packet, int endpoint,
+                                  unsigned background_number)
+{
+    make_ipv4_packet(
+        packet, SIM_BACKGROUND_BYTES,
+        (uint8_t)(0x40u + background_number +
+                  (unsigned)endpoint * 0x30u),
+        (uint16_t)(40000u + background_number), 443u);
+    if (background_number == SIM_BACKGROUND_PACKETS) {
+        packet[16] = 224u;
+        packet[17] = 0u;
+        packet[18] = 0u;
+        packet[19] = 251u;
+        finalize_ipv4_checksums(packet, SIM_BACKGROUND_BYTES);
+    }
+}
+
 static void add_milliseconds(struct timespec *time, unsigned milliseconds)
 {
     time->tv_sec += (time_t)(milliseconds / 1000u);
@@ -370,6 +414,20 @@ static void test_log(void *context, const char *message)
             bus.verify_drop_armed = 1;
         }
         (void)pthread_mutex_unlock(&bus.mutex);
+    }
+    if (strstr(message, "calib body tx direction=") != NULL &&
+        strstr(message, "size=384 trial=2/2") != NULL) {
+        int endpoint = run->options.role == UM_LIVE_CLIENT
+                           ? SIM_CLIENT
+                           : SIM_GATEWAY;
+        (void)pthread_mutex_lock(&bus.mutex);
+        if (bus.body_drop_endpoint == endpoint && bus.body_drops == 0u) {
+            bus.body_drop_armed = 1;
+        }
+        (void)pthread_mutex_unlock(&bus.mutex);
+    }
+    if (strstr(message, "calib body size=512 failed; selected=384") != NULL) {
+        ++run->body_stepdowns;
     }
     if (run->options.role == UM_LIVE_GATEWAY &&
         strstr(message,
@@ -451,6 +509,16 @@ static void test_log(void *context, const char *message)
     if (strstr(message, "DNS response dns.test A") != NULL &&
         strstr(message, "rcode=0 answers=1") != NULL) {
         ++run->dns_response_logs;
+    }
+    {
+        const char *batch = strstr(message, " batch=");
+        const char *packets = strstr(message, " packets=");
+        unsigned count;
+        if (batch != NULL && packets != NULL &&
+            sscanf(packets + strlen(" packets="), "%u", &count) == 1 &&
+            count > 1u) {
+            ++run->multi_packet_batches;
+        }
     }
     {
         const char *suppressed = strstr(message,
@@ -688,6 +756,12 @@ int um_audio_write(um_audio *audio, const float *samples, size_t frame_count)
         ++bus.commit_drops;
         drop_write = 1;
     }
+    if (bus.body_drop_armed != 0 &&
+        bus.body_drop_endpoint == audio->endpoint) {
+        bus.body_drop_armed = 0;
+        ++bus.body_drops;
+        drop_write = 1;
+    }
     (void)pthread_mutex_unlock(&bus.mutex);
     if (drop_write != 0) {
         return UM_OK;
@@ -852,21 +926,10 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
 
     if (background != 0) {
         length = SIM_BACKGROUND_BYTES;
-        make_ipv4_packet(
-            generated, length,
-            (uint8_t)(0x40u + background_number +
-                      (unsigned)network->endpoint * 0x30u),
-            (uint16_t)(40000u + background_number), 443u);
-        if (background_number == SIM_BACKGROUND_PACKETS) {
-            generated[16] = 224u;
-            generated[17] = 0u;
-            generated[18] = 0u;
-            generated[19] = 251u;
-            finalize_ipv4_checksums(generated, length);
-        }
+        make_proxy_background(generated, network->endpoint,
+                              background_number);
     } else {
-        length = network->endpoint == SIM_CLIENT ? SIM_REQUEST_BYTES
-                                                 : SIM_RESPONSE_BYTES;
+        length = proxy_target_length(network->endpoint, target_index);
         make_proxy_target(generated, length, network->endpoint,
                           target_index);
         if (dns_retry != 0) {
@@ -888,27 +951,51 @@ int um_network_write(um_network *network, const uint8_t *packet,
     uint8_t expected[UM_NETWORK_MTU];
     size_t expected_length;
     unsigned target_index;
-    int matches;
+    unsigned background_number;
+    int source_endpoint;
+    int target_matches;
+    int background_matches = 0;
     (void)timeout_ms;
     if (network == NULL || packet == NULL) {
         return UM_ERR_ARGUMENT;
     }
-    expected_length = network->endpoint == SIM_GATEWAY
-                          ? SIM_REQUEST_BYTES
-                          : SIM_RESPONSE_BYTES;
     (void)pthread_mutex_lock(&bus.mutex);
     if (bus.network_opened[network->endpoint] == 0) {
         (void)pthread_mutex_unlock(&bus.mutex);
         return UM_ERR_NETWORK;
     }
-    target_index = bus.network_writes[network->endpoint]++;
-    make_proxy_target(expected, expected_length,
-                      network->endpoint == SIM_GATEWAY ? SIM_CLIENT
-                                                       : SIM_GATEWAY,
+    ++bus.network_writes[network->endpoint];
+    target_index = bus.network_matches[network->endpoint];
+    source_endpoint = network->endpoint == SIM_GATEWAY ? SIM_CLIENT
+                                                        : SIM_GATEWAY;
+    expected_length = proxy_target_length(
+        source_endpoint, target_index);
+    make_proxy_target(expected, expected_length, source_endpoint,
                       target_index);
-    matches = packet_length == expected_length &&
-              memcmp(packet, expected, expected_length) == 0;
-    if (matches != 0) {
+    target_matches = target_index < SIM_PROXY_PACKETS &&
+                     packet_length == expected_length &&
+                     memcmp(packet, expected, expected_length) == 0;
+    if (target_matches == 0) {
+        for (background_number = 1u;
+             background_number < SIM_BACKGROUND_PACKETS;
+             ++background_number) {
+            uint32_t bit = UINT32_C(1) << background_number;
+            if ((bus.network_background_seen[network->endpoint] & bit) !=
+                0u) {
+                continue;
+            }
+            make_proxy_background(expected, source_endpoint,
+                                  background_number);
+            if (packet_length == SIM_BACKGROUND_BYTES &&
+                memcmp(packet, expected, SIM_BACKGROUND_BYTES) == 0) {
+                bus.network_background_seen[network->endpoint] |= bit;
+                ++bus.network_background_matches[network->endpoint];
+                background_matches = 1;
+                break;
+            }
+        }
+    }
+    if (target_matches != 0) {
         ++bus.network_matches[network->endpoint];
         if (network->endpoint == SIM_GATEWAY) {
             ++bus.network_input_ready[SIM_GATEWAY];
@@ -922,7 +1009,8 @@ int um_network_write(um_network *network, const uint8_t *packet,
         (void)pthread_cond_broadcast(&bus.changed);
     }
     (void)pthread_mutex_unlock(&bus.mutex);
-    return matches != 0 ? UM_OK : UM_ERR_NETWORK;
+    return target_matches != 0 || background_matches != 0 ? UM_OK
+                                                           : UM_ERR_NETWORK;
 }
 
 const char *um_network_interface_name(const um_network *network)
@@ -982,9 +1070,9 @@ static void configure_runner(runner *run, const char *name,
     run->options.output_device = device;
     run->options.link_test = link_test;
     run->options.proxy_test_packets =
-        link_test == 0 ? SIM_PROXY_PACKETS : 0u;
+        link_test == 0 ? SIM_FORWARDED_PACKETS : 0u;
     run->options.test_bytes = 256u;
-    run->options.chunk_bytes = link_test != 0 ? 64u : 128u;
+    run->options.chunk_bytes = link_test != 0 ? 64u : UM_LIVE_MAX_BODY;
     run->options.retry_limit = 5u;
     run->options.discovery_interval_seconds = 0.4f;
     run->options.calibration_path = calibration_path;
@@ -1047,6 +1135,9 @@ static int run_pair(const char *label,
     bus.begin_ack_drops = 0u;
     bus.commit_drop_armed = 0;
     bus.commit_drops = 0u;
+    bus.body_drop_endpoint = link_test == 0 ? SIM_GATEWAY : -1;
+    bus.body_drop_armed = 0;
+    bus.body_drops = 0u;
     memset(bus.network_opened, 0, sizeof(bus.network_opened));
     memset(bus.network_input_ready, 0, sizeof(bus.network_input_ready));
     memset(bus.network_dns_retry_ready, 0,
@@ -1060,6 +1151,10 @@ static int run_pair(const char *label,
     memset(bus.network_reads, 0, sizeof(bus.network_reads));
     memset(bus.network_writes, 0, sizeof(bus.network_writes));
     memset(bus.network_matches, 0, sizeof(bus.network_matches));
+    memset(bus.network_background_matches, 0,
+           sizeof(bus.network_background_matches));
+    memset(bus.network_background_seen, 0,
+           sizeof(bus.network_background_seen));
     bus.runners_done = 0;
     (void)pthread_mutex_unlock(&bus.mutex);
 
@@ -1132,10 +1227,14 @@ static int run_pair(const char *label,
               SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS + 1u ||
           bus.network_reads[SIM_GATEWAY] !=
               SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS ||
-          bus.network_writes[SIM_CLIENT] != SIM_PROXY_PACKETS ||
-          bus.network_writes[SIM_GATEWAY] != SIM_PROXY_PACKETS ||
+          bus.network_writes[SIM_CLIENT] != SIM_FORWARDED_PACKETS ||
+          bus.network_writes[SIM_GATEWAY] != SIM_FORWARDED_PACKETS ||
           bus.network_matches[SIM_CLIENT] != SIM_PROXY_PACKETS ||
           bus.network_matches[SIM_GATEWAY] != SIM_PROXY_PACKETS ||
+          bus.network_background_matches[SIM_CLIENT] !=
+              SIM_FORWARDED_BACKGROUND_PACKETS ||
+          bus.network_background_matches[SIM_GATEWAY] !=
+              SIM_FORWARDED_BACKGROUND_PACKETS ||
           bus.network_dns_retries_injected != 1u ||
           bus.network_dns_retry_reads[SIM_CLIENT] != 1u ||
           client.dns_retries_suppressed != 1u ||
@@ -1151,7 +1250,10 @@ static int run_pair(const char *label,
          (client.packet_token_commits + gateway.packet_token_commits < 2u ||
           client.packet_token_accepts + gateway.packet_token_accepts < 2u ||
           client.dns_query_logs + gateway.dns_query_logs < 2u ||
-          client.dns_response_logs + gateway.dns_response_logs < 2u))) {
+          client.dns_response_logs + gateway.dns_response_logs < 2u ||
+          client.multi_packet_batches == 0u ||
+          gateway.multi_packet_batches == 0u || bus.body_drops != 1u ||
+          client.body_stepdowns + gateway.body_stepdowns < 2u))) {
         fprintf(stderr,
                 "%s paired live simulation failed timeout=%d client=%s "
                 "gateway=%s\n",
@@ -1167,7 +1269,7 @@ static int run_pair(const char *label,
            "cache-skips=%u recovery-probes=%u offer-refreshes=%u\n",
            label,
            link_test != 0 ? "256+256-byte explicit link test"
-                          : "cross-resolver DNS coalescing plus four-packet "
+                          : "cross-resolver DNS coalescing plus eight-packet "
                             "TCP burst through multicast-saturated queues",
            client.adaptive_upgrades, gateway.adaptive_upgrades,
            client.baseline_selections, gateway.baseline_selections,
@@ -1184,6 +1286,7 @@ int main(void)
     um_channel_config v2_reverse = um_channel_recorded_v2_config(1u);
     um_distortion_profile strong;
     um_modem_config cached;
+    size_t cached_body_bytes;
     char client_path[160];
     char gateway_path[160];
     int found;
@@ -1203,8 +1306,8 @@ int main(void)
     if (status == 0) {
         found = 0;
         if (um_calibration_config_load(client_path, UM_LIVE_CLIENT, &cached,
-                                       &found) != UM_OK ||
-            found == 0) {
+                                       &cached_body_bytes, &found) != UM_OK ||
+            found == 0 || cached_body_bytes != 384u) {
             fprintf(stderr, "client calibration cache was not saved\n");
             status = 1;
         }
@@ -1212,8 +1315,8 @@ int main(void)
     if (status == 0) {
         found = 0;
         if (um_calibration_config_load(gateway_path, UM_LIVE_GATEWAY, &cached,
-                                       &found) != UM_OK ||
-            found == 0) {
+                                       &cached_body_bytes, &found) != UM_OK ||
+            found == 0 || cached_body_bytes != UM_LIVE_MAX_BODY) {
             fprintf(stderr, "gateway calibration cache was not saved\n");
             status = 1;
         }

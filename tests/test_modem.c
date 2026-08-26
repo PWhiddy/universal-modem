@@ -966,7 +966,7 @@ static void test_live_wire_protocol(void)
                               wire, sizeof(wire), &wire_length) == UM_OK);
     CHECK(um_live_wire_decode(wire, wire_length, &message) == UM_OK);
     CHECK(message.type == UM_WIRE_PROXY_COMPLETE);
-    CHECK(um_live_wire_encode((um_live_wire_type)24, 0u, 0u, NULL, 0u,
+    CHECK(um_live_wire_encode((um_live_wire_type)27, 0u, 0u, NULL, 0u,
                               wire, sizeof(wire), &wire_length) ==
           UM_ERR_ARGUMENT);
 
@@ -1068,6 +1068,7 @@ static void test_calibration_config_file(void)
     char path[160];
     um_modem_config saved = um_modem_default_config();
     um_modem_config loaded;
+    size_t loaded_body_bytes = 0u;
     FILE *file;
     int found = 0;
 
@@ -1076,21 +1077,25 @@ static void test_calibration_config_file(void)
                    "/tmp/universal-modem-calibration-%ld.config",
                    (long)getpid());
     (void)remove(path);
-    CHECK(um_calibration_config_load(path, UM_LIVE_CLIENT, &loaded, &found) ==
-          UM_OK);
+    CHECK(um_calibration_config_load(path, UM_LIVE_CLIENT, &loaded,
+                                     &loaded_body_bytes, &found) == UM_OK);
     CHECK(found == 0);
-    CHECK(um_calibration_config_save(path, UM_LIVE_CLIENT, &saved) == UM_OK);
-    CHECK(um_calibration_config_load(path, UM_LIVE_CLIENT, &loaded, &found) ==
+    CHECK(um_calibration_config_save(path, UM_LIVE_CLIENT, &saved, 384u) ==
           UM_OK);
+    CHECK(um_calibration_config_load(path, UM_LIVE_CLIENT, &loaded,
+                                     &loaded_body_bytes, &found) == UM_OK);
     CHECK(found == 1);
+    CHECK(loaded_body_bytes == 384u);
     CHECK(config_difference_count(&saved, &loaded) == 0u);
-    CHECK(um_calibration_config_load(path, UM_LIVE_GATEWAY, &loaded, &found) ==
+    CHECK(um_calibration_config_load(path, UM_LIVE_GATEWAY, &loaded,
+                                     &loaded_body_bytes, &found) ==
           UM_ERR_CONFIG);
     file = fopen(path, "w");
     CHECK(file != NULL);
-    CHECK(fputs("format=1\nrole=client\n", file) >= 0);
+    CHECK(fputs("format=2\nrole=client\n", file) >= 0);
     CHECK(fclose(file) == 0);
-    CHECK(um_calibration_config_load(path, UM_LIVE_CLIENT, &loaded, &found) ==
+    CHECK(um_calibration_config_load(path, UM_LIVE_CLIENT, &loaded,
+                                     &loaded_body_bytes, &found) ==
           UM_ERR_CONFIG);
     CHECK(remove(path) == 0);
 }

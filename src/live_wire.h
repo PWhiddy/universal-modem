@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #define UM_LIVE_WIRE_HEADER_SIZE 12u
+#define UM_LIVE_MIN_BODY 128u
 #define UM_LIVE_MAX_BODY 512u
 #define UM_LIVE_MAX_WIRE (UM_LIVE_WIRE_HEADER_SIZE + UM_LIVE_MAX_BODY)
 
@@ -33,7 +34,10 @@ typedef enum {
     UM_WIRE_PROXY_TURN = 20,
     UM_WIRE_PROXY_TURN_ACK = 21,
     UM_WIRE_PROXY_TURN_COMMIT = 22,
-    UM_WIRE_PROXY_COMPLETE = 23
+    UM_WIRE_PROXY_COMPLETE = 23,
+    UM_WIRE_IP_BATCH = 24,
+    UM_WIRE_CALIB_BODY_PROBE = 25,
+    UM_WIRE_CALIB_BODY_RESULT = 26
 } um_live_wire_type;
 
 typedef struct {
