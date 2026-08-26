@@ -49,8 +49,6 @@ typedef struct {
     unsigned proxy_drops;
     int begin_ack_drop_armed;
     unsigned begin_ack_drops;
-    int turn_ack_drop_armed;
-    unsigned turn_ack_drops;
     int commit_drop_armed;
     unsigned commit_drops;
     int network_opened[SIM_ENDPOINTS];
@@ -107,8 +105,11 @@ typedef struct {
     unsigned proxy_completed;
     unsigned proxy_start_retries;
     unsigned proxy_retries;
-    unsigned token_retries;
     unsigned commit_retries;
+    unsigned packet_token_commits;
+    unsigned packet_token_accepts;
+    unsigned dns_query_logs;
+    unsigned dns_response_logs;
     unsigned reconnecting;
 } runner;
 
@@ -172,10 +173,37 @@ static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
                               unsigned target_index)
 {
     if (target_index == 0u) {
+        uint8_t *dns;
         make_ipv4_packet(packet, length,
                          endpoint == SIM_CLIENT ? 0x31u : 0xa7u,
                          endpoint == SIM_CLIENT ? 53000u : 53u,
                          endpoint == SIM_CLIENT ? 53u : 53000u);
+        dns = &packet[28];
+        memset(dns, 0, 26u);
+        dns[0] = 0x4du;
+        dns[1] = 0x2au;
+        dns[2] = endpoint == SIM_CLIENT ? 0x01u : 0x81u;
+        dns[3] = endpoint == SIM_CLIENT ? 0x00u : 0x80u;
+        dns[5] = 1u;
+        dns[7] = endpoint == SIM_CLIENT ? 0u : 1u;
+        dns[12] = 3u;
+        memcpy(&dns[13], "dns", 3u);
+        dns[16] = 4u;
+        memcpy(&dns[17], "test", 4u);
+        dns[23] = 1u;
+        dns[25] = 1u;
+        if (endpoint != SIM_CLIENT) {
+            dns[26] = 0xc0u;
+            dns[27] = 0x0cu;
+            dns[29] = 1u;
+            dns[31] = 1u;
+            dns[35] = 60u;
+            dns[37] = 4u;
+            dns[38] = 93u;
+            dns[39] = 184u;
+            dns[40] = 216u;
+            dns[41] = 34u;
+        }
     } else {
         make_ipv4_tcp_packet(
             packet, length,
@@ -325,22 +353,28 @@ static void test_log(void *context, const char *message)
     if (strstr(message, "proxy start retry=") != NULL) {
         ++run->proxy_start_retries;
     }
-    if (strstr(message, "proxy token handoff retry=") != NULL) {
-        ++run->token_retries;
-    }
     if (strstr(message, "proxy token commit wait retry=") != NULL) {
         ++run->commit_retries;
     }
-    if (run->options.role == UM_LIVE_GATEWAY &&
-        strstr(message, "proxy token accept sequence=") != NULL) {
-        (void)pthread_mutex_lock(&bus.mutex);
-        if (bus.proxy_drop_endpoint >= 0 && bus.turn_ack_drops == 0u) {
-            bus.turn_ack_drop_armed = 1;
-        }
-        (void)pthread_mutex_unlock(&bus.mutex);
+    if (strstr(message, "proxy packet token commit wait retry=") != NULL) {
+        ++run->commit_retries;
+    }
+    if (strstr(message, "proxy packet token accept sequence=") != NULL) {
+        ++run->packet_token_accepts;
+    }
+    if (strstr(message, "proxy packet token commit sequence=") != NULL) {
+        ++run->packet_token_commits;
+    }
+    if (strstr(message, "DNS query dns.test A") != NULL) {
+        ++run->dns_query_logs;
+    }
+    if (strstr(message, "DNS response dns.test A") != NULL &&
+        strstr(message, "rcode=0 answers=1") != NULL) {
+        ++run->dns_response_logs;
     }
     if (run->options.role == UM_LIVE_CLIENT &&
-        strstr(message, "proxy token commit sequence=") != NULL) {
+        (strstr(message, "proxy token commit sequence=") != NULL ||
+         strstr(message, "proxy packet token commit sequence=") != NULL)) {
         (void)pthread_mutex_lock(&bus.mutex);
         if (bus.proxy_drop_endpoint >= 0 && bus.commit_drops == 0u) {
             bus.commit_drop_armed = 1;
@@ -548,11 +582,6 @@ int um_audio_write(um_audio *audio, const float *samples, size_t frame_count)
     if (bus.begin_ack_drop_armed != 0 && audio->endpoint == SIM_GATEWAY) {
         bus.begin_ack_drop_armed = 0;
         ++bus.begin_ack_drops;
-        drop_write = 1;
-    }
-    if (bus.turn_ack_drop_armed != 0 && audio->endpoint == SIM_GATEWAY) {
-        bus.turn_ack_drop_armed = 0;
-        ++bus.turn_ack_drops;
         drop_write = 1;
     }
     if (bus.commit_drop_armed != 0 && audio->endpoint == SIM_CLIENT) {
@@ -892,8 +921,6 @@ static int run_pair(const char *label,
     bus.proxy_drops = 0u;
     bus.begin_ack_drop_armed = 0;
     bus.begin_ack_drops = 0u;
-    bus.turn_ack_drop_armed = 0;
-    bus.turn_ack_drops = 0u;
     bus.commit_drop_armed = 0;
     bus.commit_drops = 0u;
     memset(bus.network_opened, 0, sizeof(bus.network_opened));
@@ -982,12 +1009,15 @@ static int run_pair(const char *label,
           bus.network_matches[SIM_GATEWAY] != SIM_PROXY_PACKETS)) ||
         (inject_proxy_retry != 0 &&
          (bus.proxy_drops != 2u || bus.begin_ack_drops != 1u ||
-          bus.turn_ack_drops != 1u ||
           bus.commit_drops != 1u ||
           client.proxy_start_retries + gateway.proxy_start_retries == 0u ||
           client.proxy_retries + gateway.proxy_retries == 0u ||
-          client.token_retries + gateway.token_retries == 0u ||
-          client.commit_retries + gateway.commit_retries == 0u))) {
+          client.commit_retries + gateway.commit_retries == 0u)) ||
+        (link_test == 0 &&
+         (client.packet_token_commits + gateway.packet_token_commits < 2u ||
+          client.packet_token_accepts + gateway.packet_token_accepts < 2u ||
+          client.dns_query_logs + gateway.dns_query_logs < 2u ||
+          client.dns_response_logs + gateway.dns_response_logs < 2u))) {
         fprintf(stderr,
                 "%s paired live simulation failed timeout=%d client=%s "
                 "gateway=%s\n",

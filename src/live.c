@@ -5,6 +5,7 @@
 #include "network.h"
 #include "um_internal.h"
 
+#include <ctype.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -28,6 +29,7 @@
 #define LIVE_REPORT_ENTRY_BYTES (2u + LIVE_CONFIG_BYTES)
 #define LIVE_CACHE_BODY_BYTES (1u + LIVE_CONFIG_BYTES)
 #define LIVE_PROXY_FRAGMENT_HEADER_BYTES 8u
+#define LIVE_PROXY_ACK_BYTES 5u
 #define LIVE_PROXY_BEGIN_BYTES 5u
 #define LIVE_PROXY_BURST_PACKETS 4u
 #define LIVE_PROXY_QUEUE_PACKETS 16u
@@ -35,6 +37,9 @@
 #define LIVE_PROXY_IDLE_MS 350u
 #define LIVE_PROXY_ACK_TIMEOUT_MS 5000u
 #define LIVE_PROXY_RECEIVE_TIMEOUT_MS 6500u
+#define LIVE_PROXY_TOTAL_MASK UINT16_C(0x7fff)
+#define LIVE_PROXY_YIELD_FLAG UINT16_C(0x8000)
+#define LIVE_PROXY_ACK_YIELD 0x01u
 
 enum {
     LIVE_PROXY_PRIORITY_BULK = 0,
@@ -69,9 +74,11 @@ typedef struct {
     uint16_t receive_sequence;
     uint16_t turn_sequence;
     uint16_t last_committed_turn;
+    uint16_t last_commit_packet_sequence;
     uint32_t transmit_packet_id;
     uint32_t receive_packet_id;
     uint32_t last_completed_packet_id;
+    uint32_t last_commit_packet_id;
     size_t receive_total;
     size_t receive_offset;
     size_t receive_fragments;
@@ -91,6 +98,8 @@ typedef struct {
     uint64_t started_ms;
     int have_last_completed_packet;
     int have_last_commit;
+    int last_commit_piggybacked;
+    int receive_yield_requested;
 } live_proxy_state;
 
 typedef struct {
@@ -1849,6 +1858,145 @@ static unsigned proxy_packet_priority(const uint8_t *packet, size_t length)
     return LIVE_PROXY_PRIORITY_BULK;
 }
 
+static const char *dns_record_type(uint16_t type, char text[16])
+{
+    switch (type) {
+    case 1u:
+        return "A";
+    case 5u:
+        return "CNAME";
+    case 12u:
+        return "PTR";
+    case 16u:
+        return "TXT";
+    case 28u:
+        return "AAAA";
+    case 64u:
+        return "SVCB";
+    case 65u:
+        return "HTTPS";
+    default:
+        (void)snprintf(text, 16u, "TYPE%u", (unsigned)type);
+        return text;
+    }
+}
+
+static int read_dns_name(const uint8_t *dns, size_t dns_length,
+                         size_t start, char *name, size_t name_capacity,
+                         size_t *next)
+{
+    size_t position = start;
+    size_t output = 0u;
+    size_t jump_count = 0u;
+    int jumped = 0;
+    if (name == NULL || name_capacity == 0u || next == NULL) {
+        return 0;
+    }
+    while (position < dns_length && jump_count <= 16u) {
+        size_t label_length = dns[position];
+        if ((label_length & 0xc0u) == 0xc0u) {
+            size_t target;
+            if (position + 1u >= dns_length) {
+                return 0;
+            }
+            target = ((label_length & 0x3fu) << 8u) | dns[position + 1u];
+            if (target >= dns_length) {
+                return 0;
+            }
+            if (jumped == 0) {
+                *next = position + 2u;
+            }
+            position = target;
+            jumped = 1;
+            ++jump_count;
+            continue;
+        }
+        if (label_length == 0u) {
+            if (jumped == 0) {
+                *next = position + 1u;
+            }
+            if (output == 0u) {
+                if (name_capacity < 2u) {
+                    return 0;
+                }
+                name[output++] = '.';
+            }
+            name[output] = '\0';
+            return 1;
+        }
+        if (label_length > 63u ||
+            position + 1u + label_length > dns_length) {
+            return 0;
+        }
+        if (output != 0u) {
+            if (output + 1u >= name_capacity) {
+                return 0;
+            }
+            name[output++] = '.';
+        }
+        ++position;
+        while (label_length-- != 0u) {
+            unsigned char character = dns[position++];
+            if (output + 1u >= name_capacity) {
+                return 0;
+            }
+            name[output++] =
+                (char)(isalnum(character) != 0 || character == '-' ||
+                               character == '_'
+                           ? character
+                           : '?');
+        }
+        if (jumped == 0) {
+            *next = position;
+        }
+    }
+    return 0;
+}
+
+static int describe_dns(const uint8_t *packet, size_t length,
+                        size_t transport_offset, char *description,
+                        size_t description_capacity)
+{
+    const uint8_t *dns;
+    size_t dns_length;
+    size_t question_end = 0u;
+    uint16_t udp_length;
+    uint16_t flags;
+    uint16_t type;
+    char name[96];
+    char type_text[16];
+    if (transport_offset + 8u > length) {
+        return 0;
+    }
+    udp_length = read_u16(&packet[transport_offset + 4u]);
+    if (udp_length < 20u || transport_offset + udp_length > length) {
+        return 0;
+    }
+    dns = &packet[transport_offset + 8u];
+    dns_length = udp_length - 8u;
+    if (read_u16(&dns[4]) == 0u ||
+        read_dns_name(dns, dns_length, 12u, name, sizeof(name),
+                      &question_end) == 0 ||
+        question_end + 4u > dns_length) {
+        return 0;
+    }
+    flags = read_u16(&dns[2]);
+    type = read_u16(&dns[question_end]);
+    if ((flags & UINT16_C(0x8000)) == 0u) {
+        (void)snprintf(description, description_capacity,
+                       "query %s %s id=%u", name,
+                       dns_record_type(type, type_text),
+                       (unsigned)read_u16(dns));
+    } else {
+        (void)snprintf(description, description_capacity,
+                       "response %s %s id=%u rcode=%u answers=%u", name,
+                       dns_record_type(type, type_text),
+                       (unsigned)read_u16(dns), (unsigned)(flags & 0x0fu),
+                       (unsigned)read_u16(&dns[6]));
+    }
+    return 1;
+}
+
 static void describe_proxy_packet(const uint8_t *packet, size_t length,
                                   char *description,
                                   size_t description_capacity)
@@ -1867,14 +2015,21 @@ static void describe_proxy_packet(const uint8_t *packet, size_t length,
     }
     if ((protocol == 6u || protocol == 17u) &&
         transport_offset + 4u <= length) {
-        (void)snprintf(description, description_capacity, "%s/%s %u->%u%s",
-                       family, protocol == 6u ? "TCP" : "UDP",
-                       (unsigned)read_u16(&packet[transport_offset]),
-                       (unsigned)read_u16(&packet[transport_offset + 2u]),
-                       proxy_packet_priority(packet, length) ==
-                               LIVE_PROXY_PRIORITY_DNS
-                           ? " DNS"
-                           : "");
+        char dns_description[160];
+        int is_dns = proxy_packet_priority(packet, length) ==
+                     LIVE_PROXY_PRIORITY_DNS;
+        int have_dns_description =
+            is_dns != 0 && protocol == 17u &&
+            describe_dns(packet, length, transport_offset,
+                         dns_description, sizeof(dns_description)) != 0;
+        (void)snprintf(
+            description, description_capacity, "%s/%s %u->%u%s%s%s",
+            family, protocol == 6u ? "TCP" : "UDP",
+            (unsigned)read_u16(&packet[transport_offset]),
+            (unsigned)read_u16(&packet[transport_offset + 2u]),
+            is_dns != 0 ? " DNS" : "",
+            have_dns_description != 0 ? " " : "",
+            have_dns_description != 0 ? dns_description : "");
     } else if (protocol == 1u || protocol == 58u) {
         (void)snprintf(description, description_capacity, "%s/ICMP", family);
     } else {
@@ -2017,7 +2172,7 @@ static void log_proxy_packet(live_context *context,
                              uint32_t packet_id, size_t packet_length,
                              size_t fragments, const uint8_t *packet)
 {
-    char description[64];
+    char description[256];
     double seconds = (double)(monotonic_milliseconds() - state->started_ms) /
                      1000.0;
     size_t bytes = transmitted != 0 ? state->bytes_sent
@@ -2037,7 +2192,8 @@ static void log_proxy_packet(live_context *context,
 
 static int send_proxy_packet(live_context *context, live_proxy_state *state,
                              const uint8_t *packet, size_t packet_length,
-                             size_t frame_body_limit)
+                             size_t frame_body_limit, int yield_token,
+                             int *token_yielded)
 {
     const um_modem_config *transmit = proxy_transmit_config(context);
     const um_modem_config *receive = proxy_receive_config(context);
@@ -2049,7 +2205,11 @@ static int send_proxy_packet(live_context *context, live_proxy_state *state,
     uint32_t packet_id = ++state->transmit_packet_id;
     unsigned attempt;
     int status = validate_ip_packet(packet, packet_length);
-    if (status != UM_OK || packet_length > UINT16_MAX) {
+    if (token_yielded == NULL) {
+        return UM_ERR_ARGUMENT;
+    }
+    *token_yielded = 0;
+    if (status != UM_OK || packet_length > LIVE_PROXY_TOTAL_MASK) {
         return status != UM_OK ? status : UM_ERR_CAPACITY;
     }
     fragments = (packet_length + fragment_capacity - 1u) / fragment_capacity;
@@ -2068,7 +2228,9 @@ static int send_proxy_packet(live_context *context, live_proxy_state *state,
             }
             final_fragment = offset + fragment_length == packet_length;
             write_u32(body, packet_id);
-            write_u16(&body[4], (uint16_t)packet_length);
+            write_u16(&body[4],
+                      (uint16_t)packet_length |
+                          (yield_token != 0 ? LIVE_PROXY_YIELD_FLAG : 0u));
             write_u16(&body[6], (uint16_t)offset);
             memcpy(body + LIVE_PROXY_FRAGMENT_HEADER_BYTES, packet + offset,
                    fragment_length);
@@ -2090,13 +2252,35 @@ static int send_proxy_packet(live_context *context, live_proxy_state *state,
                                   final_sequence,
                                   LIVE_PROXY_ACK_TIMEOUT_MS,
                                   &acknowledgement, NULL);
-        if (status == UM_OK && acknowledgement.body_length == 4u &&
-            read_u32(acknowledgement.body) == packet_id) {
+        if (status == UM_OK &&
+            acknowledgement.body_length == LIVE_PROXY_ACK_BYTES &&
+            read_u32(acknowledgement.body) == packet_id &&
+            ((acknowledgement.body[4] & LIVE_PROXY_ACK_YIELD) != 0u) ==
+                (yield_token != 0)) {
             state->transmit_sequence = (uint16_t)(final_sequence + 1u);
             ++state->packets_sent;
             state->bytes_sent += packet_length;
             log_proxy_packet(context, state, 1, packet_id, packet_length,
                              fragments, packet);
+            if (yield_token != 0) {
+                live_log(context,
+                         "proxy packet token commit sequence=%u packet=%u",
+                         (unsigned)state->turn_sequence, packet_id);
+                sleep_milliseconds(LIVE_TURNAROUND_MS);
+                status = send_wire(context, transmit,
+                                   UM_WIRE_PROXY_TURN_COMMIT,
+                                   state->turn_sequence, NULL, 0u, 1, NULL);
+                if (status != UM_OK) {
+                    return status;
+                }
+                state->last_committed_turn = state->turn_sequence;
+                state->last_commit_packet_sequence = final_sequence;
+                state->last_commit_packet_id = packet_id;
+                state->have_last_commit = 1;
+                state->last_commit_piggybacked = 1;
+                ++state->turn_sequence;
+                *token_yielded = 1;
+            }
             return UM_OK;
         }
         live_log(context,
@@ -2109,22 +2293,97 @@ static int send_proxy_packet(live_context *context, live_proxy_state *state,
     return live_interrupted ? UM_ERR_INTERRUPTED : UM_ERR_TIMEOUT;
 }
 
+static int send_proxy_ack(live_context *context, uint16_t sequence,
+                          uint32_t packet_id, int yield_token)
+{
+    uint8_t body[LIVE_PROXY_ACK_BYTES];
+    write_u32(body, packet_id);
+    body[4] = yield_token != 0 ? LIVE_PROXY_ACK_YIELD : 0u;
+    sleep_milliseconds(LIVE_TURNAROUND_MS);
+    return send_wire(context, proxy_transmit_config(context),
+                     UM_WIRE_IP_ACK, sequence, body, sizeof(body), 1, NULL);
+}
+
+static int accept_packet_token(live_context *context,
+                               live_proxy_state *state,
+                               uint16_t packet_sequence,
+                               uint32_t packet_id)
+{
+    const um_modem_config *receive = proxy_receive_config(context);
+    unsigned attempt;
+    for (attempt = 0u; attempt < context->options.retry_limit; ++attempt) {
+        uint64_t deadline;
+        int status;
+        live_log(context,
+                 "proxy packet token accept sequence=%u packet=%u "
+                 "attempt=%u/%u",
+                 (unsigned)state->turn_sequence, packet_id, attempt + 1u,
+                 context->options.retry_limit);
+        status = send_proxy_ack(context, packet_sequence, packet_id, 1);
+        if (status != UM_OK) {
+            return status;
+        }
+        deadline = monotonic_milliseconds() + LIVE_PROXY_ACK_TIMEOUT_MS;
+        while (!live_interrupted && monotonic_milliseconds() < deadline) {
+            um_live_wire_message message;
+            unsigned remaining =
+                (unsigned)(deadline - monotonic_milliseconds());
+            status = receive_wire(context, receive, context->session_id,
+                                  remaining, &message, NULL);
+            if (status == UM_ERR_HEADER || status == UM_ERR_CRC ||
+                status == UM_ERR_SYNC || status == UM_ERR_TRUNCATED) {
+                continue;
+            }
+            if (status != UM_OK) {
+                break;
+            }
+            if (message.type == UM_WIRE_PROXY_TURN_COMMIT &&
+                message.sequence == state->turn_sequence) {
+                ++state->turn_sequence;
+                return UM_OK;
+            }
+            if (message.type == UM_WIRE_IP_FRAGMENT &&
+                message.sequence == packet_sequence &&
+                message.body_length > LIVE_PROXY_FRAGMENT_HEADER_BYTES &&
+                read_u32(message.body) == packet_id) {
+                uint16_t encoded_total = read_u16(&message.body[4]);
+                size_t total = encoded_total & LIVE_PROXY_TOTAL_MASK;
+                size_t offset = read_u16(&message.body[6]);
+                size_t fragment_length =
+                    message.body_length - LIVE_PROXY_FRAGMENT_HEADER_BYTES;
+                if ((encoded_total & LIVE_PROXY_YIELD_FLAG) != 0u &&
+                    offset <= total && fragment_length == total - offset) {
+                    break;
+                }
+            }
+        }
+        live_log(context, "proxy packet token commit wait retry=%u/%u",
+                 attempt + 1u, context->options.retry_limit);
+    }
+    return live_interrupted ? UM_ERR_INTERRUPTED : UM_ERR_TIMEOUT;
+}
+
 static int receive_proxy_fragment(live_context *context,
                                   live_proxy_state *state,
-                                  const um_live_wire_message *message)
+                                  const um_live_wire_message *message,
+                                  int *token_received)
 {
-    const um_modem_config *acknowledgement = proxy_transmit_config(context);
-    uint8_t acknowledgement_body[4];
+    uint16_t encoded_total;
     uint32_t packet_id;
     size_t total;
     size_t offset;
     size_t fragment_length;
+    int yield_requested;
     int status;
-    if (message->body_length <= LIVE_PROXY_FRAGMENT_HEADER_BYTES) {
+    if (token_received == NULL ||
+        message->body_length <= LIVE_PROXY_FRAGMENT_HEADER_BYTES) {
         return UM_ERR_HEADER;
     }
+    *token_received = 0;
     packet_id = read_u32(message->body);
-    total = read_u16(&message->body[4]);
+    encoded_total = read_u16(&message->body[4]);
+    total = encoded_total & LIVE_PROXY_TOTAL_MASK;
+    yield_requested = (encoded_total & LIVE_PROXY_YIELD_FLAG) != 0u;
     offset = read_u16(&message->body[6]);
     fragment_length = message->body_length -
                       LIVE_PROXY_FRAGMENT_HEADER_BYTES;
@@ -2137,11 +2396,8 @@ static int receive_proxy_fragment(live_context *context,
         if (offset + fragment_length != total) {
             return UM_OK;
         }
-        write_u32(acknowledgement_body, packet_id);
-        sleep_milliseconds(LIVE_TURNAROUND_MS);
-        return send_wire(context, acknowledgement, UM_WIRE_IP_ACK,
-                         message->sequence, acknowledgement_body,
-                         sizeof(acknowledgement_body), 1, NULL);
+        return send_proxy_ack(context, message->sequence, packet_id,
+                              yield_requested);
     }
     /*
      * Packet fragments are sent as a window and acknowledged cumulatively.
@@ -2157,9 +2413,11 @@ static int receive_proxy_fragment(live_context *context,
             state->receive_total = total;
             state->receive_offset = 0u;
             state->receive_fragments = 0u;
+            state->receive_yield_requested = yield_requested;
         }
         if (packet_id != state->receive_packet_id ||
-            total != state->receive_total || offset != state->receive_offset) {
+            total != state->receive_total || offset != state->receive_offset ||
+            yield_requested != state->receive_yield_requested) {
             return UM_ERR_HEADER;
         }
         memcpy(state->receive_packet + offset,
@@ -2192,11 +2450,16 @@ static int receive_proxy_fragment(live_context *context,
             state->receive_total = 0u;
             state->receive_offset = 0u;
             state->receive_fragments = 0u;
-            write_u32(acknowledgement_body, packet_id);
-            sleep_milliseconds(LIVE_TURNAROUND_MS);
-            return send_wire(context, acknowledgement, UM_WIRE_IP_ACK,
-                             message->sequence, acknowledgement_body,
-                             sizeof(acknowledgement_body), 1, NULL);
+            state->receive_yield_requested = 0;
+            if (yield_requested != 0) {
+                status = accept_packet_token(context, state,
+                                             message->sequence, packet_id);
+                if (status == UM_OK) {
+                    *token_received = 1;
+                }
+                return status;
+            }
+            return send_proxy_ack(context, message->sequence, packet_id, 0);
         }
     }
     return UM_OK;
@@ -2243,7 +2506,10 @@ static int yield_proxy_token(live_context *context,
                 return status;
             }
             state->last_committed_turn = state->turn_sequence;
+            state->last_commit_packet_sequence = 0u;
+            state->last_commit_packet_id = 0u;
             state->have_last_commit = 1;
+            state->last_commit_piggybacked = 0;
             ++state->turn_sequence;
             return UM_OK;
         }
@@ -2360,9 +2626,14 @@ static int receive_until_proxy_token(live_context *context,
         }
         misses = 0u;
         if (message.type == UM_WIRE_IP_FRAGMENT) {
-            status = receive_proxy_fragment(context, state, &message);
+            int token_received = 0;
+            status = receive_proxy_fragment(context, state, &message,
+                                            &token_received);
             if (status != UM_OK) {
                 return status;
+            }
+            if (token_received != 0) {
+                return UM_OK;
             }
             continue;
         }
@@ -2386,7 +2657,21 @@ static int receive_until_proxy_token(live_context *context,
         }
         if (message.type == UM_WIRE_PROXY_TURN_ACK &&
             state->have_last_commit != 0 &&
+            state->last_commit_piggybacked == 0 &&
             message.sequence == state->last_committed_turn) {
+            status = resend_proxy_commit(context, state);
+            if (status != UM_OK) {
+                return status;
+            }
+            continue;
+        }
+        if (message.type == UM_WIRE_IP_ACK &&
+            state->have_last_commit != 0 &&
+            state->last_commit_piggybacked != 0 &&
+            message.sequence == state->last_commit_packet_sequence &&
+            message.body_length == LIVE_PROXY_ACK_BYTES &&
+            read_u32(message.body) == state->last_commit_packet_id &&
+            (message.body[4] & LIVE_PROXY_ACK_YIELD) != 0u) {
             status = resend_proxy_commit(context, state);
             if (status != UM_OK) {
                 return status;
@@ -2428,6 +2713,7 @@ static int run_proxy_loop(live_context *context, size_t frame_body_limit)
         int status;
         if (have_token != 0) {
             size_t burst;
+            int token_yielded = 0;
             if (context->options.role == UM_LIVE_CLIENT &&
                 context->options.proxy_test_packets != 0u &&
                 state.packets_sent >= context->options.proxy_test_packets &&
@@ -2446,6 +2732,7 @@ static int run_proxy_loop(live_context *context, size_t frame_body_limit)
                 uint8_t packet[UM_NETWORK_MAX_PACKET];
                 size_t packet_length = 0u;
                 unsigned priority = LIVE_PROXY_PRIORITY_BULK;
+                int yield_with_packet;
                 status = drain_proxy_ingress(
                     context, &state,
                     burst == 0u ? LIVE_PROXY_IDLE_MS : 0u);
@@ -2456,21 +2743,30 @@ static int run_proxy_loop(live_context *context, size_t frame_body_limit)
                                      &priority) == 0) {
                     break;
                 }
+                yield_with_packet =
+                    priority >= LIVE_PROXY_PRIORITY_CONTROL ||
+                    burst + 1u == LIVE_PROXY_BURST_PACKETS ||
+                    state.queue_count == 0u;
                 status = send_proxy_packet(context, &state, packet,
                                            packet_length,
-                                           frame_body_limit);
+                                           frame_body_limit,
+                                           yield_with_packet,
+                                           &token_yielded);
                 if (status != UM_OK) {
                     return status;
                 }
                 /* Return the half-duplex link promptly after interactive
                  * DNS, ICMP, or TCP-control traffic. */
-                if (priority >= LIVE_PROXY_PRIORITY_CONTROL) {
+                if (token_yielded != 0 ||
+                    priority >= LIVE_PROXY_PRIORITY_CONTROL) {
                     break;
                 }
             }
-            status = yield_proxy_token(context, &state);
-            if (status != UM_OK) {
-                return status;
+            if (token_yielded == 0) {
+                status = yield_proxy_token(context, &state);
+                if (status != UM_OK) {
+                    return status;
+                }
             }
             have_token = 0;
         } else {
