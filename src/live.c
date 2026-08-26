@@ -33,6 +33,8 @@
 #define LIVE_PROXY_BEGIN_BYTES 5u
 #define LIVE_PROXY_BURST_PACKETS 4u
 #define LIVE_PROXY_QUEUE_PACKETS 16u
+#define LIVE_PROXY_RECENT_DNS 8u
+#define LIVE_PROXY_DNS_RETRY_SUPPRESS_MS 30000u
 #define LIVE_PROXY_INGRESS_DRAIN_LIMIT 512u
 #define LIVE_PROXY_IDLE_MS 350u
 #define LIVE_PROXY_ACK_TIMEOUT_MS 5000u
@@ -48,18 +50,27 @@ enum {
     LIVE_PROXY_PRIORITY_DNS = 3
 };
 
-enum {
-    LIVE_CHECKSUM_REPAIRED_IP = 1u << 0u,
-    LIVE_CHECKSUM_REPAIRED_UDP = 1u << 1u,
-    LIVE_CHECKSUM_REPAIRED_TCP = 1u << 2u,
-    LIVE_CHECKSUM_REPAIRED_ICMP = 1u << 3u
-};
-
 typedef struct {
     uint8_t packet[UM_NETWORK_MAX_PACKET];
     size_t length;
     unsigned priority;
 } live_proxy_queued_packet;
+
+typedef struct {
+    uint32_t client_address;
+    uint32_t server_address;
+    uint32_t question_hash;
+    uint16_t client_port;
+    uint16_t transaction_id;
+    uint16_t question_type;
+    uint16_t question_class;
+} live_proxy_dns_key;
+
+typedef struct {
+    live_proxy_dns_key key;
+    uint64_t completed_ms;
+    int valid;
+} live_proxy_recent_dns;
 
 typedef struct {
     um_live_audio_options options;
@@ -95,12 +106,15 @@ typedef struct {
     size_t bytes_sent;
     size_t bytes_received;
     live_proxy_queued_packet queue[LIVE_PROXY_QUEUE_PACKETS];
+    live_proxy_recent_dns recent_dns[LIVE_PROXY_RECENT_DNS];
     size_t queue_count;
     size_t queue_dropped;
     size_t queue_duplicates;
+    size_t dns_retries_suppressed;
     size_t queue_priority_evictions;
     size_t queue_logged_dropped;
     size_t queue_logged_duplicates;
+    size_t dns_retries_logged_suppressed;
     size_t queue_logged_priority_evictions;
     uint64_t started_ms;
     int have_last_completed_packet;
@@ -1819,142 +1833,6 @@ static int validate_ip_packet(const uint8_t *packet, size_t length)
     return UM_ERR_HEADER;
 }
 
-static uint32_t checksum_add(uint32_t sum, const uint8_t *bytes,
-                             size_t length)
-{
-    while (length >= 2u) {
-        sum += ((uint32_t)bytes[0] << 8u) | bytes[1];
-        bytes += 2u;
-        length -= 2u;
-    }
-    if (length != 0u) {
-        sum += (uint32_t)bytes[0] << 8u;
-    }
-    return sum;
-}
-
-static uint16_t checksum_finish(uint32_t sum)
-{
-    while ((sum >> 16u) != 0u) {
-        sum = (sum & UINT32_C(0xffff)) + (sum >> 16u);
-    }
-    return (uint16_t)~sum;
-}
-
-static uint16_t ipv4_transport_checksum(const uint8_t *packet,
-                                        size_t header_length,
-                                        size_t transport_length)
-{
-    uint32_t sum = 0u;
-    sum = checksum_add(sum, &packet[12], 8u);
-    sum += packet[9];
-    sum += (uint32_t)transport_length;
-    sum = checksum_add(sum, packet + header_length, transport_length);
-    return checksum_finish(sum);
-}
-
-/*
- * A kernel TUN can expose an skb whose checksum was intended for a device
- * offload.  That metadata does not accompany the raw IP bytes over the
- * acoustic link, and another operating system will correctly discard the
- * resulting datagram.  Materialize only objectively invalid checksums on
- * complete IPv4 packets; a zero IPv4 UDP checksum remains valid and IP
- * fragments are left alone because their full transport body is unavailable.
- */
-static unsigned normalize_ipv4_checksums(uint8_t *packet, size_t length)
-{
-    size_t header_length;
-    size_t transport_length;
-    uint16_t original;
-    uint16_t calculated;
-    uint16_t fragment;
-    unsigned repaired = 0u;
-
-    if (validate_ip_packet(packet, length) != UM_OK ||
-        (packet[0] >> 4u) != 4u) {
-        return 0u;
-    }
-    header_length = (size_t)(packet[0] & 0x0fu) * 4u;
-    original = read_u16(&packet[10]);
-    write_u16(&packet[10], 0u);
-    calculated = checksum_finish(checksum_add(0u, packet, header_length));
-    write_u16(&packet[10], calculated);
-    if (original != calculated) {
-        repaired |= LIVE_CHECKSUM_REPAIRED_IP;
-    }
-
-    fragment = read_u16(&packet[6]);
-    if ((fragment & UINT16_C(0x3fff)) != 0u) {
-        return repaired;
-    }
-    transport_length = length - header_length;
-    if (packet[9] == 17u && transport_length >= 8u &&
-        read_u16(&packet[header_length + 4u]) == transport_length) {
-        original = read_u16(&packet[header_length + 6u]);
-        if (original == 0u) {
-            return repaired;
-        }
-        write_u16(&packet[header_length + 6u], 0u);
-        calculated = ipv4_transport_checksum(packet, header_length,
-                                             transport_length);
-        if (calculated == 0u) {
-            calculated = UINT16_C(0xffff);
-        }
-        write_u16(&packet[header_length + 6u], calculated);
-        if (original != calculated) {
-            repaired |= LIVE_CHECKSUM_REPAIRED_UDP;
-        }
-    } else if (packet[9] == 6u && transport_length >= 20u) {
-        original = read_u16(&packet[header_length + 16u]);
-        write_u16(&packet[header_length + 16u], 0u);
-        calculated = ipv4_transport_checksum(packet, header_length,
-                                             transport_length);
-        write_u16(&packet[header_length + 16u], calculated);
-        if (original != calculated) {
-            repaired |= LIVE_CHECKSUM_REPAIRED_TCP;
-        }
-    } else if (packet[9] == 1u && transport_length >= 4u) {
-        original = read_u16(&packet[header_length + 2u]);
-        write_u16(&packet[header_length + 2u], 0u);
-        calculated = checksum_finish(checksum_add(
-            0u, packet + header_length, transport_length));
-        write_u16(&packet[header_length + 2u], calculated);
-        if (original != calculated) {
-            repaired |= LIVE_CHECKSUM_REPAIRED_ICMP;
-        }
-    }
-    return repaired;
-}
-
-static const char *checksum_repair_text(unsigned repaired, char text[48])
-{
-    size_t used = 0u;
-    const struct {
-        unsigned flag;
-        const char *name;
-    } entries[] = {
-        {LIVE_CHECKSUM_REPAIRED_IP, "ip"},
-        {LIVE_CHECKSUM_REPAIRED_UDP, "udp"},
-        {LIVE_CHECKSUM_REPAIRED_TCP, "tcp"},
-        {LIVE_CHECKSUM_REPAIRED_ICMP, "icmp"}
-    };
-    size_t index;
-    text[0] = '\0';
-    for (index = 0u; index < sizeof(entries) / sizeof(entries[0]); ++index) {
-        int count;
-        if ((repaired & entries[index].flag) == 0u) {
-            continue;
-        }
-        count = snprintf(text + used, 48u - used, "%s%s",
-                         used == 0u ? "" : "+", entries[index].name);
-        if (count < 0 || (size_t)count >= 48u - used) {
-            break;
-        }
-        used += (size_t)count;
-    }
-    return text;
-}
-
 static unsigned proxy_packet_priority(const uint8_t *packet, size_t length)
 {
     size_t transport_offset;
@@ -2096,6 +1974,81 @@ static int read_dns_name(const uint8_t *dns, size_t dns_length,
     return 0;
 }
 
+static uint32_t dns_name_hash(const char *name)
+{
+    uint32_t hash = UINT32_C(2166136261);
+    while (*name != '\0') {
+        unsigned char character = (unsigned char)*name++;
+        hash ^= (uint32_t)tolower(character);
+        hash *= UINT32_C(16777619);
+    }
+    return hash;
+}
+
+static int dns_packet_key(const uint8_t *packet, size_t length,
+                          int response, live_proxy_dns_key *key)
+{
+    const uint8_t *dns;
+    size_t header_length;
+    size_t dns_length;
+    size_t question_end = 0u;
+    uint16_t source_port;
+    uint16_t destination_port;
+    uint16_t udp_length;
+    uint16_t flags;
+    char name[96];
+
+    if (key == NULL || validate_ip_packet(packet, length) != UM_OK ||
+        (packet[0] >> 4u) != 4u || packet[9] != 17u ||
+        (read_u16(&packet[6]) & UINT16_C(0x3fff)) != 0u) {
+        return 0;
+    }
+    header_length = (size_t)(packet[0] & 0x0fu) * 4u;
+    if (header_length + 20u > length) {
+        return 0;
+    }
+    source_port = read_u16(&packet[header_length]);
+    destination_port = read_u16(&packet[header_length + 2u]);
+    udp_length = read_u16(&packet[header_length + 4u]);
+    if (udp_length != length - header_length || udp_length < 20u) {
+        return 0;
+    }
+    dns = &packet[header_length + 8u];
+    dns_length = udp_length - 8u;
+    flags = read_u16(&dns[2]);
+    if (((flags & UINT16_C(0x8000)) != 0u) != (response != 0) ||
+        read_u16(&dns[4]) == 0u ||
+        read_dns_name(dns, dns_length, 12u, name, sizeof(name),
+                      &question_end) == 0 ||
+        question_end + 4u > dns_length) {
+        return 0;
+    }
+    if ((response == 0 && destination_port != 53u) ||
+        (response != 0 && source_port != 53u)) {
+        return 0;
+    }
+    key->client_address = read_u32(&packet[response != 0 ? 16u : 12u]);
+    key->server_address = read_u32(&packet[response != 0 ? 12u : 16u]);
+    key->question_hash = dns_name_hash(name);
+    key->client_port = response != 0 ? destination_port : source_port;
+    key->transaction_id = read_u16(dns);
+    key->question_type = read_u16(&dns[question_end]);
+    key->question_class = read_u16(&dns[question_end + 2u]);
+    return 1;
+}
+
+static int dns_keys_equal(const live_proxy_dns_key *left,
+                          const live_proxy_dns_key *right)
+{
+    return left->client_address == right->client_address &&
+           left->server_address == right->server_address &&
+           left->question_hash == right->question_hash &&
+           left->client_port == right->client_port &&
+           left->transaction_id == right->transaction_id &&
+           left->question_type == right->question_type &&
+           left->question_class == right->question_class;
+}
+
 static int describe_dns(const uint8_t *packet, size_t length,
                         size_t transport_offset, char *description,
                         size_t description_capacity)
@@ -2204,6 +2157,84 @@ static void remove_proxy_queue_entry(live_proxy_state *state, size_t index)
     --state->queue_count;
 }
 
+static int dns_query_recently_completed(live_proxy_state *state,
+                                        const uint8_t *packet,
+                                        size_t packet_length)
+{
+    live_proxy_dns_key key;
+    uint64_t now;
+    size_t index;
+    if (dns_packet_key(packet, packet_length, 0, &key) == 0) {
+        return 0;
+    }
+    now = monotonic_milliseconds();
+    for (index = 0u; index < LIVE_PROXY_RECENT_DNS; ++index) {
+        live_proxy_recent_dns *recent = &state->recent_dns[index];
+        if (recent->valid == 0) {
+            continue;
+        }
+        if (now - recent->completed_ms >
+            LIVE_PROXY_DNS_RETRY_SUPPRESS_MS) {
+            recent->valid = 0;
+            continue;
+        }
+        if (dns_keys_equal(&recent->key, &key) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void remember_completed_dns(live_proxy_state *state,
+                                   const uint8_t *packet,
+                                   size_t packet_length)
+{
+    live_proxy_dns_key key;
+    uint64_t now;
+    uint64_t oldest = UINT64_MAX;
+    size_t oldest_slot = 0u;
+    size_t slot = LIVE_PROXY_RECENT_DNS;
+    size_t index;
+    if (dns_packet_key(packet, packet_length, 1, &key) == 0) {
+        return;
+    }
+    now = monotonic_milliseconds();
+    for (index = 0u; index < LIVE_PROXY_RECENT_DNS; ++index) {
+        live_proxy_recent_dns *recent = &state->recent_dns[index];
+        if (recent->valid != 0 &&
+            dns_keys_equal(&recent->key, &key) != 0) {
+            slot = index;
+            break;
+        }
+        if (recent->valid == 0 && slot == LIVE_PROXY_RECENT_DNS) {
+            slot = index;
+        } else if (recent->valid != 0 &&
+                   recent->completed_ms < oldest) {
+            oldest = recent->completed_ms;
+            oldest_slot = index;
+        }
+    }
+    if (slot == LIVE_PROXY_RECENT_DNS) {
+        slot = oldest_slot;
+    }
+    state->recent_dns[slot].key = key;
+    state->recent_dns[slot].completed_ms = now;
+    state->recent_dns[slot].valid = 1;
+
+    index = 0u;
+    while (index < state->queue_count) {
+        live_proxy_dns_key queued;
+        if (dns_packet_key(state->queue[index].packet,
+                           state->queue[index].length, 0, &queued) != 0 &&
+            dns_keys_equal(&queued, &key) != 0) {
+            remove_proxy_queue_entry(state, index);
+            ++state->dns_retries_suppressed;
+            continue;
+        }
+        ++index;
+    }
+}
+
 static int enqueue_proxy_packet(live_proxy_state *state,
                                 const uint8_t *packet, size_t packet_length)
 {
@@ -2211,6 +2242,10 @@ static int enqueue_proxy_packet(live_proxy_state *state,
     size_t index;
     if (validate_ip_packet(packet, packet_length) != UM_OK) {
         return UM_ERR_HEADER;
+    }
+    if (dns_query_recently_completed(state, packet, packet_length) != 0) {
+        ++state->dns_retries_suppressed;
+        return UM_OK;
     }
     for (index = 0u; index < state->queue_count; ++index) {
         if (state->queue[index].length == packet_length &&
@@ -2264,20 +2299,6 @@ static int drain_proxy_ingress(live_context *context,
         if (status != UM_OK) {
             return status;
         }
-        {
-            unsigned repaired = normalize_ipv4_checksums(packet,
-                                                          packet_length);
-            if (repaired != 0u) {
-                char repairs[48];
-                char description[256];
-                describe_proxy_packet(packet, packet_length, description,
-                                      sizeof(description));
-                live_log(context,
-                         "proxy materialized TUN checksums=%s traffic=%s",
-                         checksum_repair_text(repaired, repairs),
-                         description);
-            }
-        }
         status = enqueue_proxy_packet(state, packet, packet_length);
         if (status != UM_OK) {
             return status;
@@ -2285,15 +2306,22 @@ static int drain_proxy_ingress(live_context *context,
     }
     if (state->queue_dropped != state->queue_logged_dropped ||
         state->queue_duplicates != state->queue_logged_duplicates ||
+        state->dns_retries_suppressed !=
+            state->dns_retries_logged_suppressed ||
         state->queue_priority_evictions !=
             state->queue_logged_priority_evictions) {
         live_log(context,
                  "proxy ingress queue pending=%zu dropped=%zu "
-                 "duplicates=%zu priority-evictions=%zu",
+                 "duplicates=%zu dns-retries-suppressed=%zu "
+                 "priority-evictions=%zu",
                  state->queue_count, state->queue_dropped,
-                 state->queue_duplicates, state->queue_priority_evictions);
+                 state->queue_duplicates,
+                 state->dns_retries_suppressed,
+                 state->queue_priority_evictions);
         state->queue_logged_dropped = state->queue_dropped;
         state->queue_logged_duplicates = state->queue_duplicates;
+        state->dns_retries_logged_suppressed =
+            state->dns_retries_suppressed;
         state->queue_logged_priority_evictions =
             state->queue_priority_evictions;
     }
@@ -2605,28 +2633,14 @@ static int receive_proxy_fragment(live_context *context,
             if (status != UM_OK) {
                 return status;
             }
-            {
-                unsigned repaired = normalize_ipv4_checksums(
-                    state->receive_packet, completed_length);
-                if (repaired != 0u) {
-                    char repairs[48];
-                    char description[256];
-                    describe_proxy_packet(state->receive_packet,
-                                          completed_length, description,
-                                          sizeof(description));
-                    live_log(context,
-                             "proxy repaired received checksums=%s "
-                             "traffic=%s",
-                             checksum_repair_text(repaired, repairs),
-                             description);
-                }
-            }
             status = um_network_write(context->network,
                                       state->receive_packet,
                                       completed_length, 1000u);
             if (status != UM_OK) {
                 return status;
             }
+            remember_completed_dns(state, state->receive_packet,
+                                   completed_length);
             ++state->packets_received;
             state->bytes_received += completed_length;
             log_proxy_packet(context, state, 0, state->receive_packet_id,

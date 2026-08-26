@@ -53,7 +53,10 @@ typedef struct {
     unsigned commit_drops;
     int network_opened[SIM_ENDPOINTS];
     int network_input_ready[SIM_ENDPOINTS];
+    int network_dns_retry_ready[SIM_ENDPOINTS];
     unsigned network_background_remaining[SIM_ENDPOINTS];
+    unsigned network_dns_retry_reads[SIM_ENDPOINTS];
+    unsigned network_dns_retries_injected;
     unsigned network_targets_read[SIM_ENDPOINTS];
     unsigned network_reads[SIM_ENDPOINTS];
     unsigned network_writes[SIM_ENDPOINTS];
@@ -110,6 +113,7 @@ typedef struct {
     unsigned packet_token_accepts;
     unsigned dns_query_logs;
     unsigned dns_response_logs;
+    unsigned dns_retries_suppressed;
     unsigned reconnecting;
 } runner;
 
@@ -242,6 +246,16 @@ static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
                          endpoint == SIM_CLIENT ? 0x31u : 0xa7u,
                          endpoint == SIM_CLIENT ? 53000u : 53u,
                          endpoint == SIM_CLIENT ? 53u : 53000u);
+        if (endpoint != SIM_CLIENT) {
+            packet[12] = 1u;
+            packet[13] = 1u;
+            packet[14] = 1u;
+            packet[15] = 1u;
+            packet[16] = 10u;
+            packet[17] = 0u;
+            packet[18] = 0u;
+            packet[19] = 2u;
+        }
         dns = &packet[28];
         memset(dns, 0, 26u);
         dns[0] = 0x4du;
@@ -436,6 +450,16 @@ static void test_log(void *context, const char *message)
     if (strstr(message, "DNS response dns.test A") != NULL &&
         strstr(message, "rcode=0 answers=1") != NULL) {
         ++run->dns_response_logs;
+    }
+    {
+        const char *suppressed = strstr(message,
+                                        "dns-retries-suppressed=");
+        unsigned count;
+        if (suppressed != NULL &&
+            sscanf(suppressed + strlen("dns-retries-suppressed="),
+                   "%u", &count) == 1) {
+            run->dns_retries_suppressed = count;
+        }
     }
     if (run->options.role == UM_LIVE_CLIENT &&
         (strstr(message, "proxy token commit sequence=") != NULL ||
@@ -753,6 +777,7 @@ void um_network_close(um_network *network)
     (void)pthread_mutex_lock(&bus.mutex);
     bus.network_opened[network->endpoint] = 0;
     bus.network_input_ready[network->endpoint] = 0;
+    bus.network_dns_retry_ready[network->endpoint] = 0;
     bus.network_background_remaining[network->endpoint] = 0u;
     (void)pthread_cond_broadcast(&bus.changed);
     (void)pthread_mutex_unlock(&bus.mutex);
@@ -780,6 +805,7 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
     add_milliseconds(&deadline, timeout_ms);
     (void)pthread_mutex_lock(&bus.mutex);
     while (bus.network_input_ready[network->endpoint] == 0 &&
+           bus.network_dns_retry_ready[network->endpoint] == 0 &&
            bus.network_background_remaining[network->endpoint] == 0u &&
            bus.network_opened[network->endpoint] != 0 &&
            wait_status != ETIMEDOUT && timeout_ms != 0u) {
@@ -791,6 +817,7 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
         return UM_ERR_NETWORK;
     }
     if (bus.network_input_ready[network->endpoint] == 0 &&
+        bus.network_dns_retry_ready[network->endpoint] == 0 &&
         bus.network_background_remaining[network->endpoint] == 0u) {
         (void)pthread_mutex_unlock(&bus.mutex);
         return UM_ERR_TIMEOUT;
@@ -800,6 +827,10 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
         background_number =
             bus.network_background_remaining[network->endpoint];
         --bus.network_background_remaining[network->endpoint];
+    } else if (bus.network_dns_retry_ready[network->endpoint] != 0) {
+        bus.network_dns_retry_ready[network->endpoint] = 0;
+        ++bus.network_dns_retry_reads[network->endpoint];
+        target_index = 0u;
     } else {
         --bus.network_input_ready[network->endpoint];
         target_index = bus.network_targets_read[network->endpoint]++;
@@ -819,10 +850,6 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
                                                  : SIM_RESPONSE_BYTES;
         make_proxy_target(generated, length, network->endpoint,
                           target_index);
-        if (network->endpoint == SIM_GATEWAY && target_index == 0u) {
-            generated[10] ^= 0x01u;
-            generated[26] ^= 0x01u;
-        }
     }
     memcpy(packet, generated, length);
     *packet_length = length;
@@ -862,6 +889,8 @@ int um_network_write(um_network *network, const uint8_t *packet,
             if (target_index == 0u) {
                 bus.network_input_ready[SIM_CLIENT] +=
                     SIM_PROXY_PACKETS - 1u;
+                bus.network_dns_retry_ready[SIM_CLIENT] = 1;
+                ++bus.network_dns_retries_injected;
             }
         }
         (void)pthread_cond_broadcast(&bus.changed);
@@ -994,8 +1023,13 @@ static int run_pair(const char *label,
     bus.commit_drops = 0u;
     memset(bus.network_opened, 0, sizeof(bus.network_opened));
     memset(bus.network_input_ready, 0, sizeof(bus.network_input_ready));
+    memset(bus.network_dns_retry_ready, 0,
+           sizeof(bus.network_dns_retry_ready));
     memset(bus.network_background_remaining, 0,
            sizeof(bus.network_background_remaining));
+    memset(bus.network_dns_retry_reads, 0,
+           sizeof(bus.network_dns_retry_reads));
+    bus.network_dns_retries_injected = 0u;
     memset(bus.network_targets_read, 0, sizeof(bus.network_targets_read));
     memset(bus.network_reads, 0, sizeof(bus.network_reads));
     memset(bus.network_writes, 0, sizeof(bus.network_writes));
@@ -1069,13 +1103,16 @@ static int run_pair(const char *label,
          (bus.network_opened[SIM_CLIENT] != 0 ||
           bus.network_opened[SIM_GATEWAY] != 0 ||
           bus.network_reads[SIM_CLIENT] !=
-              SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS ||
+              SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS + 1u ||
           bus.network_reads[SIM_GATEWAY] !=
               SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS ||
           bus.network_writes[SIM_CLIENT] != SIM_PROXY_PACKETS ||
           bus.network_writes[SIM_GATEWAY] != SIM_PROXY_PACKETS ||
           bus.network_matches[SIM_CLIENT] != SIM_PROXY_PACKETS ||
-          bus.network_matches[SIM_GATEWAY] != SIM_PROXY_PACKETS)) ||
+          bus.network_matches[SIM_GATEWAY] != SIM_PROXY_PACKETS ||
+          bus.network_dns_retries_injected != 1u ||
+          bus.network_dns_retry_reads[SIM_CLIENT] != 1u ||
+          client.dns_retries_suppressed != 1u)) ||
         (inject_proxy_retry != 0 &&
          (bus.proxy_drops != 2u || bus.begin_ack_drops != 1u ||
           bus.commit_drops != 1u ||
