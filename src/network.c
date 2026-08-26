@@ -1167,15 +1167,56 @@ static int mac_configure_dns(um_network *network)
     return UM_OK;
 }
 
+static int mac_verify_capture_route(um_network *network,
+                                    const char *destination)
+{
+    const char *command[] = {
+        network->route_path, "-n", "get", destination, NULL
+    };
+    char output[2048];
+    char selected_interface[IFNAMSIZ];
+    char selected_gateway[64];
+    char *interface_line;
+    char *gateway_line;
+    int status = mac_run(network, command, output, sizeof(output));
+    if (status != UM_OK) {
+        return status;
+    }
+    interface_line = strstr(output, "interface:");
+    gateway_line = strstr(output, "gateway:");
+    if (interface_line == NULL || gateway_line == NULL ||
+        sscanf(interface_line + strlen("interface:"), "%15s",
+               selected_interface) != 1 ||
+        sscanf(gateway_line + strlen("gateway:"), "%63s",
+               selected_gateway) != 1) {
+        network_log(network, "Could not verify IPv4 capture route for %s",
+                    destination);
+        return UM_ERR_NETWORK;
+    }
+    if (strcmp(selected_interface, network->interface_name) != 0 ||
+        strcmp(selected_gateway, UM_TUN_GATEWAY_ADDRESS) != 0) {
+        network_log(network,
+                    "IPv4 capture route for %s selected gateway=%s "
+                    "interface=%s; expected gateway=%s interface=%s",
+                    destination, selected_gateway, selected_interface,
+                    UM_TUN_GATEWAY_ADDRESS, network->interface_name);
+        return UM_ERR_NETWORK;
+    }
+    network_log(network,
+                "IPv4 capture route verified: %s via %s on %s",
+                destination, selected_gateway, selected_interface);
+    return UM_OK;
+}
+
 static int mac_configure_client(um_network *network)
 {
     const char *low[] = {
-        network->route_path, "-n", "add", "-net", "0.0.0.0/1",
-        "-interface", network->interface_name, NULL
+        network->route_path, "-n", "add", "-inet", "-net",
+        "0.0.0.0/1", UM_TUN_GATEWAY_ADDRESS, NULL
     };
     const char *high[] = {
-        network->route_path, "-n", "add", "-net", "128.0.0.0/1",
-        "-interface", network->interface_name, NULL
+        network->route_path, "-n", "add", "-inet", "-net",
+        "128.0.0.0/1", UM_TUN_GATEWAY_ADDRESS, NULL
     };
     char output[768];
     int status = mac_run(network, low, output, sizeof(output));
@@ -1185,6 +1226,12 @@ static int mac_configure_client(um_network *network)
     }
     if (status == UM_OK) {
         network->route_high_added = 1;
+        status = mac_verify_capture_route(network, "1.1.1.1");
+    }
+    if (status == UM_OK) {
+        status = mac_verify_capture_route(network, "200.0.0.1");
+    }
+    if (status == UM_OK) {
         status = mac_configure_dns(network);
     }
     return status;
@@ -1234,12 +1281,12 @@ static void mac_cleanup(um_network *network)
     }
     if (network->role == UM_LIVE_CLIENT && network->route_path != NULL) {
         const char *high[] = {
-            network->route_path, "-n", "delete", "-net", "128.0.0.0/1",
-            "-interface", network->interface_name, NULL
+            network->route_path, "-n", "delete", "-inet", "-net",
+            "128.0.0.0/1", UM_TUN_GATEWAY_ADDRESS, NULL
         };
         const char *low[] = {
-            network->route_path, "-n", "delete", "-net", "0.0.0.0/1",
-            "-interface", network->interface_name, NULL
+            network->route_path, "-n", "delete", "-inet", "-net",
+            "0.0.0.0/1", UM_TUN_GATEWAY_ADDRESS, NULL
         };
         if (network->route_high_added != 0) {
             (void)mac_run(network, high, output, sizeof(output));
