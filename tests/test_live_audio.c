@@ -24,7 +24,11 @@ enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
 #define SIM_SMALL_TCP_BYTES 60u
 #define SIM_BACKGROUND_BYTES 64u
 #define SIM_BACKGROUND_PACKETS 16u
-#define SIM_FORWARDED_BACKGROUND_PACKETS (SIM_BACKGROUND_PACKETS - 1u)
+#define SIM_FILTERED_BACKGROUND_PACKETS 3u
+#define SIM_COALESCED_BACKGROUND_PACKETS 1u
+#define SIM_FORWARDED_BACKGROUND_PACKETS                              \
+    (SIM_BACKGROUND_PACKETS - SIM_FILTERED_BACKGROUND_PACKETS -      \
+     SIM_COALESCED_BACKGROUND_PACKETS)
 #define SIM_PROXY_PACKETS 10u
 #define SIM_FORWARDED_PACKETS \
     (SIM_PROXY_PACKETS + SIM_FORWARDED_BACKGROUND_PACKETS)
@@ -74,6 +78,7 @@ typedef struct {
     unsigned network_writes[SIM_ENDPOINTS];
     unsigned network_matches[SIM_ENDPOINTS];
     unsigned network_background_matches[SIM_ENDPOINTS];
+    uint32_t network_target_seen[SIM_ENDPOINTS];
     uint32_t network_background_seen[SIM_ENDPOINTS];
     int runners_done;
 } simulated_bus;
@@ -130,7 +135,12 @@ typedef struct {
     unsigned dns_retries_suppressed;
     unsigned dns_response_bursts;
     unsigned multicast_dropped;
+    unsigned broadcast_dropped;
+    unsigned stale_dns_icmp_dropped;
+    unsigned discovery_dns_deprioritized;
+    unsigned tcp_acks_coalesced;
     unsigned multi_packet_batches;
+    unsigned rate_breakdowns;
     unsigned body_stepdowns;
     unsigned reconnecting;
 } runner;
@@ -324,12 +334,154 @@ static size_t proxy_target_length(int endpoint, unsigned target_index)
     return SIM_SMALL_TCP_BYTES;
 }
 
+static size_t proxy_background_length(unsigned background_number)
+{
+    if (background_number == 14u) {
+        return 56u;
+    }
+    if (background_number == 13u || background_number == 12u) {
+        return 40u;
+    }
+    if (background_number == 11u) {
+        return 68u;
+    }
+    return SIM_BACKGROUND_BYTES;
+}
+
+static void make_stale_dns_icmp(uint8_t *packet, size_t length)
+{
+    uint8_t *quoted;
+    memset(packet, 0, length);
+    packet[0] = 0x45u;
+    packet[2] = (uint8_t)(length >> 8u);
+    packet[3] = (uint8_t)length;
+    packet[8] = 64u;
+    packet[9] = 1u;
+    packet[12] = 10u;
+    packet[13] = 77u;
+    packet[15] = 2u;
+    packet[16] = 1u;
+    packet[17] = 1u;
+    packet[18] = 1u;
+    packet[19] = 1u;
+    packet[20] = 3u;
+    packet[21] = 3u;
+    quoted = &packet[28];
+    quoted[0] = 0x45u;
+    quoted[2] = 0u;
+    quoted[3] = 48u;
+    quoted[8] = 64u;
+    quoted[9] = 17u;
+    quoted[12] = 1u;
+    quoted[13] = 1u;
+    quoted[14] = 1u;
+    quoted[15] = 1u;
+    quoted[16] = 10u;
+    quoted[17] = 77u;
+    quoted[19] = 2u;
+    quoted[20] = 0u;
+    quoted[21] = 53u;
+    quoted[22] = 0x9cu;
+    quoted[23] = 0x40u;
+    quoted[24] = 0u;
+    quoted[25] = 28u;
+    finalize_ipv4_checksums(packet, length);
+}
+
+static void make_coalescible_tcp_ack(uint8_t *packet, int endpoint,
+                                     unsigned background_number)
+{
+    make_ipv4_tcp_packet(packet, 40u, 0u,
+                         endpoint == SIM_CLIENT ? 51000u : 443u,
+                         endpoint == SIM_CLIENT ? 443u : 51000u);
+    if (endpoint == SIM_GATEWAY) {
+        packet[12] = 1u;
+        packet[13] = 1u;
+        packet[14] = 1u;
+        packet[15] = 1u;
+        packet[16] = 10u;
+        packet[17] = 0u;
+        packet[18] = 0u;
+        packet[19] = 2u;
+    }
+    packet[4] = 0u;
+    packet[5] = (uint8_t)background_number;
+    packet[31] = (uint8_t)(14u - background_number);
+    packet[33] = 0x10u;
+    finalize_ipv4_checksums(packet, 40u);
+}
+
+static void make_tunnel_discovery_dns(uint8_t *packet, int endpoint)
+{
+    uint8_t *dns;
+    make_ipv4_packet(packet, 68u, 0u,
+                     endpoint == SIM_CLIENT ? 52000u : 53u,
+                     endpoint == SIM_CLIENT ? 53u : 52000u);
+    if (endpoint == SIM_GATEWAY) {
+        packet[12] = 1u;
+        packet[13] = 1u;
+        packet[14] = 1u;
+        packet[15] = 1u;
+        packet[16] = 10u;
+        packet[17] = 77u;
+        packet[18] = 0u;
+        packet[19] = 2u;
+    }
+    dns = &packet[28];
+    memset(dns, 0, 40u);
+    dns[0] = 0x22u;
+    dns[1] = 0x11u;
+    dns[2] = endpoint == SIM_CLIENT ? 0x01u : 0x81u;
+    dns[3] = endpoint == SIM_CLIENT ? 0x00u : 0x83u;
+    dns[5] = 1u;
+    dns[12] = 1u;
+    dns[13] = '2';
+    dns[14] = 1u;
+    dns[15] = '0';
+    dns[16] = 2u;
+    dns[17] = '7';
+    dns[18] = '7';
+    dns[19] = 2u;
+    dns[20] = '1';
+    dns[21] = '0';
+    dns[22] = 7u;
+    memcpy(&dns[23], "in-addr", 7u);
+    dns[30] = 4u;
+    memcpy(&dns[31], "arpa", 4u);
+    dns[36] = 0u;
+    dns[37] = 12u;
+    dns[39] = 1u;
+    finalize_ipv4_checksums(packet, 68u);
+}
+
 static void make_proxy_background(uint8_t *packet, int endpoint,
                                   unsigned background_number)
 {
+    size_t length = proxy_background_length(background_number);
+    if (background_number == 15u) {
+        make_ipv4_packet(packet, length, 0x15u, 137u, 137u);
+        packet[16] = 10u;
+        packet[17] = 77u;
+        packet[18] = 0u;
+        packet[19] = 3u;
+        finalize_ipv4_checksums(packet, length);
+        return;
+    }
+    if (background_number == 14u) {
+        make_stale_dns_icmp(packet, length);
+        return;
+    }
+    if (background_number == 13u || background_number == 12u) {
+        make_coalescible_tcp_ack(packet, endpoint, background_number);
+        return;
+    }
+    if (background_number == 11u) {
+        make_tunnel_discovery_dns(packet, endpoint);
+        return;
+    }
     if (endpoint == SIM_GATEWAY) {
         uint8_t *dns;
-        make_ipv4_packet(packet, SIM_BACKGROUND_BYTES,
+        make_ipv4_packet(packet, length,
                          (uint8_t)(0x70u + background_number), 53u,
                          (uint16_t)(40000u + background_number));
         packet[12] = 1u;
@@ -341,7 +493,7 @@ static void make_proxy_background(uint8_t *packet, int endpoint,
         packet[18] = 0u;
         packet[19] = 2u;
         dns = &packet[28];
-        memset(dns, 0, SIM_BACKGROUND_BYTES - 28u);
+        memset(dns, 0, length - 28u);
         dns[0] = 0x70u;
         dns[1] = (uint8_t)background_number;
         dns[2] = 0x81u;
@@ -353,9 +505,9 @@ static void make_proxy_background(uint8_t *packet, int endpoint,
         memcpy(&dns[16], "test", 4u);
         dns[22] = 1u;
         dns[24] = 1u;
-        finalize_ipv4_checksums(packet, SIM_BACKGROUND_BYTES);
+        finalize_ipv4_checksums(packet, length);
     } else {
-        make_ipv4_packet(packet, SIM_BACKGROUND_BYTES,
+        make_ipv4_packet(packet, length,
                          (uint8_t)(0x40u + background_number),
                          (uint16_t)(40000u + background_number), 53u);
     }
@@ -364,7 +516,7 @@ static void make_proxy_background(uint8_t *packet, int endpoint,
         packet[17] = 0u;
         packet[18] = 0u;
         packet[19] = 251u;
-        finalize_ipv4_checksums(packet, SIM_BACKGROUND_BYTES);
+        finalize_ipv4_checksums(packet, length);
     }
 }
 
@@ -583,6 +735,49 @@ static void test_log(void *context, const char *message)
                    "%u", &count) == 1) {
             run->multicast_dropped = count;
         }
+    }
+    {
+        const char *dropped = strstr(message, "broadcast-dropped=");
+        unsigned count;
+        if (dropped != NULL &&
+            sscanf(dropped + strlen("broadcast-dropped="),
+                   "%u", &count) == 1) {
+            run->broadcast_dropped = count;
+        }
+    }
+    {
+        const char *dropped = strstr(message,
+                                     "stale-dns-icmp-dropped=");
+        unsigned count;
+        if (dropped != NULL &&
+            sscanf(dropped + strlen("stale-dns-icmp-dropped="),
+                   "%u", &count) == 1) {
+            run->stale_dns_icmp_dropped = count;
+        }
+    }
+    {
+        const char *deprioritized = strstr(
+            message, "discovery-dns-deprioritized=");
+        unsigned count;
+        if (deprioritized != NULL &&
+            sscanf(deprioritized +
+                       strlen("discovery-dns-deprioritized="),
+                   "%u", &count) == 1) {
+            run->discovery_dns_deprioritized = count;
+        }
+    }
+    {
+        const char *coalesced = strstr(message, "tcp-acks-coalesced=");
+        unsigned count;
+        if (coalesced != NULL &&
+            sscanf(coalesced + strlen("tcp-acks-coalesced="),
+                   "%u", &count) == 1) {
+            run->tcp_acks_coalesced = count;
+        }
+    }
+    if (strstr(message, "dns-rate=") != NULL &&
+        strstr(message, "non-dns-rate=") != NULL) {
+        ++run->rate_breakdowns;
     }
     if (run->options.role == UM_LIVE_CLIENT &&
         (strstr(message, "proxy token commit sequence=") != NULL ||
@@ -981,7 +1176,7 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
     (void)pthread_mutex_unlock(&bus.mutex);
 
     if (background != 0) {
-        length = SIM_BACKGROUND_BYTES;
+        length = proxy_background_length(background_number);
         make_proxy_background(generated, network->endpoint,
                               background_number);
     } else {
@@ -1005,8 +1200,9 @@ int um_network_write(um_network *network, const uint8_t *packet,
                      size_t packet_length, unsigned timeout_ms)
 {
     uint8_t expected[UM_NETWORK_MTU];
-    size_t expected_length;
+    size_t expected_length = 0u;
     unsigned target_index;
+    unsigned target_candidate;
     unsigned background_number;
     int source_endpoint;
     int target_matches;
@@ -1021,29 +1217,43 @@ int um_network_write(um_network *network, const uint8_t *packet,
         return UM_ERR_NETWORK;
     }
     ++bus.network_writes[network->endpoint];
-    target_index = bus.network_matches[network->endpoint];
+    target_index = 0u;
     source_endpoint = network->endpoint == SIM_GATEWAY ? SIM_CLIENT
                                                         : SIM_GATEWAY;
-    expected_length = proxy_target_length(
-        source_endpoint, target_index);
-    make_proxy_target(expected, expected_length, source_endpoint,
-                      target_index);
-    target_matches = target_index < SIM_PROXY_PACKETS &&
-                     packet_length == expected_length &&
-                     memcmp(packet, expected, expected_length) == 0;
+    target_matches = 0;
+    for (target_candidate = 0u;
+         target_candidate < SIM_PROXY_PACKETS; ++target_candidate) {
+        uint32_t bit = UINT32_C(1) << target_candidate;
+        if ((bus.network_target_seen[network->endpoint] & bit) != 0u) {
+            continue;
+        }
+        expected_length = proxy_target_length(source_endpoint,
+                                               target_candidate);
+        make_proxy_target(expected, expected_length, source_endpoint,
+                          target_candidate);
+        if (packet_length == expected_length &&
+            memcmp(packet, expected, expected_length) == 0) {
+            bus.network_target_seen[network->endpoint] |= bit;
+            target_index = target_candidate;
+            target_matches = 1;
+            break;
+        }
+    }
     if (target_matches == 0) {
         for (background_number = 1u;
              background_number < SIM_BACKGROUND_PACKETS;
              ++background_number) {
             uint32_t bit = UINT32_C(1) << background_number;
+            size_t background_length =
+                proxy_background_length(background_number);
             if ((bus.network_background_seen[network->endpoint] & bit) !=
                 0u) {
                 continue;
             }
             make_proxy_background(expected, source_endpoint,
                                   background_number);
-            if (packet_length == SIM_BACKGROUND_BYTES &&
-                memcmp(packet, expected, SIM_BACKGROUND_BYTES) == 0) {
+            if (packet_length == background_length &&
+                memcmp(packet, expected, background_length) == 0) {
                 bus.network_background_seen[network->endpoint] |= bit;
                 ++bus.network_background_matches[network->endpoint];
                 background_matches = 1;
@@ -1063,7 +1273,7 @@ int um_network_write(um_network *network, const uint8_t *packet,
             } else {
                 ++bus.network_input_ready[SIM_GATEWAY];
             }
-            if (target_index == 1u &&
+            if (target_index != 0u &&
                 bus.network_background_matches[SIM_GATEWAY] <
                     SIM_FORWARDED_BACKGROUND_PACKETS) {
                 bus.client_tcp_before_dns_drained = 1;
@@ -1225,6 +1435,8 @@ static int run_pair(const char *label,
     memset(bus.network_matches, 0, sizeof(bus.network_matches));
     memset(bus.network_background_matches, 0,
            sizeof(bus.network_background_matches));
+    memset(bus.network_target_seen, 0,
+           sizeof(bus.network_target_seen));
     memset(bus.network_background_seen, 0,
            sizeof(bus.network_background_seen));
     bus.runners_done = 0;
@@ -1313,7 +1525,17 @@ static int run_pair(const char *label,
           gateway.dns_response_bursts == 0u ||
           bus.client_tcp_before_dns_drained == 0 ||
           client.multicast_dropped != 1u ||
-          gateway.multicast_dropped != 1u)) ||
+          gateway.multicast_dropped != 1u ||
+          client.broadcast_dropped != 1u ||
+          gateway.broadcast_dropped != 1u ||
+          client.stale_dns_icmp_dropped != 1u ||
+          gateway.stale_dns_icmp_dropped != 1u ||
+          client.discovery_dns_deprioritized != 1u ||
+          gateway.discovery_dns_deprioritized != 1u ||
+          client.tcp_acks_coalesced != 1u ||
+          gateway.tcp_acks_coalesced != 1u ||
+          client.rate_breakdowns == 0u ||
+          gateway.rate_breakdowns == 0u)) ||
         (inject_proxy_retry != 0 &&
          (bus.proxy_drops != 2u || bus.begin_ack_drops != 1u ||
           bus.commit_drops != 1u ||

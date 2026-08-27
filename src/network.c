@@ -46,7 +46,6 @@
 #define UM_TUN_GATEWAY_ADDRESS "10.77.0.1"
 #define UM_TUN_CLIENT_ADDRESS "10.77.0.2"
 #define UM_DNS_PRIMARY "1.1.1.1"
-#define UM_DNS_SECONDARY "8.8.8.8"
 
 #if defined(__APPLE__)
 /* XNU otherwise permits only one packet to wait on the utun control socket.
@@ -606,7 +605,7 @@ static int linux_configure_dns(um_network *network)
 {
     const char *dns[] = {
         network->resolvectl_path, "dns", network->interface_name,
-        UM_DNS_PRIMARY, UM_DNS_SECONDARY, NULL
+        UM_DNS_PRIMARY, NULL
     };
     const char *domain[] = {
         network->resolvectl_path, "domain", network->interface_name, "~.",
@@ -637,8 +636,8 @@ static int linux_configure_dns(um_network *network)
                     "configuration");
         return UM_OK;
     }
-    network_log(network, "DNS routed through %s using %s and %s",
-                network->interface_name, UM_DNS_PRIMARY, UM_DNS_SECONDARY);
+    network_log(network, "DNS routed through %s using %s",
+                network->interface_name, UM_DNS_PRIMARY);
     return UM_OK;
 }
 
@@ -1024,7 +1023,7 @@ static int mac_configure_dns(um_network *network)
     CFMutableDictionaryRef ipv4_dictionary = NULL;
     CFStringRef interface = NULL;
     CFStringRef service_id = NULL;
-    CFStringRef servers[2] = {CFSTR("1.1.1.1"), CFSTR("8.8.8.8")};
+    CFStringRef servers[1] = {CFSTR("1.1.1.1")};
     CFStringRef domains[1] = {CFSTR("")};
     CFStringRef addresses[1] = {CFSTR("10.77.0.2")};
     CFStringRef subnet_masks[1] = {CFSTR("255.255.255.252")};
@@ -1064,7 +1063,7 @@ static int mac_configure_dns(um_network *network)
     ipv4_dictionary = CFDictionaryCreateMutable(
         NULL, 0u, &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks);
-    server_array = CFArrayCreate(NULL, (const void **)servers, 2u,
+    server_array = CFArrayCreate(NULL, (const void **)servers, 1u,
                                  &kCFTypeArrayCallBacks);
     domain_array = CFArrayCreate(NULL, (const void **)domains, 1u,
                                  &kCFTypeArrayCallBacks);
@@ -1179,11 +1178,10 @@ static int mac_configure_dns(um_network *network)
     }
     network_log(network,
                 "Published IPv4 service state and catch-all DNS on %s "
-                "using %s and %s "
+                "using %s "
                 "timeout=%ds/server; "
                 "verify 'Request A records' with 'scutil --dns'",
-                network->interface_name, UM_DNS_PRIMARY,
-                UM_DNS_SECONDARY, timeout_value);
+                network->interface_name, UM_DNS_PRIMARY, timeout_value);
     return UM_OK;
 }
 

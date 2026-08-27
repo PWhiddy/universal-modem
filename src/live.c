@@ -43,6 +43,7 @@
 #define LIVE_PROXY_DNS_RETRY_SUPPRESS_MS 30000u
 #define LIVE_PROXY_DNS_INFLIGHT_SUPPRESS_MS 15000u
 #define LIVE_PROXY_DNS_QUEUE_LIMIT 48u
+#define LIVE_PROXY_DISCOVERY_DNS_QUEUE_LIMIT 4u
 #define LIVE_PROXY_DNS_BURST_PACKETS 3u
 #define LIVE_PROXY_INGRESS_DRAIN_LIMIT 512u
 #define LIVE_PROXY_IDLE_MS 350u
@@ -68,7 +69,6 @@ typedef struct {
 
 typedef struct {
     uint32_t client_address;
-    uint32_t server_address;
     uint32_t question_hash;
     uint16_t client_port;
     uint16_t transaction_id;
@@ -127,6 +127,8 @@ typedef struct {
     size_t batches_received;
     size_t bytes_sent;
     size_t bytes_received;
+    size_t dns_bytes_sent;
+    size_t dns_bytes_received;
     live_proxy_queued_packet queue[LIVE_PROXY_QUEUE_PACKETS];
     live_proxy_recent_dns recent_dns[LIVE_PROXY_RECENT_DNS];
     live_proxy_inflight_dns inflight_dns[LIVE_PROXY_INFLIGHT_DNS];
@@ -135,11 +137,21 @@ typedef struct {
     size_t queue_duplicates;
     size_t dns_retries_suppressed;
     size_t multicast_dropped;
+    size_t broadcast_dropped;
+    size_t stale_dns_icmp_dropped;
+    size_t discovery_dns_deprioritized;
+    size_t discovery_dns_dropped;
+    size_t tcp_acks_coalesced;
     size_t queue_priority_evictions;
     size_t queue_logged_dropped;
     size_t queue_logged_duplicates;
     size_t dns_retries_logged_suppressed;
     size_t multicast_logged_dropped;
+    size_t broadcast_logged_dropped;
+    size_t stale_dns_icmp_logged_dropped;
+    size_t discovery_dns_logged_deprioritized;
+    size_t discovery_dns_logged_dropped;
+    size_t tcp_acks_logged_coalesced;
     size_t queue_logged_priority_evictions;
     size_t consecutive_dns_sent;
     uint64_t started_ms;
@@ -160,6 +172,8 @@ static volatile sig_atomic_t live_interrupted = 0;
 
 static int fatal_live_status(int status);
 static const char *direction_label(unsigned direction);
+static int proxy_packet_is_tunnel_discovery_dns(const uint8_t *packet,
+                                                size_t length);
 
 static void handle_signal(int signal_number)
 {
@@ -2067,6 +2081,134 @@ static int validate_ip_packet(const uint8_t *packet, size_t length)
     return UM_ERR_HEADER;
 }
 
+static int proxy_packet_is_dns_traffic(const uint8_t *packet, size_t length)
+{
+    size_t transport_offset;
+    unsigned protocol;
+    if (validate_ip_packet(packet, length) != UM_OK) {
+        return 0;
+    }
+    if ((packet[0] >> 4u) == 4u) {
+        transport_offset = (size_t)(packet[0] & 0x0fu) * 4u;
+        protocol = packet[9];
+        if ((read_u16(&packet[6]) & UINT16_C(0x1fff)) != 0u) {
+            return 0;
+        }
+    } else {
+        transport_offset = 40u;
+        protocol = packet[6];
+    }
+    return (protocol == 6u || protocol == 17u) &&
+           transport_offset + 4u <= length &&
+           (read_u16(&packet[transport_offset]) == 53u ||
+            read_u16(&packet[transport_offset + 2u]) == 53u);
+}
+
+static int proxy_packet_is_tunnel_broadcast(const uint8_t *packet,
+                                            size_t length)
+{
+    static const uint8_t subnet_broadcast[4] = {10u, 77u, 0u, 3u};
+    static const uint8_t limited_broadcast[4] = {255u, 255u, 255u, 255u};
+    return validate_ip_packet(packet, length) == UM_OK &&
+           (packet[0] >> 4u) == 4u &&
+           (memcmp(&packet[16], subnet_broadcast,
+                   sizeof(subnet_broadcast)) == 0 ||
+            memcmp(&packet[16], limited_broadcast,
+                   sizeof(limited_broadcast)) == 0);
+}
+
+static int proxy_packet_is_stale_dns_icmp(const uint8_t *packet,
+                                          size_t length)
+{
+    size_t header_length;
+    size_t quoted_offset;
+    size_t quoted_header_length;
+    if (validate_ip_packet(packet, length) != UM_OK ||
+        (packet[0] >> 4u) != 4u || packet[9] != 1u) {
+        return 0;
+    }
+    header_length = (size_t)(packet[0] & 0x0fu) * 4u;
+    quoted_offset = header_length + 8u;
+    if (quoted_offset + 28u > length || packet[header_length] != 3u ||
+        packet[header_length + 1u] != 3u ||
+        (packet[quoted_offset] >> 4u) != 4u ||
+        packet[quoted_offset + 9u] != 17u) {
+        return 0;
+    }
+    quoted_header_length =
+        (size_t)(packet[quoted_offset] & 0x0fu) * 4u;
+    return quoted_header_length >= 20u &&
+           quoted_offset + quoted_header_length + 8u <= length &&
+           read_u16(&packet[quoted_offset + quoted_header_length]) == 53u;
+}
+
+static int tcp_ack_options_are_replaceable(const uint8_t *tcp,
+                                           size_t header_length)
+{
+    size_t offset = 20u;
+    while (offset < header_length) {
+        unsigned kind = tcp[offset];
+        size_t option_length;
+        if (kind == 0u) {
+            return 1;
+        }
+        if (kind == 1u) {
+            ++offset;
+            continue;
+        }
+        if (offset + 2u > header_length) {
+            return 0;
+        }
+        option_length = tcp[offset + 1u];
+        if (option_length < 2u || option_length > header_length - offset ||
+            kind != 8u || option_length != 10u) {
+            return 0;
+        }
+        offset += option_length;
+    }
+    return 1;
+}
+
+static int tcp_ack_supersedes(const uint8_t *new_packet, size_t new_length,
+                              const uint8_t *old_packet, size_t old_length)
+{
+    const uint8_t *new_tcp;
+    const uint8_t *old_tcp;
+    size_t new_tcp_header;
+    size_t old_tcp_header;
+    uint32_t acknowledgement_delta;
+    if (validate_ip_packet(new_packet, new_length) != UM_OK ||
+        validate_ip_packet(old_packet, old_length) != UM_OK ||
+        (new_packet[0] >> 4u) != 4u ||
+        (old_packet[0] >> 4u) != 4u ||
+        (new_packet[0] & 0x0fu) != 5u ||
+        (old_packet[0] & 0x0fu) != 5u || new_packet[9] != 6u ||
+        old_packet[9] != 6u ||
+        (read_u16(&new_packet[6]) & UINT16_C(0x3fff)) != 0u ||
+        (read_u16(&old_packet[6]) & UINT16_C(0x3fff)) != 0u ||
+        memcmp(&new_packet[12], &old_packet[12], 8u) != 0) {
+        return 0;
+    }
+    new_tcp = &new_packet[20];
+    old_tcp = &old_packet[20];
+    if (new_length < 40u || old_length < 40u ||
+        memcmp(new_tcp, old_tcp, 8u) != 0 ||
+        new_tcp[13] != 0x10u || old_tcp[13] != 0x10u) {
+        return 0;
+    }
+    new_tcp_header = (size_t)(new_tcp[12] >> 4u) * 4u;
+    old_tcp_header = (size_t)(old_tcp[12] >> 4u) * 4u;
+    if (new_tcp_header < 20u || old_tcp_header < 20u ||
+        20u + new_tcp_header != new_length ||
+        20u + old_tcp_header != old_length ||
+        tcp_ack_options_are_replaceable(new_tcp, new_tcp_header) == 0 ||
+        tcp_ack_options_are_replaceable(old_tcp, old_tcp_header) == 0) {
+        return 0;
+    }
+    acknowledgement_delta = read_u32(&new_tcp[8]) - read_u32(&old_tcp[8]);
+    return acknowledgement_delta <= UINT32_C(0x7fffffff);
+}
+
 static unsigned proxy_packet_priority(const uint8_t *packet, size_t length)
 {
     size_t transport_offset;
@@ -2094,7 +2236,9 @@ static unsigned proxy_packet_priority(const uint8_t *packet, size_t length)
         source_port = read_u16(&packet[transport_offset]);
         destination_port = read_u16(&packet[transport_offset + 2u]);
         if (source_port == 53u || destination_port == 53u) {
-            return LIVE_PROXY_PRIORITY_DNS;
+            return proxy_packet_is_tunnel_discovery_dns(packet, length) != 0
+                       ? LIVE_PROXY_PRIORITY_NORMAL
+                       : LIVE_PROXY_PRIORITY_DNS;
         }
     }
     if (protocol == 1u || protocol == 58u) {
@@ -2208,6 +2352,65 @@ static int read_dns_name(const uint8_t *dns, size_t dns_length,
     return 0;
 }
 
+static int text_has_case_insensitive_suffix(const char *text,
+                                            const char *suffix)
+{
+    size_t text_length = strlen(text);
+    size_t suffix_length = strlen(suffix);
+    size_t index;
+    if (suffix_length > text_length) {
+        return 0;
+    }
+    text += text_length - suffix_length;
+    for (index = 0u; index < suffix_length; ++index) {
+        if (tolower((unsigned char)text[index]) !=
+            tolower((unsigned char)suffix[index])) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int proxy_packet_is_tunnel_discovery_dns(const uint8_t *packet,
+                                                size_t length)
+{
+    const uint8_t *dns;
+    size_t header_length;
+    size_t dns_length;
+    size_t question_end = 0u;
+    uint16_t source_port;
+    uint16_t destination_port;
+    uint16_t udp_length;
+    char name[96];
+    if (validate_ip_packet(packet, length) != UM_OK ||
+        (packet[0] >> 4u) != 4u || packet[9] != 17u ||
+        (read_u16(&packet[6]) & UINT16_C(0x3fff)) != 0u) {
+        return 0;
+    }
+    header_length = (size_t)(packet[0] & 0x0fu) * 4u;
+    if (header_length + 20u > length) {
+        return 0;
+    }
+    source_port = read_u16(&packet[header_length]);
+    destination_port = read_u16(&packet[header_length + 2u]);
+    udp_length = read_u16(&packet[header_length + 4u]);
+    if ((source_port != 53u && destination_port != 53u) ||
+        udp_length != length - header_length || udp_length < 20u) {
+        return 0;
+    }
+    dns = &packet[header_length + 8u];
+    dns_length = udp_length - 8u;
+    if (read_u16(&dns[4]) == 0u ||
+        read_dns_name(dns, dns_length, 12u, name, sizeof(name),
+                      &question_end) == 0 ||
+        question_end + 4u > dns_length ||
+        read_u16(&dns[question_end]) != 12u) {
+        return 0;
+    }
+    return text_has_case_insensitive_suffix(
+        name, ".0.77.10.in-addr.arpa");
+}
+
 static uint32_t dns_name_hash(const char *name)
 {
     uint32_t hash = UINT32_C(2166136261);
@@ -2262,7 +2465,6 @@ static int dns_packet_key(const uint8_t *packet, size_t length,
         return 0;
     }
     key->client_address = read_u32(&packet[response != 0 ? 16u : 12u]);
-    key->server_address = read_u32(&packet[response != 0 ? 12u : 16u]);
     key->question_hash = dns_name_hash(name);
     key->client_port = response != 0 ? destination_port : source_port;
     key->transaction_id = read_u16(dns);
@@ -2677,6 +2879,7 @@ static int enqueue_proxy_packet(live_proxy_state *state,
 {
     unsigned priority;
     size_t queued_dns = 0u;
+    size_t queued_discovery_dns = 0u;
     size_t index;
     if (validate_ip_packet(packet, packet_length) != UM_OK) {
         return UM_ERR_HEADER;
@@ -2689,6 +2892,21 @@ static int enqueue_proxy_packet(live_proxy_state *state,
         ++state->multicast_dropped;
         return UM_OK;
     }
+    /* The peer address space is a /30, making 10.77.0.3 its directed
+     * broadcast address. Neither it nor 255.255.255.255 can be forwarded by
+     * the gateway; dropping them here prevents NetBIOS and similar discovery
+     * retries from consuming acoustic frames. */
+    if (proxy_packet_is_tunnel_broadcast(packet, packet_length) != 0) {
+        ++state->broadcast_dropped;
+        return UM_OK;
+    }
+    /* A UDP port-unreachable quoting a DNS response is only notice that the
+     * local resolver already closed its socket. Recursive DNS is stateless,
+     * so relaying that ICMP packet cannot recover anything. */
+    if (proxy_packet_is_stale_dns_icmp(packet, packet_length) != 0) {
+        ++state->stale_dns_icmp_dropped;
+        return UM_OK;
+    }
     if (dns_query_recently_completed(state, packet, packet_length) != 0) {
         ++state->dns_retries_suppressed;
         return UM_OK;
@@ -2698,14 +2916,43 @@ static int enqueue_proxy_packet(live_proxy_state *state,
         ++state->dns_retries_suppressed;
         return UM_OK;
     }
+    priority = proxy_packet_priority(packet, packet_length);
     for (index = 0u; index < state->queue_count; ++index) {
         if (state->queue[index].length == packet_length &&
             memcmp(state->queue[index].packet, packet, packet_length) == 0) {
             ++state->queue_duplicates;
             return UM_OK;
         }
+        /* Unsent cumulative ACKs for the same TCP flow can be replaced by a
+         * newer ACK with the same sequence number. This is deliberately
+         * limited to payload-free ACK-only packets with no SACK or unknown
+         * options; SYN/FIN/RST, data, and already-transmitted ACKs are never
+         * coalesced. */
+        if (tcp_ack_supersedes(packet, packet_length,
+                               state->queue[index].packet,
+                               state->queue[index].length) != 0) {
+            state->queue[index].length = packet_length;
+            state->queue[index].priority = priority;
+            memcpy(state->queue[index].packet, packet, packet_length);
+            ++state->tcp_acks_coalesced;
+            return UM_OK;
+        }
     }
-    priority = proxy_packet_priority(packet, packet_length);
+    if (proxy_packet_is_tunnel_discovery_dns(packet, packet_length) != 0) {
+        for (index = 0u; index < state->queue_count; ++index) {
+            if (proxy_packet_is_tunnel_discovery_dns(
+                    state->queue[index].packet,
+                    state->queue[index].length) != 0) {
+                ++queued_discovery_dns;
+            }
+        }
+        if (queued_discovery_dns >=
+            LIVE_PROXY_DISCOVERY_DNS_QUEUE_LIMIT) {
+            ++state->discovery_dns_dropped;
+            return UM_OK;
+        }
+        ++state->discovery_dns_deprioritized;
+    }
     if (priority == LIVE_PROXY_PRIORITY_DNS) {
         /* Keep part of the bounded queue available for traffic that must
          * follow resolution (notably TCP), even during an OS DNS burst. */
@@ -2773,22 +3020,47 @@ static int drain_proxy_ingress(live_context *context,
         state->dns_retries_suppressed !=
             state->dns_retries_logged_suppressed ||
         state->multicast_dropped != state->multicast_logged_dropped ||
+        state->broadcast_dropped != state->broadcast_logged_dropped ||
+        state->stale_dns_icmp_dropped !=
+            state->stale_dns_icmp_logged_dropped ||
+        state->discovery_dns_deprioritized !=
+            state->discovery_dns_logged_deprioritized ||
+        state->discovery_dns_dropped !=
+            state->discovery_dns_logged_dropped ||
+        state->tcp_acks_coalesced != state->tcp_acks_logged_coalesced ||
         state->queue_priority_evictions !=
             state->queue_logged_priority_evictions) {
         live_log(context,
                  "proxy ingress queue pending=%zu dropped=%zu "
                  "duplicates=%zu dns-retries-suppressed=%zu "
-                 "multicast-dropped=%zu priority-evictions=%zu",
+                 "multicast-dropped=%zu broadcast-dropped=%zu "
+                 "stale-dns-icmp-dropped=%zu "
+                 "discovery-dns-deprioritized=%zu "
+                 "discovery-dns-dropped=%zu tcp-acks-coalesced=%zu "
+                 "priority-evictions=%zu",
                  state->queue_count, state->queue_dropped,
                  state->queue_duplicates,
                  state->dns_retries_suppressed,
                  state->multicast_dropped,
+                 state->broadcast_dropped,
+                 state->stale_dns_icmp_dropped,
+                 state->discovery_dns_deprioritized,
+                 state->discovery_dns_dropped,
+                 state->tcp_acks_coalesced,
                  state->queue_priority_evictions);
         state->queue_logged_dropped = state->queue_dropped;
         state->queue_logged_duplicates = state->queue_duplicates;
         state->dns_retries_logged_suppressed =
             state->dns_retries_suppressed;
         state->multicast_logged_dropped = state->multicast_dropped;
+        state->broadcast_logged_dropped = state->broadcast_dropped;
+        state->stale_dns_icmp_logged_dropped =
+            state->stale_dns_icmp_dropped;
+        state->discovery_dns_logged_deprioritized =
+            state->discovery_dns_deprioritized;
+        state->discovery_dns_logged_dropped =
+            state->discovery_dns_dropped;
+        state->tcp_acks_logged_coalesced = state->tcp_acks_coalesced;
         state->queue_logged_priority_evictions =
             state->queue_priority_evictions;
     }
@@ -2923,17 +3195,24 @@ static void log_proxy_packet(live_context *context,
                      1000.0;
     size_t bytes = transmitted != 0 ? state->bytes_sent
                                     : state->bytes_received;
+    size_t dns_bytes = transmitted != 0 ? state->dns_bytes_sent
+                                        : state->dns_bytes_received;
     describe_proxy_packet(packet, packet_length, description,
                           sizeof(description));
     live_log(context,
              "proxy %s packet=%u traffic=%s bytes=%zu fragments=%zu "
-             "total-packets=%zu total-bytes=%zu rate=%.0fbps",
+             "total-packets=%zu total-bytes=%zu rate=%.0fbps "
+             "dns-rate=%.0fbps non-dns-rate=%.0fbps",
              transmitted != 0 ? proxy_transmit_label(context)
                               : proxy_receive_label(context),
              packet_id, description, packet_length, fragments,
              transmitted != 0 ? state->packets_sent
                               : state->packets_received,
-             bytes, seconds > 0.0 ? (double)(bytes * 8u) / seconds : 0.0);
+             bytes, seconds > 0.0 ? (double)(bytes * 8u) / seconds : 0.0,
+             seconds > 0.0 ? (double)(dns_bytes * 8u) / seconds : 0.0,
+             seconds > 0.0
+                 ? (double)((bytes - dns_bytes) * 8u) / seconds
+                 : 0.0);
 }
 
 static int inspect_proxy_batch(const uint8_t *body, size_t body_length,
@@ -2978,14 +3257,38 @@ static void account_transmitted_packet_priority(live_proxy_state *state,
                                                 const uint8_t *packet,
                                                 size_t packet_length)
 {
+    live_proxy_dns_key query;
+    if (dns_packet_key(packet, packet_length, 0, &query) != 0) {
+        remember_inflight_dns(state, packet, packet_length);
+    }
     if (proxy_packet_priority(packet, packet_length) ==
         LIVE_PROXY_PRIORITY_DNS) {
         if (state->consecutive_dns_sent != SIZE_MAX) {
             ++state->consecutive_dns_sent;
         }
-        remember_inflight_dns(state, packet, packet_length);
     } else {
         state->consecutive_dns_sent = 0u;
+    }
+}
+
+static void account_proxy_packet_bytes(live_proxy_state *state,
+                                       int transmitted,
+                                       const uint8_t *packet,
+                                       size_t packet_length)
+{
+    int dns = proxy_packet_is_dns_traffic(packet, packet_length);
+    if (transmitted != 0) {
+        ++state->packets_sent;
+        state->bytes_sent += packet_length;
+        if (dns != 0) {
+            state->dns_bytes_sent += packet_length;
+        }
+    } else {
+        ++state->packets_received;
+        state->bytes_received += packet_length;
+        if (dns != 0) {
+            state->dns_bytes_received += packet_length;
+        }
     }
 }
 
@@ -3020,14 +3323,14 @@ static void account_proxy_batch(live_context *context,
         if (transmitted != 0) {
             account_transmitted_packet_priority(state, &body[offset],
                                                 packet_length);
-            ++state->packets_sent;
-            state->bytes_sent += packet_length;
+            account_proxy_packet_bytes(state, 1, &body[offset],
+                                       packet_length);
             log_proxy_packet(context, state, 1,
                              (uint32_t)state->packets_sent, packet_length,
                              1u, &body[offset]);
         } else {
-            ++state->packets_received;
-            state->bytes_received += packet_length;
+            account_proxy_packet_bytes(state, 0, &body[offset],
+                                       packet_length);
             log_proxy_packet(context, state, 0,
                              (uint32_t)state->packets_received,
                              packet_length, 1u, &body[offset]);
@@ -3132,8 +3435,7 @@ static int send_proxy_packet(live_context *context, live_proxy_state *state,
             state->transmit_sequence = (uint16_t)(final_sequence + 1u);
             account_transmitted_packet_priority(state, packet,
                                                 packet_length);
-            ++state->packets_sent;
-            state->bytes_sent += packet_length;
+            account_proxy_packet_bytes(state, 1, packet, packet_length);
             log_proxy_packet(context, state, 1, packet_id, packet_length,
                              fragments, packet);
             if (yield_token != 0) {
@@ -3364,8 +3666,8 @@ static int receive_proxy_fragment(live_context *context,
             }
             remember_completed_dns(state, state->receive_packet,
                                    completed_length);
-            ++state->packets_received;
-            state->bytes_received += completed_length;
+            account_proxy_packet_bytes(state, 0, state->receive_packet,
+                                       completed_length);
             log_proxy_packet(context, state, 0, state->receive_packet_id,
                              completed_length, completed_fragments,
                              state->receive_packet);
