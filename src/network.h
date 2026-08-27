@@ -6,7 +6,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define UM_NETWORK_MTU 1500u
+#define UM_NETWORK_MTU 576u
 #define UM_NETWORK_MAX_PACKET 2048u
 
 typedef struct um_network um_network;

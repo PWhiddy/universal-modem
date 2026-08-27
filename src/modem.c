@@ -1185,6 +1185,7 @@ int um_demodulate_frame(const um_modem_config *config,
         payload == NULL || payload_length == NULL || sequence == NULL) {
         return UM_ERR_ARGUMENT;
     }
+    *payload_length = 0u;
     if (metrics != NULL) {
         memset(metrics, 0, sizeof(*metrics));
     }
@@ -1349,14 +1350,11 @@ int um_demodulate_frame(const um_modem_config *config,
     if (status != UM_OK) {
         goto done;
     }
-    /* Preserve the decoded length on a payload CRC failure.  Live framing
-     * can then validate any envelope that still decoded coherently and
-     * request an immediate retry without delivering the damaged payload. */
-    *payload_length = decoded_length;
     if (um_crc32(payload, decoded_length) != expected_crc) {
         status = UM_ERR_CRC;
         goto done;
     }
+    *payload_length = decoded_length;
     status = UM_OK;
 
 done:

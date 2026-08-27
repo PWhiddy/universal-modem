@@ -21,9 +21,9 @@
 #define UM_MAX_PAYLOAD 65535u
 #define UM_CALIBRATION_SEARCH_MAX_NODES 512u
 #define UM_CALIBRATION_PROBE_BYTES 128u
-#define UM_LIVE_PROTOCOL_VERSION 5u
+#define UM_LIVE_PROTOCOL_VERSION 6u
 #define UM_LIVE_CONFIG_FORMAT_VERSION 2u
-#define UM_LIVE_PROXY_FORMAT_VERSION 5u
+#define UM_LIVE_PROXY_FORMAT_VERSION 6u
 #define UM_LIVE_HANDSHAKE_BYTES 5u
 
 typedef enum {
@@ -160,5 +160,7 @@ int um_calibration_config_save(const char *path, um_live_role role,
 const char *um_calibration_step_name(um_calibration_step step);
 float um_calibration_payload_rate(const um_modem_config *config,
                                   size_t payload_bytes);
+int um_calibration_guard_config(const um_modem_config *measured,
+                                um_modem_config *guarded);
 
 #endif

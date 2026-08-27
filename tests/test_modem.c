@@ -976,11 +976,7 @@ static void test_live_wire_protocol(void)
                               wire, sizeof(wire), &wire_length) == UM_OK);
     CHECK(um_live_wire_decode(wire, wire_length, &message) == UM_OK);
     CHECK(message.type == UM_WIRE_IP_WINDOW);
-    CHECK(um_live_wire_encode(UM_WIRE_IP_NACK, 3u, 4u, body, 4u,
-                              wire, sizeof(wire), &wire_length) == UM_OK);
-    CHECK(um_live_wire_decode(wire, wire_length, &message) == UM_OK);
-    CHECK(message.type == UM_WIRE_IP_NACK);
-    CHECK(um_live_wire_encode((um_live_wire_type)29, 0u, 0u, NULL, 0u,
+    CHECK(um_live_wire_encode((um_live_wire_type)26, 0u, 0u, NULL, 0u,
                               wire, sizeof(wire), &wire_length) ==
           UM_ERR_ARGUMENT);
 
@@ -1114,6 +1110,50 @@ static void test_calibration_config_file(void)
                                      &loaded_body_bytes, &found) ==
           UM_ERR_CONFIG);
     CHECK(remove(path) == 0);
+}
+
+static void test_calibration_safety_guard(void)
+{
+    um_modem_config frontier = um_modem_default_config();
+    um_modem_config guarded;
+    ++tests_run;
+
+    frontier.first_bin = 32u;
+    frontier.last_bin = 896u;
+    frontier.cyclic_prefix = 64u;
+    frontier.window_samples = 32u;
+    frontier.sync_samples = 512u;
+    frontier.sync_gap = 512u;
+    frontier.training_symbols = 2u;
+    frontier.qam_bits = 6u;
+    frontier.fec_rate = UM_FEC_RATE_3_4;
+    CHECK(um_calibration_guard_config(&frontier, &guarded) == UM_OK);
+    CHECK(guarded.qam_bits == 4u);
+    CHECK(guarded.fec_rate == UM_FEC_RATE_2_3);
+    CHECK(guarded.first_bin == 48u);
+    CHECK(guarded.last_bin == 768u);
+    CHECK(guarded.cyclic_prefix == 1024u);
+    CHECK(guarded.window_samples == 64u);
+    CHECK(guarded.sync_samples == 1536u);
+    CHECK(guarded.sync_gap == 2048u);
+    CHECK(guarded.training_symbols == 3u);
+    CHECK(um_calibration_payload_rate(&guarded, UM_LIVE_MAX_BODY) <
+          um_calibration_payload_rate(&frontier, UM_LIVE_MAX_BODY));
+
+    frontier = um_modem_default_config();
+    frontier.qam_bits = 4u;
+    frontier.fec_rate = UM_FEC_RATE_3_4;
+    CHECK(um_calibration_guard_config(&frontier, &guarded) == UM_OK);
+    CHECK(guarded.qam_bits == 2u);
+    CHECK(guarded.fec_rate == UM_FEC_RATE_2_3);
+
+    frontier = um_modem_robust_config();
+    CHECK(um_calibration_guard_config(&frontier, &guarded) == UM_OK);
+    CHECK(guarded.qam_bits == frontier.qam_bits);
+    CHECK(guarded.fec_rate == frontier.fec_rate);
+    CHECK(guarded.symbol_repetitions == frontier.symbol_repetitions);
+    CHECK(um_calibration_guard_config(NULL, &guarded) == UM_ERR_ARGUMENT);
+    CHECK(um_calibration_guard_config(&frontier, NULL) == UM_ERR_ARGUMENT);
 }
 
 static void test_adaptive_calibration_search(void)
@@ -1606,6 +1646,7 @@ int main(void)
     test_async_session_distortion_ladder();
     test_live_wire_protocol();
     test_calibration_config_file();
+    test_calibration_safety_guard();
     test_adaptive_calibration_search();
 
     if (failures != 0) {

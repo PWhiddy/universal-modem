@@ -21,8 +21,8 @@
 #define LIVE_TURNAROUND_MS 80u
 #define LIVE_CALIBRATION_SETTLE_MS 160u
 #define LIVE_RECEIVER_ARM_MS 120u
-#define LIVE_VERIFY_TRIALS_DEFAULT 4u
-#define LIVE_VERIFY_TRIALS_HIGH 7u
+#define LIVE_VERIFY_TRIALS_DEFAULT 3u
+#define LIVE_VERIFY_TRIALS_HIGH 4u
 #define LIVE_CALIBRATION_RANKS 5u
 #define LIVE_CALIB_BEGIN_BYTES 6u
 #define LIVE_CALIB_SIZE_RESULT_BYTES 3u
@@ -31,18 +31,15 @@
 #define LIVE_READY_BYTES (3u + LIVE_CONFIG_BYTES)
 #define LIVE_REPORT_ENTRY_BYTES (2u + LIVE_CONFIG_BYTES)
 #define LIVE_CACHE_BODY_BYTES (1u + LIVE_CONFIG_BYTES + 2u)
-#define LIVE_PROXY_FRAGMENT_HEADER_BYTES 8u
 #define LIVE_PROXY_BATCH_HEADER_BYTES 6u
 #define LIVE_PROXY_BATCH_ENTRY_BYTES 2u
-#define LIVE_PROXY_ACK_BYTES 5u
 #define LIVE_PROXY_WINDOW_HEADER_BYTES 10u
 #define LIVE_PROXY_WINDOW_ACK_BYTES 7u
-#define LIVE_PROXY_WINDOW_MAX_CELLS 8u
+#define LIVE_PROXY_WINDOW_MAX_CELLS 5u
 #define LIVE_PROXY_WINDOW_MAX_BYTES                                      \
     (LIVE_PROXY_WINDOW_MAX_CELLS *                                      \
      (UM_LIVE_MAX_BODY - LIVE_PROXY_WINDOW_HEADER_BYTES))
 #define LIVE_PROXY_BEGIN_BYTES 7u
-#define LIVE_PROXY_BURST_PACKETS 4u
 #define LIVE_PROXY_QUEUE_PACKETS 64u
 #define LIVE_PROXY_RECENT_DNS 64u
 #define LIVE_PROXY_INFLIGHT_DNS 64u
@@ -57,12 +54,12 @@
 #define LIVE_PROXY_RECEIVE_TIMEOUT_MS 6500u
 #define LIVE_PROXY_TOTAL_MASK UINT16_C(0x7fff)
 #define LIVE_PROXY_YIELD_FLAG UINT16_C(0x8000)
-#define LIVE_PROXY_ACK_YIELD 0x01u
 #define LIVE_PROXY_BATCH_YIELD 0x01u
 #define LIVE_PROXY_WINDOW_END 0x80u
 #define LIVE_PROXY_WINDOW_INDEX_MASK 0x7fu
 #define LIVE_PROXY_WINDOW_ACK_COMPLETE 0x01u
 #define LIVE_PROXY_WINDOW_ACK_YIELD 0x02u
+#define LIVE_PROXY_WINDOW_ROUNDS_PER_RETRY 2u
 
 enum {
     LIVE_PROXY_PRIORITY_BULK = 0,
@@ -134,18 +131,10 @@ typedef struct {
     uint16_t last_committed_turn;
     uint16_t last_commit_packet_sequence;
     uint16_t last_completed_window_sequence;
-    uint32_t transmit_packet_id;
     uint32_t transmit_batch_id;
-    uint32_t receive_packet_id;
-    uint32_t last_completed_packet_id;
-    uint32_t last_completed_batch_id;
     uint32_t receive_window_id;
     uint32_t last_completed_window_id;
     uint32_t last_commit_packet_id;
-    size_t receive_total;
-    size_t receive_offset;
-    size_t receive_fragments;
-    uint8_t receive_packet[UM_NETWORK_MAX_PACKET];
     uint8_t receive_window[LIVE_PROXY_WINDOW_MAX_BYTES];
     size_t receive_window_total;
     uint8_t receive_window_count;
@@ -185,13 +174,9 @@ typedef struct {
     size_t queue_logged_priority_evictions;
     size_t consecutive_dns_sent;
     uint64_t started_ms;
-    int have_last_completed_packet;
-    int have_last_completed_batch;
     int have_last_completed_window;
     int have_last_commit;
     int last_commit_piggybacked;
-    int last_commit_window_ack;
-    int receive_yield_requested;
     int receive_window_yield_requested;
     int last_completed_window_yield_requested;
 } live_proxy_state;
@@ -199,7 +184,6 @@ typedef struct {
 typedef struct {
     size_t index;
     um_modem_config config;
-    float score;
 } live_ranked_candidate;
 
 static volatile sig_atomic_t live_interrupted = 0;
@@ -295,8 +279,6 @@ static const char *wire_name(um_live_wire_type type)
         return "CALIB_CACHE";
     case UM_WIRE_PROXY_BEGIN:
         return "PROXY_BEGIN";
-    case UM_WIRE_IP_FRAGMENT:
-        return "IP_FRAGMENT";
     case UM_WIRE_IP_ACK:
         return "IP_ACK";
     case UM_WIRE_PROXY_TURN:
@@ -307,16 +289,12 @@ static const char *wire_name(um_live_wire_type type)
         return "PROXY_TURN_COMMIT";
     case UM_WIRE_PROXY_COMPLETE:
         return "PROXY_COMPLETE";
-    case UM_WIRE_IP_BATCH:
-        return "IP_BATCH";
     case UM_WIRE_CALIB_BODY_PROBE:
         return "CALIB_BODY_PROBE";
     case UM_WIRE_CALIB_BODY_RESULT:
         return "CALIB_BODY_RESULT";
     case UM_WIRE_IP_WINDOW:
         return "IP_WINDOW";
-    case UM_WIRE_IP_NACK:
-        return "IP_NACK";
     default:
         return "UNKNOWN";
     }
@@ -344,7 +322,7 @@ static unsigned live_verification_trials(int high_quality)
 
 static unsigned live_body_verification_trials(int high_quality)
 {
-    return high_quality != 0 ? 5u : 3u;
+    return high_quality != 0 ? 2u : 1u;
 }
 
 static const size_t live_body_candidates[] = {256u, 384u, 512u};
@@ -372,6 +350,22 @@ static um_modem_config live_bootstrap_config(void)
 static um_modem_config live_calibration_control_config(void)
 {
     return live_bootstrap_config();
+}
+
+static int live_config_equal(const um_modem_config *left,
+                             const um_modem_config *right)
+{
+    return left->fft_size == right->fft_size &&
+           left->first_bin == right->first_bin &&
+           left->last_bin == right->last_bin &&
+           left->cyclic_prefix == right->cyclic_prefix &&
+           left->window_samples == right->window_samples &&
+           left->sync_samples == right->sync_samples &&
+           left->sync_gap == right->sync_gap &&
+           left->training_symbols == right->training_symbols &&
+           left->symbol_repetitions == right->symbol_repetitions &&
+           left->qam_bits == right->qam_bits &&
+           left->fec_rate == right->fec_rate;
 }
 
 static void write_u16(uint8_t *bytes, uint16_t value)
@@ -680,17 +674,6 @@ static int receive_wire(live_context *context, const um_modem_config *config,
                 }
                 return UM_OK;
             }
-            if (status == UM_ERR_CRC &&
-                um_live_wire_decode(wire, wire_length, message) == UM_OK &&
-                message->sequence == modem_sequence) {
-                if (expected_session != 0u &&
-                    message->session_id != expected_session) {
-                    memset(message, 0, sizeof(*message));
-                    sample_count = 0u;
-                    continue;
-                }
-                return UM_ERR_CRC;
-            }
             if (status == UM_ERR_SYNC) {
                 size_t retain = config->sync_samples * 2u;
                 if (sample_count > retain) {
@@ -732,11 +715,6 @@ static int receive_expected(live_context *context,
         if (message->type == expected_type &&
             message->sequence == expected_sequence) {
             return UM_OK;
-        }
-        if (expected_type == UM_WIRE_IP_ACK &&
-            message->type == UM_WIRE_IP_NACK &&
-            message->sequence == expected_sequence) {
-            return UM_ERR_CRC;
         }
         live_log(context, "Ignoring %s while waiting for %s",
                  wire_name(message->type), wire_name(expected_type));
@@ -1009,6 +987,7 @@ static int calibration_body_sender(live_context *context,
         context->options.calibrate_high_quality);
     uint16_t sequence = 0u;
     size_t candidate_index;
+    size_t largest_confirmed = LIVE_CALIB_BODY_BASE_BYTES;
     *selected_body_bytes = LIVE_CALIB_BODY_BASE_BYTES;
     for (candidate_index = 0u;
          candidate_index < sizeof(live_body_candidates) /
@@ -1057,10 +1036,14 @@ static int calibration_body_sender(live_context *context,
                 return UM_ERR_HEADER;
             }
         }
-        *selected_body_bytes = candidate;
+        *selected_body_bytes = largest_confirmed;
+        largest_confirmed = candidate;
     }
-    live_log(context, "calib body selected direction=%s bytes=%zu",
-             direction_label(direction), *selected_body_bytes);
+    live_log(context,
+             "calib body selected direction=%s bytes=%zu "
+             "largest-confirmed=%zu safety-backoff=one-tier",
+             direction_label(direction), *selected_body_bytes,
+             largest_confirmed);
     return UM_OK;
 }
 
@@ -1075,6 +1058,7 @@ static int calibration_body_receiver(live_context *context,
     unsigned trials = live_body_verification_trials(high_quality);
     uint16_t sequence = 0u;
     size_t candidate_index;
+    size_t largest_confirmed = LIVE_CALIB_BODY_BASE_BYTES;
     *selected_body_bytes = LIVE_CALIB_BODY_BASE_BYTES;
     for (candidate_index = 0u;
          candidate_index < sizeof(live_body_candidates) /
@@ -1132,10 +1116,14 @@ static int calibration_body_receiver(live_context *context,
                 return UM_OK;
             }
         }
-        *selected_body_bytes = candidate;
+        *selected_body_bytes = largest_confirmed;
+        largest_confirmed = candidate;
     }
-    live_log(context, "calib body selected direction=%s bytes=%zu",
-             direction_label(direction), *selected_body_bytes);
+    live_log(context,
+             "calib body selected direction=%s bytes=%zu "
+             "largest-confirmed=%zu safety-backoff=one-tier",
+             direction_label(direction), *selected_body_bytes,
+             largest_confirmed);
     return UM_OK;
 }
 
@@ -1668,11 +1656,58 @@ static int calibration_receiver(live_context *context, unsigned direction,
     }
     {
         size_t rank;
+        size_t guarded_count = 0u;
         for (rank = 0u; rank < rank_count; ++rank) {
-            ranked[rank].index = ranked_ids[rank];
-            ranked[rank].config = search.nodes[ranked_ids[rank]].config;
-            ranked[rank].score = candidate_scores[ranked_ids[rank]];
+            um_modem_config measured =
+                search.nodes[ranked_ids[rank]].config;
+            um_modem_config guarded;
+            size_t prior;
+            int duplicate = 0;
+            status = um_calibration_guard_config(&measured,
+                                                 &guarded);
+            if (status != UM_OK) {
+                return status;
+            }
+            for (prior = 0u; prior < guarded_count; ++prior) {
+                if (live_config_equal(&ranked[prior].config, &guarded) != 0) {
+                    duplicate = 1;
+                    break;
+                }
+            }
+            if (duplicate != 0) {
+                live_log(context,
+                         "calib safety backoff measured-rank=%zu id=%zu "
+                         "duplicates operating-rank=%zu; skipped",
+                         rank + 1u, ranked_ids[rank], prior + 1u);
+                continue;
+            }
+            ranked[guarded_count].index = ranked_ids[rank];
+            ranked[guarded_count].config = guarded;
+            live_log(context,
+                     "calib safety backoff rank=%zu measured-rank=%zu id=%zu "
+                     "measured=%u-qam/%s/cp%u/%.0f-%.0fHz "
+                     "operating=%u-qam/%s/cp%u/%.0f-%.0fHz "
+                     "rate@%zuB=%.0fbps",
+                     guarded_count + 1u, rank + 1u,
+                     ranked[guarded_count].index,
+                     1u << measured.qam_bits, fec_name(measured.fec_rate),
+                     measured.cyclic_prefix,
+                     (double)measured.first_bin * UM_SAMPLE_RATE /
+                         measured.fft_size,
+                     (double)measured.last_bin * UM_SAMPLE_RATE /
+                         measured.fft_size,
+                     1u << guarded.qam_bits, fec_name(guarded.fec_rate),
+                     guarded.cyclic_prefix,
+                     (double)guarded.first_bin * UM_SAMPLE_RATE /
+                         guarded.fft_size,
+                     (double)guarded.last_bin * UM_SAMPLE_RATE /
+                         guarded.fft_size,
+                     rate_payload_bytes,
+                     um_calibration_payload_rate(&guarded,
+                                                 rate_payload_bytes));
+            ++guarded_count;
         }
+        rank_count = guarded_count;
     }
     {
         uint8_t report[4u + LIVE_CALIBRATION_RANKS *
@@ -2748,25 +2783,6 @@ static int proxy_queue_has_non_dns(const live_proxy_state *state)
     return 0;
 }
 
-static int proxy_packet_is_dns_response(const uint8_t *packet,
-                                        size_t packet_length)
-{
-    live_proxy_dns_key key;
-    return dns_packet_key(packet, packet_length, 1, &key);
-}
-
-static int proxy_queue_has_dns_response(const live_proxy_state *state)
-{
-    size_t index;
-    for (index = 0u; index < state->queue_count; ++index) {
-        if (proxy_packet_is_dns_response(state->queue[index].packet,
-                                         state->queue[index].length) != 0) {
-            return 1;
-        }
-    }
-    return 0;
-}
-
 static int select_proxy_queue_index(const live_proxy_state *state,
                                     int allow_dns, int require_fit,
                                     size_t maximum_packet_bytes,
@@ -3156,53 +3172,21 @@ static int drain_proxy_ingress(live_context *context,
     return UM_OK;
 }
 
-static int pop_proxy_packet(live_proxy_state *state, uint8_t *packet,
-                            size_t *packet_length, unsigned *priority)
-{
-    size_t selected;
-    int allow_dns;
-    if (state->queue_count == 0u) {
-        return 0;
-    }
-    /* DNS stays first, but an unbroken DNS stream cannot exclude every
-     * already-queued non-DNS packet from the link forever. */
-    allow_dns = !(state->consecutive_dns_sent >=
-                      LIVE_PROXY_DNS_BURST_PACKETS &&
-                  proxy_queue_has_non_dns(state) != 0);
-    if (select_proxy_queue_index(state, allow_dns, 0, 0u,
-                                 &selected) == 0) {
-        return 0;
-    }
-    *packet_length = state->queue[selected].length;
-    *priority = state->queue[selected].priority;
-    memcpy(packet, state->queue[selected].packet, *packet_length);
-    remove_proxy_queue_entry(state, selected);
-    return 1;
-}
-
 static size_t build_proxy_batch(live_proxy_state *state, uint8_t *body,
                                 size_t body_capacity,
-                                size_t interactive_capacity,
-                                unsigned *highest_priority,
-                                size_t *packet_bytes,
-                                int *leading_dns_response)
+                                size_t interactive_capacity)
 {
     size_t offset = LIVE_PROXY_BATCH_HEADER_BYTES;
     size_t capacity_limit = body_capacity;
     size_t count = 0u;
     size_t dns_selected = 0u;
     int single_oversized_interactive = 0;
-    if (body == NULL || highest_priority == NULL || packet_bytes == NULL ||
-        leading_dns_response == NULL ||
-        body_capacity > LIVE_PROXY_WINDOW_MAX_BYTES ||
+    if (body == NULL || body_capacity > LIVE_PROXY_WINDOW_MAX_BYTES ||
         interactive_capacity > body_capacity ||
         interactive_capacity <= LIVE_PROXY_BATCH_HEADER_BYTES ||
         body_capacity <= LIVE_PROXY_BATCH_HEADER_BYTES) {
         return 0u;
     }
-    *highest_priority = LIVE_PROXY_PRIORITY_BULK;
-    *packet_bytes = 0u;
-    *leading_dns_response = 0;
     while (state->queue_count != 0u && count < UINT8_MAX) {
         const live_proxy_queued_packet *queued;
         size_t selected;
@@ -3249,13 +3233,6 @@ static size_t build_proxy_batch(live_proxy_state *state, uint8_t *body,
         if (needed > capacity_limit - offset) {
             break;
         }
-        if (queued->priority > *highest_priority) {
-            *highest_priority = queued->priority;
-        }
-        if (count == 0u) {
-            *leading_dns_response = proxy_packet_is_dns_response(
-                queued->packet, queued->length);
-        }
         if (queued->priority == LIVE_PROXY_PRIORITY_DNS) {
             ++dns_selected;
         }
@@ -3263,7 +3240,6 @@ static size_t build_proxy_batch(live_proxy_state *state, uint8_t *body,
         memcpy(&body[offset + LIVE_PROXY_BATCH_ENTRY_BYTES], queued->packet,
                queued->length);
         offset += needed;
-        *packet_bytes += queued->length;
         remove_proxy_queue_entry(state, selected);
         ++count;
         if (single_oversized_interactive != 0) {
@@ -3502,7 +3478,6 @@ static int commit_proxy_packet_token(live_context *context,
                                      live_proxy_state *state,
                                      uint16_t final_sequence,
                                      uint32_t transaction_id,
-                                     int window_ack,
                                      int *token_yielded)
 {
     int status;
@@ -3520,163 +3495,9 @@ static int commit_proxy_packet_token(live_context *context,
     state->last_commit_packet_id = transaction_id;
     state->have_last_commit = 1;
     state->last_commit_piggybacked = 1;
-    state->last_commit_window_ack = window_ack;
     ++state->turn_sequence;
     *token_yielded = 1;
     return UM_OK;
-}
-
-static int send_proxy_packet(live_context *context, live_proxy_state *state,
-                             const uint8_t *packet, size_t packet_length,
-                             size_t frame_body_limit, int yield_token,
-                             int *token_yielded)
-{
-    const um_modem_config *transmit = proxy_transmit_config(context);
-    const um_modem_config *receive = proxy_receive_config(context);
-    size_t fragment_capacity = frame_body_limit -
-                               LIVE_PROXY_FRAGMENT_HEADER_BYTES;
-    size_t fragments;
-    uint16_t first_sequence = state->transmit_sequence;
-    uint16_t final_sequence;
-    uint32_t packet_id = ++state->transmit_packet_id;
-    unsigned attempt;
-    int status = validate_ip_packet(packet, packet_length);
-    if (token_yielded == NULL) {
-        return UM_ERR_ARGUMENT;
-    }
-    *token_yielded = 0;
-    if (status != UM_OK || packet_length > LIVE_PROXY_TOTAL_MASK) {
-        return status != UM_OK ? status : UM_ERR_CAPACITY;
-    }
-    fragments = (packet_length + fragment_capacity - 1u) / fragment_capacity;
-    final_sequence = (uint16_t)(first_sequence + fragments - 1u);
-    for (attempt = 0u; attempt < context->options.retry_limit; ++attempt) {
-        size_t offset = 0u;
-        size_t fragment = 0u;
-        um_live_wire_message acknowledgement;
-        sleep_milliseconds(LIVE_TURNAROUND_MS);
-        while (offset < packet_length && !live_interrupted) {
-            uint8_t body[UM_LIVE_MAX_BODY];
-            size_t fragment_length = packet_length - offset;
-            int final_fragment;
-            if (fragment_length > fragment_capacity) {
-                fragment_length = fragment_capacity;
-            }
-            final_fragment = offset + fragment_length == packet_length;
-            write_u32(body, packet_id);
-            write_u16(&body[4],
-                      (uint16_t)packet_length |
-                          (yield_token != 0 ? LIVE_PROXY_YIELD_FLAG : 0u));
-            write_u16(&body[6], (uint16_t)offset);
-            memcpy(body + LIVE_PROXY_FRAGMENT_HEADER_BYTES, packet + offset,
-                   fragment_length);
-            status = send_wire(
-                context, transmit, UM_WIRE_IP_FRAGMENT,
-                (uint16_t)(first_sequence + fragment), body,
-                LIVE_PROXY_FRAGMENT_HEADER_BYTES + fragment_length,
-                final_fragment, NULL);
-            if (status != UM_OK) {
-                return status;
-            }
-            offset += fragment_length;
-            ++fragment;
-        }
-        if (live_interrupted) {
-            return UM_ERR_INTERRUPTED;
-        }
-        status = receive_expected(context, receive, UM_WIRE_IP_ACK,
-                                  final_sequence,
-                                  LIVE_PROXY_ACK_TIMEOUT_MS,
-                                  &acknowledgement, NULL);
-        if (status == UM_OK &&
-            acknowledgement.body_length == LIVE_PROXY_ACK_BYTES &&
-            read_u32(acknowledgement.body) == packet_id &&
-            ((acknowledgement.body[4] & LIVE_PROXY_ACK_YIELD) != 0u) ==
-                (yield_token != 0)) {
-            state->transmit_sequence = (uint16_t)(final_sequence + 1u);
-            account_transmitted_packet_priority(state, packet,
-                                                packet_length);
-            account_proxy_packet_bytes(state, 1, packet, packet_length);
-            log_proxy_packet(context, state, 1, packet_id, packet_length,
-                             fragments, packet);
-            if (yield_token != 0) {
-                return commit_proxy_packet_token(
-                    context, state, final_sequence, packet_id,
-                    0, token_yielded);
-            }
-            return UM_OK;
-        }
-        live_log(context,
-                 "proxy %s packet=%u cumulative-ack retry=%u/%u (%s)",
-                 proxy_transmit_label(context), packet_id, attempt + 1u,
-                 context->options.retry_limit,
-                 status == UM_OK ? "invalid acknowledgement"
-                                 : um_status_string(status));
-    }
-    return live_interrupted ? UM_ERR_INTERRUPTED : UM_ERR_TIMEOUT;
-}
-
-static int send_proxy_batch(live_context *context, live_proxy_state *state,
-                            uint8_t *body, size_t body_length,
-                            int yield_token, int *token_yielded)
-{
-    const um_modem_config *transmit = proxy_transmit_config(context);
-    const um_modem_config *receive = proxy_receive_config(context);
-    uint32_t batch_id = ++state->transmit_batch_id;
-    uint16_t sequence = state->transmit_sequence;
-    unsigned attempt;
-    if (body == NULL || token_yielded == NULL ||
-        body_length <= LIVE_PROXY_BATCH_HEADER_BYTES ||
-        body_length > UM_LIVE_MAX_BODY) {
-        return UM_ERR_ARGUMENT;
-    }
-    write_u32(body, batch_id);
-    body[4] = yield_token != 0 ? LIVE_PROXY_BATCH_YIELD : 0u;
-    *token_yielded = 0;
-    for (attempt = 0u; attempt < context->options.retry_limit; ++attempt) {
-        um_live_wire_message acknowledgement;
-        int status;
-        sleep_milliseconds(LIVE_TURNAROUND_MS);
-        status = send_wire(context, transmit, UM_WIRE_IP_BATCH, sequence,
-                           body, body_length, 1, NULL);
-        if (status != UM_OK) {
-            return status;
-        }
-        status = receive_expected(context, receive, UM_WIRE_IP_ACK,
-                                  sequence, LIVE_PROXY_ACK_TIMEOUT_MS,
-                                  &acknowledgement, NULL);
-        if (status == UM_OK &&
-            acknowledgement.body_length == LIVE_PROXY_ACK_BYTES &&
-            read_u32(acknowledgement.body) == batch_id &&
-            ((acknowledgement.body[4] & LIVE_PROXY_ACK_YIELD) != 0u) ==
-                (yield_token != 0)) {
-            ++state->transmit_sequence;
-            account_proxy_batch(context, state, 1, body, body_length, 1u);
-            if (yield_token != 0) {
-                return commit_proxy_packet_token(context, state, sequence,
-                                                 batch_id, 0,
-                                                 token_yielded);
-            }
-            return UM_OK;
-        }
-        if (status == UM_ERR_CRC &&
-            acknowledgement.type == UM_WIRE_IP_NACK &&
-            acknowledgement.body_length == sizeof(batch_id) &&
-            read_u32(acknowledgement.body) == batch_id) {
-            live_log(context,
-                     "proxy %s batch=%u fast-nack retry=%u/%u",
-                     proxy_transmit_label(context), batch_id, attempt + 1u,
-                     context->options.retry_limit);
-            continue;
-        }
-        live_log(context,
-                 "proxy %s batch=%u cumulative-ack retry=%u/%u (%s)",
-                 proxy_transmit_label(context), batch_id, attempt + 1u,
-                 context->options.retry_limit,
-                 status == UM_OK ? "invalid acknowledgement"
-                                 : um_status_string(status));
-    }
-    return live_interrupted ? UM_ERR_INTERRUPTED : UM_ERR_TIMEOUT;
 }
 
 static int send_proxy_window(live_context *context,
@@ -3693,16 +3514,18 @@ static int send_proxy_window(live_context *context,
     uint8_t pending_bitmap;
     uint32_t window_id = ++state->transmit_batch_id;
     uint16_t sequence = state->transmit_sequence;
+    unsigned round_limit = context->options.retry_limit *
+                           LIVE_PROXY_WINDOW_ROUNDS_PER_RETRY;
     unsigned attempt;
     if (batch == NULL || token_yielded == NULL ||
         frame_body_limit <= LIVE_PROXY_WINDOW_HEADER_BYTES ||
-        batch_length <= frame_body_limit ||
+        batch_length <= LIVE_PROXY_BATCH_HEADER_BYTES ||
         batch_length > LIVE_PROXY_WINDOW_MAX_BYTES) {
         return UM_ERR_ARGUMENT;
     }
     cell_capacity = frame_body_limit - LIVE_PROXY_WINDOW_HEADER_BYTES;
     cell_count = (batch_length + cell_capacity - 1u) / cell_capacity;
-    if (cell_count < 2u || cell_count > LIVE_PROXY_WINDOW_MAX_CELLS) {
+    if (cell_count == 0u || cell_count > LIVE_PROXY_WINDOW_MAX_CELLS) {
         return UM_ERR_CAPACITY;
     }
     write_u32(batch, window_id);
@@ -3715,7 +3538,11 @@ static int send_proxy_window(live_context *context,
              "cell-payload=%zu",
              proxy_transmit_label(context), window_id, cell_count,
              batch_length, cell_capacity);
-    for (attempt = 0u; attempt < context->options.retry_limit; ++attempt) {
+    /* A lost ACK needs a bitmap-only probe before the next selective data
+     * repair.  Give each configured retry one bounded round for each job so
+     * the final probe cannot discover a missing cell and then immediately
+     * exhaust the connection's retry budget. */
+    for (attempt = 0u; attempt < round_limit; ++attempt) {
         um_live_wire_message acknowledgement;
         uint8_t sent_bitmap = pending_bitmap;
         int status;
@@ -3801,8 +3628,7 @@ static int send_proxy_window(live_context *context,
                                     batch_length, cell_count);
                 if (yield_token != 0) {
                     return commit_proxy_packet_token(
-                        context, state, sequence, window_id, 1,
-                        token_yielded);
+                        context, state, sequence, window_id, token_yielded);
                 }
                 return UM_OK;
             }
@@ -3812,7 +3638,7 @@ static int send_proxy_window(live_context *context,
                      "sent=0x%02x attempt=%u/%u",
                      proxy_transmit_label(context), window_id,
                      pending_bitmap, sent_bitmap, attempt + 1u,
-                     context->options.retry_limit);
+                     round_limit);
             continue;
         }
         /* The receiver may have accepted every data cell and only lost the
@@ -3822,22 +3648,11 @@ static int send_proxy_window(live_context *context,
         live_log(context,
                  "proxy %s window=%u bitmap-ack retry=%u/%u (%s)",
                  proxy_transmit_label(context), window_id, attempt + 1u,
-                 context->options.retry_limit,
+                 round_limit,
                  status == UM_OK ? "invalid acknowledgement"
                                  : um_status_string(status));
     }
     return live_interrupted ? UM_ERR_INTERRUPTED : UM_ERR_TIMEOUT;
-}
-
-static int send_proxy_ack(live_context *context, uint16_t sequence,
-                          uint32_t packet_id, int yield_token)
-{
-    uint8_t body[LIVE_PROXY_ACK_BYTES];
-    write_u32(body, packet_id);
-    body[4] = yield_token != 0 ? LIVE_PROXY_ACK_YIELD : 0u;
-    sleep_milliseconds(LIVE_TURNAROUND_MS);
-    return send_wire(context, proxy_transmit_config(context),
-                     UM_WIRE_IP_ACK, sequence, body, sizeof(body), 1, NULL);
 }
 
 static int send_proxy_window_ack(live_context *context, uint16_t sequence,
@@ -3860,20 +3675,8 @@ static int send_proxy_window_ack(live_context *context, uint16_t sequence,
                      UM_WIRE_IP_ACK, sequence, body, sizeof(body), 1, NULL);
 }
 
-static int send_proxy_nack(live_context *context, uint16_t sequence,
-                           uint32_t transaction_id)
-{
-    uint8_t body[4];
-    write_u32(body, transaction_id);
-    sleep_milliseconds(LIVE_TURNAROUND_MS);
-    return send_wire(context, proxy_transmit_config(context),
-                     UM_WIRE_IP_NACK, sequence, body, sizeof(body), 1,
-                     NULL);
-}
-
 static int accept_packet_token(live_context *context,
                                live_proxy_state *state,
-                               um_live_wire_type transaction_type,
                                uint16_t packet_sequence,
                                uint32_t packet_id,
                                uint8_t window_bitmap,
@@ -3889,12 +3692,9 @@ static int accept_packet_token(live_context *context,
                  "attempt=%u/%u",
                  (unsigned)state->turn_sequence, packet_id, attempt + 1u,
                  context->options.retry_limit);
-        status = transaction_type == UM_WIRE_IP_WINDOW
-                     ? send_proxy_window_ack(
-                           context, packet_sequence, packet_id,
-                           window_bitmap, window_count, 1, 1)
-                     : send_proxy_ack(context, packet_sequence, packet_id,
-                                      1);
+        status = send_proxy_window_ack(
+            context, packet_sequence, packet_id, window_bitmap,
+            window_count, 1, 1);
         if (status != UM_OK) {
             return status;
         }
@@ -3917,31 +3717,7 @@ static int accept_packet_token(live_context *context,
                 ++state->turn_sequence;
                 return UM_OK;
             }
-            if (message.type == UM_WIRE_IP_FRAGMENT &&
-                transaction_type == UM_WIRE_IP_FRAGMENT &&
-                message.sequence == packet_sequence &&
-                message.body_length > LIVE_PROXY_FRAGMENT_HEADER_BYTES &&
-                read_u32(message.body) == packet_id) {
-                uint16_t encoded_total = read_u16(&message.body[4]);
-                size_t total = encoded_total & LIVE_PROXY_TOTAL_MASK;
-                size_t offset = read_u16(&message.body[6]);
-                size_t fragment_length =
-                    message.body_length - LIVE_PROXY_FRAGMENT_HEADER_BYTES;
-                if ((encoded_total & LIVE_PROXY_YIELD_FLAG) != 0u &&
-                    offset <= total && fragment_length == total - offset) {
-                    break;
-                }
-            }
-            if (message.type == UM_WIRE_IP_BATCH &&
-                transaction_type == UM_WIRE_IP_BATCH &&
-                message.sequence == packet_sequence &&
-                message.body_length > LIVE_PROXY_BATCH_HEADER_BYTES &&
-                read_u32(message.body) == packet_id &&
-                (message.body[4] & LIVE_PROXY_BATCH_YIELD) != 0u) {
-                break;
-            }
             if (message.type == UM_WIRE_IP_WINDOW &&
-                transaction_type == UM_WIRE_IP_WINDOW &&
                 message.sequence == packet_sequence) {
                 live_proxy_window_cell cell;
                 if (inspect_proxy_window_cell(
@@ -3956,111 +3732,6 @@ static int accept_packet_token(live_context *context,
                  attempt + 1u, context->options.retry_limit);
     }
     return live_interrupted ? UM_ERR_INTERRUPTED : UM_ERR_TIMEOUT;
-}
-
-static int receive_proxy_fragment(live_context *context,
-                                  live_proxy_state *state,
-                                  const um_live_wire_message *message,
-                                  int *token_received)
-{
-    uint16_t encoded_total;
-    uint32_t packet_id;
-    size_t total;
-    size_t offset;
-    size_t fragment_length;
-    int yield_requested;
-    int status;
-    if (token_received == NULL ||
-        message->body_length <= LIVE_PROXY_FRAGMENT_HEADER_BYTES) {
-        return UM_ERR_HEADER;
-    }
-    *token_received = 0;
-    packet_id = read_u32(message->body);
-    encoded_total = read_u16(&message->body[4]);
-    total = encoded_total & LIVE_PROXY_TOTAL_MASK;
-    yield_requested = (encoded_total & LIVE_PROXY_YIELD_FLAG) != 0u;
-    offset = read_u16(&message->body[6]);
-    fragment_length = message->body_length -
-                      LIVE_PROXY_FRAGMENT_HEADER_BYTES;
-    if (total == 0u || total > sizeof(state->receive_packet) ||
-        offset > total || fragment_length > total - offset) {
-        return UM_ERR_HEADER;
-    }
-    if (state->have_last_completed_packet != 0 &&
-        packet_id == state->last_completed_packet_id) {
-        if (offset + fragment_length != total) {
-            return UM_OK;
-        }
-        return send_proxy_ack(context, message->sequence, packet_id,
-                              yield_requested);
-    }
-    /*
-     * Packet fragments are sent as a window and acknowledged cumulatively.
-     * Ignore later or replayed fragments until the first missing sequence is
-     * retried; the offset check below then resumes the partial packet.
-     */
-    if (message->sequence != state->receive_sequence) {
-        return UM_OK;
-    }
-    if (message->sequence == state->receive_sequence) {
-        if (offset == 0u) {
-            state->receive_packet_id = packet_id;
-            state->receive_total = total;
-            state->receive_offset = 0u;
-            state->receive_fragments = 0u;
-            state->receive_yield_requested = yield_requested;
-        }
-        if (packet_id != state->receive_packet_id ||
-            total != state->receive_total || offset != state->receive_offset ||
-            yield_requested != state->receive_yield_requested) {
-            return UM_ERR_HEADER;
-        }
-        memcpy(state->receive_packet + offset,
-               message->body + LIVE_PROXY_FRAGMENT_HEADER_BYTES,
-               fragment_length);
-        state->receive_offset += fragment_length;
-        ++state->receive_fragments;
-        ++state->receive_sequence;
-        if (state->receive_offset == state->receive_total) {
-            size_t completed_length = state->receive_total;
-            size_t completed_fragments = state->receive_fragments;
-            status = validate_ip_packet(state->receive_packet,
-                                        completed_length);
-            if (status != UM_OK) {
-                return status;
-            }
-            status = um_network_write(context->network,
-                                      state->receive_packet,
-                                      completed_length, 1000u);
-            if (status != UM_OK) {
-                return status;
-            }
-            remember_completed_dns(state, state->receive_packet,
-                                   completed_length);
-            account_proxy_packet_bytes(state, 0, state->receive_packet,
-                                       completed_length);
-            log_proxy_packet(context, state, 0, state->receive_packet_id,
-                             completed_length, completed_fragments,
-                             state->receive_packet);
-            state->last_completed_packet_id = state->receive_packet_id;
-            state->have_last_completed_packet = 1;
-            state->receive_total = 0u;
-            state->receive_offset = 0u;
-            state->receive_fragments = 0u;
-            state->receive_yield_requested = 0;
-            if (yield_requested != 0) {
-                status = accept_packet_token(
-                    context, state, UM_WIRE_IP_FRAGMENT,
-                    message->sequence, packet_id, 0u, 0u);
-                if (status == UM_OK) {
-                    *token_received = 1;
-                }
-                return status;
-            }
-            return send_proxy_ack(context, message->sequence, packet_id, 0);
-        }
-    }
-    return UM_OK;
 }
 
 static int receive_proxy_window(live_context *context,
@@ -4193,8 +3864,8 @@ static int receive_proxy_window(live_context *context,
     state->receive_window_yield_requested = 0;
     if (cell.yield_token != 0) {
         status = accept_packet_token(
-            context, state, UM_WIRE_IP_WINDOW, message->sequence,
-            cell.window_id, full_bitmap, cell.count);
+            context, state, message->sequence, cell.window_id,
+            full_bitmap, cell.count);
         if (status == UM_OK) {
             *token_received = 1;
         }
@@ -4203,65 +3874,6 @@ static int receive_proxy_window(live_context *context,
     return send_proxy_window_ack(context, message->sequence,
                                  cell.window_id, full_bitmap, cell.count,
                                  1, 0);
-}
-
-static int receive_proxy_batch(live_context *context,
-                               live_proxy_state *state,
-                               const um_live_wire_message *message,
-                               int *token_received)
-{
-    uint32_t batch_id = 0u;
-    int yield_requested = 0;
-    size_t packet_count = 0u;
-    size_t packet_bytes = 0u;
-    size_t offset = LIVE_PROXY_BATCH_HEADER_BYTES;
-    size_t index;
-    int status;
-    if (message == NULL || token_received == NULL) {
-        return UM_ERR_ARGUMENT;
-    }
-    *token_received = 0;
-    status = inspect_proxy_batch(message->body, message->body_length,
-                                 &batch_id, &yield_requested,
-                                 &packet_count, &packet_bytes);
-    if (status != UM_OK) {
-        return status;
-    }
-    (void)packet_bytes;
-    if (state->have_last_completed_batch != 0 &&
-        batch_id == state->last_completed_batch_id) {
-        return send_proxy_ack(context, message->sequence, batch_id,
-                              yield_requested);
-    }
-    if (message->sequence != state->receive_sequence) {
-        return UM_OK;
-    }
-    for (index = 0u; index < packet_count; ++index) {
-        size_t packet_length = read_u16(&message->body[offset]);
-        offset += LIVE_PROXY_BATCH_ENTRY_BYTES;
-        status = um_network_write(context->network, &message->body[offset],
-                                  packet_length, 1000u);
-        if (status != UM_OK) {
-            return status;
-        }
-        remember_completed_dns(state, &message->body[offset],
-                               packet_length);
-        offset += packet_length;
-    }
-    ++state->receive_sequence;
-    account_proxy_batch(context, state, 0, message->body,
-                        message->body_length, 1u);
-    state->last_completed_batch_id = batch_id;
-    state->have_last_completed_batch = 1;
-    if (yield_requested != 0) {
-        status = accept_packet_token(context, state, UM_WIRE_IP_BATCH,
-                                     message->sequence, batch_id, 0u, 0u);
-        if (status == UM_OK) {
-            *token_received = 1;
-        }
-        return status;
-    }
-    return send_proxy_ack(context, message->sequence, batch_id, 0);
 }
 
 static int resend_proxy_commit(live_context *context,
@@ -4408,34 +4020,6 @@ static int receive_until_proxy_token(live_context *context,
         int status = receive_wire(context, receive, context->session_id,
                                   LIVE_PROXY_RECEIVE_TIMEOUT_MS, &message,
                                   NULL);
-        if (status == UM_ERR_CRC && message.type == UM_WIRE_IP_BATCH &&
-            message.sequence == state->receive_sequence &&
-            message.body_length > LIVE_PROXY_BATCH_HEADER_BYTES) {
-            uint32_t batch_id = 0u;
-            int yield_token = 0;
-            size_t packet_count = 0u;
-            size_t packet_bytes = 0u;
-            /* Only answer when the complete batch envelope still validates.
-             * In particular this prevents a damaged non-final window cell
-             * whose type bits changed from eliciting mid-burst feedback. */
-            if (inspect_proxy_batch(
-                    message.body, message.body_length, &batch_id,
-                    &yield_token, &packet_count, &packet_bytes) == UM_OK) {
-                (void)yield_token;
-                (void)packet_count;
-                (void)packet_bytes;
-                live_log(context,
-                         "proxy %s batch=%u damaged; sending fast-nack",
-                         proxy_receive_label(context), batch_id);
-                status = send_proxy_nack(context, message.sequence,
-                                         batch_id);
-                if (status != UM_OK) {
-                    return status;
-                }
-                misses = 0u;
-                continue;
-            }
-        }
         if (status == UM_ERR_HEADER || status == UM_ERR_CRC ||
             status == UM_ERR_SYNC || status == UM_ERR_TRUNCATED ||
             status == UM_ERR_TIMEOUT) {
@@ -4451,34 +4035,10 @@ static int receive_until_proxy_token(live_context *context,
             return status;
         }
         misses = 0u;
-        if (message.type == UM_WIRE_IP_FRAGMENT) {
-            int token_received = 0;
-            status = receive_proxy_fragment(context, state, &message,
-                                            &token_received);
-            if (status != UM_OK) {
-                return status;
-            }
-            if (token_received != 0) {
-                return UM_OK;
-            }
-            continue;
-        }
         if (message.type == UM_WIRE_IP_WINDOW) {
             int token_received = 0;
             status = receive_proxy_window(context, state, &message,
                                           &token_received);
-            if (status != UM_OK) {
-                return status;
-            }
-            if (token_received != 0) {
-                return UM_OK;
-            }
-            continue;
-        }
-        if (message.type == UM_WIRE_IP_BATCH) {
-            int token_received = 0;
-            status = receive_proxy_batch(context, state, &message,
-                                         &token_received);
             if (status != UM_OK) {
                 return status;
             }
@@ -4522,12 +4082,8 @@ static int receive_until_proxy_token(live_context *context,
             state->have_last_commit != 0 &&
             state->last_commit_piggybacked != 0 &&
             message.sequence == state->last_commit_packet_sequence &&
-            ((state->last_commit_window_ack == 0 &&
-              message.body_length == LIVE_PROXY_ACK_BYTES &&
-              (message.body[4] & LIVE_PROXY_ACK_YIELD) != 0u) ||
-             (state->last_commit_window_ack != 0 &&
-              message.body_length == LIVE_PROXY_WINDOW_ACK_BYTES &&
-              (message.body[6] & LIVE_PROXY_WINDOW_ACK_YIELD) != 0u)) &&
+            message.body_length == LIVE_PROXY_WINDOW_ACK_BYTES &&
+            (message.body[6] & LIVE_PROXY_WINDOW_ACK_YIELD) != 0u &&
             read_u32(message.body) == state->last_commit_packet_id) {
             status = resend_proxy_commit(context, state);
             if (status != UM_OK) {
@@ -4571,17 +4127,18 @@ static int run_proxy_loop(live_context *context)
     state.started_ms = monotonic_milliseconds();
     live_log(context,
              "state=PROXYING interface=%s mtu=%u tx-frame-body=%zu "
-             "rx-frame-body=%zu fragment-payload=%zu window-body=%zu "
+             "rx-frame-body=%zu window-cell-payload=%zu window-body=%zu "
              "window-cells=%u initial-token=%s",
              um_network_interface_name(context->network), UM_NETWORK_MTU,
              frame_body_limit, receive_frame_body_limit,
-             frame_body_limit - LIVE_PROXY_FRAGMENT_HEADER_BYTES,
+             frame_body_limit - LIVE_PROXY_WINDOW_HEADER_BYTES,
              window_body_capacity, LIVE_PROXY_WINDOW_MAX_CELLS,
              have_token != 0 ? "local" : "peer");
     while (!live_interrupted) {
         int status;
         if (have_token != 0) {
-            size_t burst;
+            uint8_t batch[LIVE_PROXY_WINDOW_MAX_BYTES];
+            size_t batch_length;
             int token_yielded = 0;
             if (context->options.role == UM_LIVE_CLIENT &&
                 context->options.proxy_test_packets != 0u &&
@@ -4597,108 +4154,20 @@ static int run_proxy_loop(live_context *context)
                 }
                 return status;
             }
-            for (burst = 0u; burst < LIVE_PROXY_BURST_PACKETS; ++burst) {
-                uint8_t batch[LIVE_PROXY_WINDOW_MAX_BYTES];
-                uint8_t packet[UM_NETWORK_MAX_PACKET];
-                size_t batch_length;
-                size_t batch_packet_bytes = 0u;
-                size_t packet_length = 0u;
-                unsigned priority = LIVE_PROXY_PRIORITY_BULK;
-                int leading_dns_response = 0;
-                int continue_response_burst = 0;
-                int yield_with_packet;
-                status = drain_proxy_ingress(
-                    context, &state,
-                    burst == 0u ? LIVE_PROXY_IDLE_MS : 0u);
-                if (status != UM_OK) {
-                    return status;
-                }
-                batch_length = build_proxy_batch(
-                    &state, batch, window_body_capacity,
-                    frame_body_limit, &priority,
-                    &batch_packet_bytes, &leading_dns_response);
-                (void)batch_packet_bytes;
-                if (batch_length != 0u) {
-                    if (batch_length > frame_body_limit) {
-                        status = send_proxy_window(
-                            context, &state, batch, batch_length, 1,
-                            &token_yielded);
-                        if (status != UM_OK) {
-                            return status;
-                        }
-                        break;
-                    }
-                    continue_response_burst =
-                        leading_dns_response != 0 &&
-                        burst + 1u < LIVE_PROXY_BURST_PACKETS &&
-                        proxy_queue_has_dns_response(&state) != 0;
-                    yield_with_packet =
-                        continue_response_burst == 0 &&
-                        (priority >= LIVE_PROXY_PRIORITY_CONTROL ||
-                         burst + 1u == LIVE_PROXY_BURST_PACKETS ||
-                         state.queue_count == 0u);
-                    if (continue_response_burst != 0) {
-                        live_log(context,
-                                 "proxy DNS response backlog continuing "
-                                 "turn queued=%zu frame=%zu/%u",
-                                 state.queue_count, burst + 1u,
-                                 LIVE_PROXY_BURST_PACKETS);
-                    }
-                    status = send_proxy_batch(
-                        context, &state, batch, batch_length,
-                        yield_with_packet, &token_yielded);
-                    if (status != UM_OK) {
-                        return status;
-                    }
-                    if (token_yielded != 0 ||
-                        (context->options.proxy_test_packets != 0u &&
-                         state.packets_sent >=
-                             context->options.proxy_test_packets) ||
-                        (priority >= LIVE_PROXY_PRIORITY_CONTROL &&
-                         continue_response_burst == 0)) {
-                        break;
-                    }
-                    continue;
-                }
-                if (pop_proxy_packet(&state, packet, &packet_length,
-                                     &priority) == 0) {
-                    break;
-                }
-                continue_response_burst =
-                    proxy_packet_is_dns_response(packet, packet_length) !=
-                        0 &&
-                    burst + 1u < LIVE_PROXY_BURST_PACKETS &&
-                    proxy_queue_has_dns_response(&state) != 0;
-                yield_with_packet =
-                    continue_response_burst == 0 &&
-                    (priority >= LIVE_PROXY_PRIORITY_CONTROL ||
-                     burst + 1u == LIVE_PROXY_BURST_PACKETS ||
-                     state.queue_count == 0u);
-                if (continue_response_burst != 0) {
-                    live_log(context,
-                             "proxy DNS response backlog continuing turn "
-                             "queued=%zu frame=%zu/%u",
-                             state.queue_count, burst + 1u,
-                             LIVE_PROXY_BURST_PACKETS);
-                }
-                status = send_proxy_packet(context, &state, packet,
-                                           packet_length,
-                                           frame_body_limit,
-                                           yield_with_packet,
+            status = drain_proxy_ingress(context, &state,
+                                         LIVE_PROXY_IDLE_MS);
+            if (status != UM_OK) {
+                return status;
+            }
+            batch_length = build_proxy_batch(
+                &state, batch, window_body_capacity,
+                frame_body_limit - LIVE_PROXY_WINDOW_HEADER_BYTES);
+            if (batch_length != 0u) {
+                status = send_proxy_window(context, &state, batch,
+                                           batch_length, 1,
                                            &token_yielded);
                 if (status != UM_OK) {
                     return status;
-                }
-                /* Return the half-duplex link promptly after interactive
-                 * requests, except while draining an already-visible DNS
-                 * response backlog that the peer is waiting on. */
-                if (token_yielded != 0 ||
-                    (context->options.proxy_test_packets != 0u &&
-                     state.packets_sent >=
-                         context->options.proxy_test_packets) ||
-                    (priority >= LIVE_PROXY_PRIORITY_CONTROL &&
-                     continue_response_burst == 0)) {
-                    break;
                 }
             }
             if (token_yielded == 0) {
@@ -5120,6 +4589,7 @@ int um_run_live_audio(const um_live_audio_options *options,
         (options->link_test == 0 &&
          options->chunk_bytes < LIVE_CALIB_BODY_BASE_BYTES) ||
         options->chunk_bytes > UINT16_MAX || options->retry_limit == 0u ||
+        options->retry_limit > 100u ||
         options->discovery_interval_seconds <= 0.0f) {
         return UM_ERR_ARGUMENT;
     }
@@ -5226,6 +4696,13 @@ int um_run_live_audio(const um_live_audio_options *options,
              1000.0 * (double)UM_FFT_SIZE / UM_SAMPLE_RATE,
              (double)UM_SAMPLE_RATE / UM_FFT_SIZE,
              UM_MAX_SYMBOL_REPETITIONS);
+    live_log(&context,
+             "Calibration operating guard qam>4=one-tier-lower "
+             "fec>1/2=one-tier-stronger robust-floor=repeats2 "
+             "cp>=21.3ms window>=64 "
+             "training>=3 sync>=32.0ms gap>=42.7ms "
+             "band-edges=one-tier-inward high<=18000Hz "
+             "body=one-tier-below-confirmed");
     load_local_calibration(&context);
     while (!live_interrupted) {
         context.link_stage_started = 0;

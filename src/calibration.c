@@ -1,5 +1,6 @@
 #include "um_internal.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,10 +8,6 @@
 typedef struct {
     um_modem_config config;
     size_t candidate_id;
-    float score;
-    float payload_bps;
-    float evm_rms;
-    int robust_gate;
 } viable_candidate;
 
 #define CALIBRATION_DEFAULT_BUDGET 12u
@@ -108,6 +105,98 @@ float um_calibration_payload_rate(const um_modem_config *config,
                    config->window_samples + 64u;
     return (float)(payload_bytes * 8u) * (float)UM_SAMPLE_RATE /
            (float)sample_count;
+}
+
+/*
+ * Calibration deliberately probes until it finds the channel boundary.  A
+ * mode at that boundary is useful evidence, but it is the wrong long-lived
+ * operating point: a person moving, fan noise, clock drift, or a slightly
+ * longer payload can turn a short successful probe into repeated retries.
+ *
+ * Convert the measured frontier into a deterministic guarded mode.  Every
+ * change is monotonic with respect to payload robustness or acquisition
+ * margin, and the resulting mode is verified over the real link before use.
+ * This is intentionally a structural backoff rather than many more trials of
+ * the same marginal mode.
+ */
+int um_calibration_guard_config(const um_modem_config *measured,
+                                um_modem_config *guarded)
+{
+    size_t index;
+    unsigned lower_high_edge = measured != NULL ? measured->last_bin : 0u;
+    unsigned higher_low_edge = measured != NULL ? measured->first_bin : 0u;
+    int payload_strengthened = 0;
+    if (measured == NULL || guarded == NULL ||
+        um_modem_config_validate(measured) != UM_OK) {
+        return UM_ERR_ARGUMENT;
+    }
+    *guarded = *measured;
+
+    if (guarded->fec_rate > UM_FEC_RATE_1_2) {
+        guarded->fec_rate = (um_fec_rate)((unsigned)guarded->fec_rate - 1u);
+        payload_strengthened = 1;
+    }
+    if (guarded->qam_bits > 2u) {
+        guarded->qam_bits -= 2u;
+        payload_strengthened = 1;
+    }
+    if (payload_strengthened == 0 && guarded->symbol_repetitions < 2u) {
+        guarded->symbol_repetitions = 2u;
+    }
+
+    /* Move each explored spectrum edge inward.  The top two high-band tiers
+     * are close together and device-dependent, so never deploy above the
+     * broadly useful 18 kHz tier. */
+    if (measured->last_bin > 298u) {
+        lower_high_edge = 0u;
+        for (index = 0u;
+             index < sizeof(calibration_high_values) /
+                         sizeof(calibration_high_values[0]);
+             ++index) {
+            unsigned value = calibration_high_values[index];
+            if (value < measured->last_bin && value > lower_high_edge) {
+                lower_high_edge = value;
+            }
+        }
+        if (lower_high_edge > 768u) {
+            lower_high_edge = 768u;
+        }
+        if (lower_high_edge >= measured->first_bin) {
+            guarded->last_bin = lower_high_edge;
+        }
+    }
+    if (measured->first_bin < 64u) {
+        higher_low_edge = UINT_MAX;
+        for (index = 0u;
+             index < sizeof(calibration_low_values) /
+                         sizeof(calibration_low_values[0]);
+             ++index) {
+            unsigned value = calibration_low_values[index];
+            if (value > measured->first_bin && value < higher_low_edge) {
+                higher_low_edge = value;
+            }
+        }
+        if (higher_low_edge <= guarded->last_bin) {
+            guarded->first_bin = higher_low_edge;
+        }
+    }
+
+    if (guarded->cyclic_prefix < 1024u) {
+        guarded->cyclic_prefix = 1024u;
+    }
+    if (guarded->window_samples < 64u) {
+        guarded->window_samples = 64u;
+    }
+    if (guarded->sync_samples < 1536u) {
+        guarded->sync_samples = 1536u;
+    }
+    if (guarded->sync_gap < 2048u) {
+        guarded->sync_gap = 2048u;
+    }
+    if (guarded->training_symbols < 3u) {
+        guarded->training_symbols = 3u;
+    }
+    return um_modem_config_validate(guarded);
 }
 
 size_t um_calibration_search_budget(int high_quality)
@@ -990,10 +1079,6 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
             ++result->candidates_viable;
             viable[viable_count].config = candidate;
             viable[viable_count].candidate_id = candidate_id;
-            viable[viable_count].score = score;
-            viable[viable_count].payload_bps = payload_bps;
-            viable[viable_count].evm_rms = metrics.evm_rms;
-            viable[viable_count].robust_gate = robust_gate;
             candidate_scores[candidate_id] = score;
             ++viable_count;
         }
@@ -1036,14 +1121,15 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
         sizeof(ranked) / sizeof(ranked[0]));
     if (ranked_count != 0u) {
         size_t rank;
-        unsigned verification_trials = high_quality != 0 ? 7u : 4u;
+        unsigned verification_trials = high_quality != 0 ? 4u : 3u;
         for (rank = 0u; rank < ranked_count; ++rank) {
             viable_candidate *ranked_candidate = NULL;
+            um_modem_config guarded;
             size_t viable_index;
             unsigned trial;
-            unsigned passes = 1u;
-            float evm_sum;
-            float payload_sum;
+            unsigned passes = 0u;
+            float evm_sum = 0.0f;
+            float payload_sum = 0.0f;
             for (viable_index = 0u; viable_index < viable_count;
                  ++viable_index) {
                 if (viable[viable_index].candidate_id == ranked[rank]) {
@@ -1055,8 +1141,11 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                 free(viable);
                 return UM_ERR_CONFIG;
             }
-            evm_sum = ranked_candidate->evm_rms;
-            payload_sum = ranked_candidate->payload_bps;
+            if (um_calibration_guard_config(&ranked_candidate->config,
+                                            &guarded) != UM_OK) {
+                free(viable);
+                return UM_ERR_CONFIG;
+            }
             ++result->candidates_verified;
             for (trial = 0u; trial < verification_trials; ++trial) {
                 um_rx_metrics metrics;
@@ -1072,16 +1161,16 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                            seed ^ UINT32_C(0x6a09e667));
                 memset(&metrics, 0, sizeof(metrics));
                 status = try_candidate(
-                    &ranked_candidate->config, channel, seed,
+                    &guarded, channel, seed,
                     verification_probe,
                     sizeof(verification_probe), &duration, &payload_bps,
                     &metrics);
                 reliable = status == UM_OK &&
-                           (ranked_candidate->robust_gate != 0
+                           (um_modem_config_uses_robust_gate(&guarded) != 0
                                 ? um_modem_metrics_have_baseline_margin(
                                       &metrics)
                                 : um_modem_metrics_have_margin(
-                                      &ranked_candidate->config, &metrics)) !=
+                                      &guarded, &metrics)) !=
                                0;
                 ++result->verification_frames;
                 result->estimated_seconds += duration;
@@ -1091,8 +1180,8 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                         "verify rank=%zu trial=%u/%u qam=%u fec=%s: %s "
                         "snr=%.1fdB evm=%.3f",
                         rank + 1u, trial + 1u, verification_trials,
-                        1u << ranked_candidate->config.qam_bits,
-                        fec_name(ranked_candidate->config.fec_rate),
+                        1u << guarded.qam_bits,
+                        fec_name(guarded.fec_rate),
                         reliable != 0
                             ? "pass"
                             : status == UM_OK ? "marginal"
@@ -1111,9 +1200,13 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                 evm_sum += metrics.evm_rms;
                 payload_sum += payload_bps;
             }
-            if (passes == verification_trials + 1u) {
-                result->config = ranked_candidate->config;
-                result->score = ranked_candidate->score;
+            if (passes == verification_trials) {
+                result->config = guarded;
+                result->score =
+                    um_calibration_payload_rate(&guarded,
+                                                search.rate_payload_bytes) /
+                    (1.0f + 4.0f * (evm_sum / (float)passes) *
+                                    (evm_sum / (float)passes));
                 result->payload_bps = payload_sum / (float)passes;
                 result->success_rate = 1.0f;
                 result->evm_rms = evm_sum / (float)passes;

@@ -136,7 +136,6 @@ typedef struct {
     unsigned dns_query_logs;
     unsigned dns_response_logs;
     unsigned dns_retries_suppressed;
-    unsigned dns_response_bursts;
     unsigned multicast_dropped;
     unsigned broadcast_dropped;
     unsigned stale_dns_icmp_dropped;
@@ -604,7 +603,7 @@ static void test_log(void *context, const char *message)
         (void)pthread_mutex_unlock(&bus.mutex);
     }
     if (strstr(message, "calib body tx direction=") != NULL &&
-        strstr(message, "size=384 trial=3/3") != NULL) {
+        strstr(message, "size=384 trial=1/1") != NULL) {
         int endpoint = run->options.role == UM_LIVE_CLIENT
                            ? SIM_CLIENT
                            : SIM_GATEWAY;
@@ -614,7 +613,8 @@ static void test_log(void *context, const char *message)
         }
         (void)pthread_mutex_unlock(&bus.mutex);
     }
-    if (strstr(message, "calib body size=512 failed; selected=384") != NULL) {
+    if (strstr(message, "calib body size=") != NULL &&
+        strstr(message, "failed; selected=") != NULL) {
         ++run->body_stepdowns;
     }
     if (run->options.role == UM_LIVE_GATEWAY &&
@@ -664,7 +664,7 @@ static void test_log(void *context, const char *message)
         ++run->proxy_completed;
     }
     if (strstr(message, "proxy ") != NULL &&
-        strstr(message, " cumulative-ack retry=") != NULL) {
+        strstr(message, " bitmap-ack retry=") != NULL) {
         ++run->proxy_retries;
     }
     if (strstr(message, " window=") != NULL &&
@@ -724,10 +724,6 @@ static void test_log(void *context, const char *message)
             }
             (void)pthread_mutex_unlock(&bus.mutex);
         }
-    }
-    if (strstr(message,
-               "proxy DNS response backlog continuing turn") != NULL) {
-        ++run->dns_response_bursts;
     }
     {
         const char *batch = strstr(message, " batch=");
@@ -1562,7 +1558,6 @@ static int run_pair(const char *label,
           bus.network_dns_retries_injected != 3u ||
           bus.network_dns_retry_reads[SIM_CLIENT] != 3u ||
           client.dns_retries_suppressed != 3u ||
-          gateway.dns_response_bursts == 0u ||
           bus.client_tcp_before_dns_drained == 0 ||
           client.multicast_dropped != 1u ||
           gateway.multicast_dropped != 1u ||
@@ -1608,7 +1603,7 @@ static int run_pair(const char *label,
            "delayed capture restart, %s; upgrades=%u/%u "
            "fallbacks=%u/%u verification-stepdowns=%u calibrations=%u "
            "cache-skips=%u recovery-probes=%u offer-refreshes=%u "
-           "dns-response-bursts=%u/%u\n",
+           "bounded-window-repairs=%u\n",
            label,
            link_test != 0 ? "256+256-byte explicit link test"
                           : "queued/in-flight/completed DNS coalescing plus "
@@ -1618,8 +1613,8 @@ static int run_pair(const char *label,
            client.verification_fallbacks + gateway.verification_fallbacks,
            expected_calibrations, client.cache_skips + gateway.cache_skips,
            client.recovery_probes + gateway.recovery_probes,
-           gateway.offer_refreshes, client.dns_response_bursts,
-           gateway.dns_response_bursts);
+           gateway.offer_refreshes,
+           client.window_repairs + gateway.window_repairs);
     return 0;
 }
 
@@ -1650,7 +1645,7 @@ int main(void)
         found = 0;
         if (um_calibration_config_load(client_path, UM_LIVE_CLIENT, &cached,
                                        &cached_body_bytes, &found) != UM_OK ||
-            found == 0 || cached_body_bytes != 384u) {
+            found == 0 || cached_body_bytes != 256u) {
             fprintf(stderr, "client calibration cache was not saved\n");
             status = 1;
         }
@@ -1659,7 +1654,7 @@ int main(void)
         found = 0;
         if (um_calibration_config_load(gateway_path, UM_LIVE_GATEWAY, &cached,
                                        &cached_body_bytes, &found) != UM_OK ||
-            found == 0 || cached_body_bytes != UM_LIVE_MAX_BODY) {
+            found == 0 || cached_body_bytes != 384u) {
             fprintf(stderr, "gateway calibration cache was not saved\n");
             status = 1;
         }
