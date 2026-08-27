@@ -65,6 +65,9 @@ typedef struct {
     int body_drop_endpoint;
     int body_drop_armed;
     unsigned body_drops;
+    int window_drop_endpoint;
+    int window_drop_armed;
+    unsigned window_drops;
     int network_opened[SIM_ENDPOINTS];
     int network_input_ready[SIM_ENDPOINTS];
     int network_dns_retry_ready[SIM_ENDPOINTS];
@@ -140,6 +143,9 @@ typedef struct {
     unsigned discovery_dns_deprioritized;
     unsigned tcp_acks_coalesced;
     unsigned multi_packet_batches;
+    unsigned multi_packet_windows;
+    unsigned window_starts;
+    unsigned window_repairs;
     unsigned rate_breakdowns;
     unsigned body_stepdowns;
     unsigned reconnecting;
@@ -598,7 +604,7 @@ static void test_log(void *context, const char *message)
         (void)pthread_mutex_unlock(&bus.mutex);
     }
     if (strstr(message, "calib body tx direction=") != NULL &&
-        strstr(message, "size=384 trial=2/2") != NULL) {
+        strstr(message, "size=384 trial=3/3") != NULL) {
         int endpoint = run->options.role == UM_LIVE_CLIENT
                            ? SIM_CLIENT
                            : SIM_GATEWAY;
@@ -661,6 +667,22 @@ static void test_log(void *context, const char *message)
         strstr(message, " cumulative-ack retry=") != NULL) {
         ++run->proxy_retries;
     }
+    if (strstr(message, " window=") != NULL &&
+        strstr(message, " start cells=") != NULL) {
+        int endpoint = run->options.role == UM_LIVE_CLIENT
+                           ? SIM_CLIENT
+                           : SIM_GATEWAY;
+        ++run->window_starts;
+        (void)pthread_mutex_lock(&bus.mutex);
+        if (bus.window_drop_endpoint == endpoint &&
+            bus.window_drops == 0u) {
+            bus.window_drop_armed = 1;
+        }
+        (void)pthread_mutex_unlock(&bus.mutex);
+    }
+    if (strstr(message, " selective-repair missing=") != NULL) {
+        ++run->window_repairs;
+    }
     if (run->options.role == UM_LIVE_GATEWAY &&
         strstr(message, "proxy client->gateway packet=1 ") != NULL) {
         (void)pthread_mutex_lock(&bus.mutex);
@@ -710,11 +732,20 @@ static void test_log(void *context, const char *message)
     {
         const char *batch = strstr(message, " batch=");
         const char *packets = strstr(message, " packets=");
+        const char *cells = strstr(message, " acoustic-cells=");
         unsigned count;
         if (batch != NULL && packets != NULL &&
             sscanf(packets + strlen(" packets="), "%u", &count) == 1 &&
             count > 1u) {
             ++run->multi_packet_batches;
+            if (cells != NULL) {
+                unsigned cell_count;
+                if (sscanf(cells + strlen(" acoustic-cells="), "%u",
+                           &cell_count) == 1 &&
+                    cell_count > 1u) {
+                    ++run->multi_packet_windows;
+                }
+            }
         }
     }
     {
@@ -1000,6 +1031,12 @@ int um_audio_write(um_audio *audio, const float *samples, size_t frame_count)
         bus.body_drop_endpoint == audio->endpoint) {
         bus.body_drop_armed = 0;
         ++bus.body_drops;
+        drop_write = 1;
+    }
+    if (bus.window_drop_armed != 0 &&
+        bus.window_drop_endpoint == audio->endpoint) {
+        bus.window_drop_armed = 0;
+        ++bus.window_drops;
         drop_write = 1;
     }
     (void)pthread_mutex_unlock(&bus.mutex);
@@ -1418,6 +1455,9 @@ static int run_pair(const char *label,
     bus.body_drop_endpoint = link_test == 0 ? SIM_GATEWAY : -1;
     bus.body_drop_armed = 0;
     bus.body_drops = 0u;
+    bus.window_drop_endpoint = link_test == 0 ? SIM_CLIENT : -1;
+    bus.window_drop_armed = 0;
+    bus.window_drops = 0u;
     memset(bus.network_opened, 0, sizeof(bus.network_opened));
     memset(bus.network_input_ready, 0, sizeof(bus.network_input_ready));
     memset(bus.network_dns_retry_ready, 0,
@@ -1548,7 +1588,12 @@ static int run_pair(const char *label,
           client.dns_query_logs + gateway.dns_query_logs < 2u ||
           client.dns_response_logs + gateway.dns_response_logs < 2u ||
           client.multi_packet_batches == 0u ||
-          gateway.multi_packet_batches == 0u || bus.body_drops != 1u ||
+          gateway.multi_packet_batches == 0u ||
+          client.multi_packet_windows + gateway.multi_packet_windows ==
+              0u ||
+          client.window_starts + gateway.window_starts == 0u ||
+          client.window_repairs + gateway.window_repairs == 0u ||
+          bus.window_drops != 1u || bus.body_drops != 1u ||
           client.body_stepdowns + gateway.body_stepdowns < 2u))) {
         fprintf(stderr,
                 "%s paired live simulation failed timeout=%d client=%s "

@@ -972,7 +972,15 @@ static void test_live_wire_protocol(void)
                               wire, sizeof(wire), &wire_length) == UM_OK);
     CHECK(um_live_wire_decode(wire, wire_length, &message) == UM_OK);
     CHECK(message.type == UM_WIRE_PROXY_COMPLETE);
-    CHECK(um_live_wire_encode((um_live_wire_type)27, 0u, 0u, NULL, 0u,
+    CHECK(um_live_wire_encode(UM_WIRE_IP_WINDOW, 3u, 4u, body, 10u,
+                              wire, sizeof(wire), &wire_length) == UM_OK);
+    CHECK(um_live_wire_decode(wire, wire_length, &message) == UM_OK);
+    CHECK(message.type == UM_WIRE_IP_WINDOW);
+    CHECK(um_live_wire_encode(UM_WIRE_IP_NACK, 3u, 4u, body, 4u,
+                              wire, sizeof(wire), &wire_length) == UM_OK);
+    CHECK(um_live_wire_decode(wire, wire_length, &message) == UM_OK);
+    CHECK(message.type == UM_WIRE_IP_NACK);
+    CHECK(um_live_wire_encode((um_live_wire_type)29, 0u, 0u, NULL, 0u,
                               wire, sizeof(wire), &wire_length) ==
           UM_ERR_ARGUMENT);
 

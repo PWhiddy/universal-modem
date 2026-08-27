@@ -1036,7 +1036,7 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
         sizeof(ranked) / sizeof(ranked[0]));
     if (ranked_count != 0u) {
         size_t rank;
-        unsigned verification_trials = high_quality != 0 ? 5u : 3u;
+        unsigned verification_trials = high_quality != 0 ? 7u : 4u;
         for (rank = 0u; rank < ranked_count; ++rank) {
             viable_candidate *ranked_candidate = NULL;
             size_t viable_index;

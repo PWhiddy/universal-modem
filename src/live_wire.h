@@ -37,7 +37,9 @@ typedef enum {
     UM_WIRE_PROXY_COMPLETE = 23,
     UM_WIRE_IP_BATCH = 24,
     UM_WIRE_CALIB_BODY_PROBE = 25,
-    UM_WIRE_CALIB_BODY_RESULT = 26
+    UM_WIRE_CALIB_BODY_RESULT = 26,
+    UM_WIRE_IP_WINDOW = 27,
+    UM_WIRE_IP_NACK = 28
 } um_live_wire_type;
 
 typedef struct {
