@@ -190,6 +190,7 @@ typedef struct {
     int calibrate_high_quality;
     const char *calibration_path;
     size_t proxy_test_packets;
+    int filter_background_traffic;
 } um_live_audio_options;
 
 uint32_t um_crc32(const uint8_t *data, size_t length);

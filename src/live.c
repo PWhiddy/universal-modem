@@ -3,6 +3,7 @@
 #include "audio.h"
 #include "live_wire.h"
 #include "network.h"
+#include "traffic_policy.h"
 #include "um_internal.h"
 
 #include <ctype.h>
@@ -161,6 +162,8 @@ typedef struct {
     size_t discovery_dns_deprioritized;
     size_t discovery_dns_dropped;
     size_t tcp_acks_coalesced;
+    size_t background_dns_rejected;
+    size_t background_packets_dropped;
     size_t queue_priority_evictions;
     size_t queue_logged_dropped;
     size_t queue_logged_duplicates;
@@ -171,6 +174,8 @@ typedef struct {
     size_t discovery_dns_logged_deprioritized;
     size_t discovery_dns_logged_dropped;
     size_t tcp_acks_logged_coalesced;
+    size_t background_dns_logged_rejected;
+    size_t background_packets_logged_dropped;
     size_t queue_logged_priority_evictions;
     size_t consecutive_dns_sent;
     uint64_t started_ms;
@@ -190,9 +195,6 @@ static volatile sig_atomic_t live_interrupted = 0;
 
 static int fatal_live_status(int status);
 static const char *direction_label(unsigned direction);
-static int proxy_packet_is_tunnel_discovery_dns(const uint8_t *packet,
-                                                size_t length);
-
 static void handle_signal(int signal_number)
 {
     (void)signal_number;
@@ -2228,44 +2230,6 @@ static int proxy_packet_is_dns_traffic(const uint8_t *packet, size_t length)
             read_u16(&packet[transport_offset + 2u]) == 53u);
 }
 
-static int proxy_packet_is_tunnel_broadcast(const uint8_t *packet,
-                                            size_t length)
-{
-    static const uint8_t subnet_broadcast[4] = {10u, 77u, 0u, 3u};
-    static const uint8_t limited_broadcast[4] = {255u, 255u, 255u, 255u};
-    return validate_ip_packet(packet, length) == UM_OK &&
-           (packet[0] >> 4u) == 4u &&
-           (memcmp(&packet[16], subnet_broadcast,
-                   sizeof(subnet_broadcast)) == 0 ||
-            memcmp(&packet[16], limited_broadcast,
-                   sizeof(limited_broadcast)) == 0);
-}
-
-static int proxy_packet_is_stale_dns_icmp(const uint8_t *packet,
-                                          size_t length)
-{
-    size_t header_length;
-    size_t quoted_offset;
-    size_t quoted_header_length;
-    if (validate_ip_packet(packet, length) != UM_OK ||
-        (packet[0] >> 4u) != 4u || packet[9] != 1u) {
-        return 0;
-    }
-    header_length = (size_t)(packet[0] & 0x0fu) * 4u;
-    quoted_offset = header_length + 8u;
-    if (quoted_offset + 28u > length || packet[header_length] != 3u ||
-        packet[header_length + 1u] != 3u ||
-        (packet[quoted_offset] >> 4u) != 4u ||
-        packet[quoted_offset + 9u] != 17u) {
-        return 0;
-    }
-    quoted_header_length =
-        (size_t)(packet[quoted_offset] & 0x0fu) * 4u;
-    return quoted_header_length >= 20u &&
-           quoted_offset + quoted_header_length + 8u <= length &&
-           read_u16(&packet[quoted_offset + quoted_header_length]) == 53u;
-}
-
 static int tcp_ack_options_are_replaceable(const uint8_t *tcp,
                                            size_t header_length)
 {
@@ -2360,7 +2324,8 @@ static unsigned proxy_packet_priority(const uint8_t *packet, size_t length)
         source_port = read_u16(&packet[transport_offset]);
         destination_port = read_u16(&packet[transport_offset + 2u]);
         if (source_port == 53u || destination_port == 53u) {
-            return proxy_packet_is_tunnel_discovery_dns(packet, length) != 0
+            return um_traffic_policy_is_tunnel_discovery_dns(packet,
+                                                              length) != 0
                        ? LIVE_PROXY_PRIORITY_NORMAL
                        : LIVE_PROXY_PRIORITY_DNS;
         }
@@ -2474,65 +2439,6 @@ static int read_dns_name(const uint8_t *dns, size_t dns_length,
         }
     }
     return 0;
-}
-
-static int text_has_case_insensitive_suffix(const char *text,
-                                            const char *suffix)
-{
-    size_t text_length = strlen(text);
-    size_t suffix_length = strlen(suffix);
-    size_t index;
-    if (suffix_length > text_length) {
-        return 0;
-    }
-    text += text_length - suffix_length;
-    for (index = 0u; index < suffix_length; ++index) {
-        if (tolower((unsigned char)text[index]) !=
-            tolower((unsigned char)suffix[index])) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static int proxy_packet_is_tunnel_discovery_dns(const uint8_t *packet,
-                                                size_t length)
-{
-    const uint8_t *dns;
-    size_t header_length;
-    size_t dns_length;
-    size_t question_end = 0u;
-    uint16_t source_port;
-    uint16_t destination_port;
-    uint16_t udp_length;
-    char name[96];
-    if (validate_ip_packet(packet, length) != UM_OK ||
-        (packet[0] >> 4u) != 4u || packet[9] != 17u ||
-        (read_u16(&packet[6]) & UINT16_C(0x3fff)) != 0u) {
-        return 0;
-    }
-    header_length = (size_t)(packet[0] & 0x0fu) * 4u;
-    if (header_length + 20u > length) {
-        return 0;
-    }
-    source_port = read_u16(&packet[header_length]);
-    destination_port = read_u16(&packet[header_length + 2u]);
-    udp_length = read_u16(&packet[header_length + 4u]);
-    if ((source_port != 53u && destination_port != 53u) ||
-        udp_length != length - header_length || udp_length < 20u) {
-        return 0;
-    }
-    dns = &packet[header_length + 8u];
-    dns_length = udp_length - 8u;
-    if (read_u16(&dns[4]) == 0u ||
-        read_dns_name(dns, dns_length, 12u, name, sizeof(name),
-                      &question_end) == 0 ||
-        question_end + 4u > dns_length ||
-        read_u16(&dns[question_end]) != 12u) {
-        return 0;
-    }
-    return text_has_case_insensitive_suffix(
-        name, ".0.77.10.in-addr.arpa");
 }
 
 static uint32_t dns_name_hash(const char *name)
@@ -2989,29 +2895,6 @@ static int enqueue_proxy_packet(live_proxy_state *state,
     if (validate_ip_packet(packet, packet_length) != UM_OK) {
         return UM_ERR_HEADER;
     }
-    /* Link-local multicast has no useful path through an Internet gateway.
-     * In particular, mDNS and SSDP daemons advertise on every new TUN and
-     * otherwise consume the acoustic link indefinitely. */
-    if ((packet[0] >> 4u) == 4u &&
-        (packet[16] & UINT8_C(0xf0)) == UINT8_C(0xe0)) {
-        ++state->multicast_dropped;
-        return UM_OK;
-    }
-    /* The peer address space is a /30, making 10.77.0.3 its directed
-     * broadcast address. Neither it nor 255.255.255.255 can be forwarded by
-     * the gateway; dropping them here prevents NetBIOS and similar discovery
-     * retries from consuming acoustic frames. */
-    if (proxy_packet_is_tunnel_broadcast(packet, packet_length) != 0) {
-        ++state->broadcast_dropped;
-        return UM_OK;
-    }
-    /* A UDP port-unreachable quoting a DNS response is only notice that the
-     * local resolver already closed its socket. Recursive DNS is stateless,
-     * so relaying that ICMP packet cannot recover anything. */
-    if (proxy_packet_is_stale_dns_icmp(packet, packet_length) != 0) {
-        ++state->stale_dns_icmp_dropped;
-        return UM_OK;
-    }
     if (dns_query_recently_completed(state, packet, packet_length) != 0) {
         ++state->dns_retries_suppressed;
         return UM_OK;
@@ -3043,9 +2926,10 @@ static int enqueue_proxy_packet(live_proxy_state *state,
             return UM_OK;
         }
     }
-    if (proxy_packet_is_tunnel_discovery_dns(packet, packet_length) != 0) {
+    if (um_traffic_policy_is_tunnel_discovery_dns(packet,
+                                                   packet_length) != 0) {
         for (index = 0u; index < state->queue_count; ++index) {
-            if (proxy_packet_is_tunnel_discovery_dns(
+            if (um_traffic_policy_is_tunnel_discovery_dns(
                     state->queue[index].packet,
                     state->queue[index].length) != 0) {
                 ++queued_discovery_dns;
@@ -3115,6 +2999,56 @@ static int drain_proxy_ingress(live_context *context,
         if (status != UM_OK) {
             return status;
         }
+        {
+            um_traffic_policy_decision decision;
+            if (um_traffic_policy_decide(
+                    packet, packet_length,
+                    context->options.role == UM_LIVE_CLIENT,
+                    context->options.filter_background_traffic,
+                    &decision) != 0) {
+                return UM_ERR_HEADER;
+            }
+            if (decision.action == UM_TRAFFIC_POLICY_DROP_MULTICAST) {
+                ++state->multicast_dropped;
+                continue;
+            }
+            if (decision.action == UM_TRAFFIC_POLICY_DROP_BROADCAST) {
+                ++state->broadcast_dropped;
+                continue;
+            }
+            if (decision.action == UM_TRAFFIC_POLICY_DROP_STALE_DNS_ICMP) {
+                ++state->stale_dns_icmp_dropped;
+                continue;
+            }
+            if (decision.action == UM_TRAFFIC_POLICY_DROP_BACKGROUND) {
+                ++state->background_packets_dropped;
+                live_log(context, "proxy firewall drop rule=%s",
+                         decision.rule);
+                continue;
+            }
+            if (decision.action ==
+                UM_TRAFFIC_POLICY_REJECT_BACKGROUND_DNS) {
+                uint8_t response[UM_NETWORK_MAX_PACKET];
+                size_t response_length = 0u;
+                if (um_traffic_policy_build_dns_rejection(
+                        packet, packet_length, response, sizeof(response),
+                        &response_length) != 0) {
+                    return UM_ERR_HEADER;
+                }
+                status = um_network_write(context->network, response,
+                                          response_length, 1000u);
+                if (status != UM_OK) {
+                    return status;
+                }
+                ++state->background_dns_rejected;
+                live_log(context,
+                         "proxy firewall local-nxdomain name=%s type=%u "
+                         "rule=%s",
+                         decision.dns_name, (unsigned)decision.dns_type,
+                         decision.rule);
+                continue;
+            }
+        }
         status = enqueue_proxy_packet(state, packet, packet_length);
         if (status != UM_OK) {
             return status;
@@ -3133,6 +3067,10 @@ static int drain_proxy_ingress(live_context *context,
         state->discovery_dns_dropped !=
             state->discovery_dns_logged_dropped ||
         state->tcp_acks_coalesced != state->tcp_acks_logged_coalesced ||
+        state->background_dns_rejected !=
+            state->background_dns_logged_rejected ||
+        state->background_packets_dropped !=
+            state->background_packets_logged_dropped ||
         state->queue_priority_evictions !=
             state->queue_logged_priority_evictions) {
         live_log(context,
@@ -3142,6 +3080,8 @@ static int drain_proxy_ingress(live_context *context,
                  "stale-dns-icmp-dropped=%zu "
                  "discovery-dns-deprioritized=%zu "
                  "discovery-dns-dropped=%zu tcp-acks-coalesced=%zu "
+                 "background-dns-rejected=%zu "
+                 "background-packets-dropped=%zu "
                  "priority-evictions=%zu",
                  state->queue_count, state->queue_dropped,
                  state->queue_duplicates,
@@ -3152,6 +3092,8 @@ static int drain_proxy_ingress(live_context *context,
                  state->discovery_dns_deprioritized,
                  state->discovery_dns_dropped,
                  state->tcp_acks_coalesced,
+                 state->background_dns_rejected,
+                 state->background_packets_dropped,
                  state->queue_priority_evictions);
         state->queue_logged_dropped = state->queue_dropped;
         state->queue_logged_duplicates = state->queue_duplicates;
@@ -3166,6 +3108,10 @@ static int drain_proxy_ingress(live_context *context,
         state->discovery_dns_logged_dropped =
             state->discovery_dns_dropped;
         state->tcp_acks_logged_coalesced = state->tcp_acks_coalesced;
+        state->background_dns_logged_rejected =
+            state->background_dns_rejected;
+        state->background_packets_logged_dropped =
+            state->background_packets_dropped;
         state->queue_logged_priority_evictions =
             state->queue_priority_evictions;
     }
@@ -4563,6 +4509,7 @@ um_live_audio_options um_live_audio_default_options(um_live_role role)
     options.calibrate_high_quality = 0;
     options.calibration_path = "calibration.config";
     options.proxy_test_packets = 0u;
+    options.filter_background_traffic = 1;
     return options;
 }
 
@@ -4641,6 +4588,11 @@ int um_run_live_audio(const um_live_audio_options *options,
              options->link_test != 0 ? "link-test" : "network-proxy",
              options->test_bytes, options->chunk_bytes,
              options->retry_limit, LIVE_TURNAROUND_MS);
+    if (options->link_test == 0) {
+        live_log(&context, "Quiet-link firewall=%s",
+                 options->filter_background_traffic != 0 ? "enabled"
+                                                         : "disabled");
+    }
     live_log(&context,
              "Bootstrap qam=%u fec=%s cp=%u window=%u repeats=%u training=%u "
              "sync=%.1fms band=%.0f-%.0fHz",

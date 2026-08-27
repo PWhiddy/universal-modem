@@ -1389,6 +1389,9 @@ static void configure_runner(runner *run, const char *name,
     run->options.retry_limit = 5u;
     run->options.discovery_interval_seconds = 0.4f;
     run->options.calibration_path = calibration_path;
+    /* Queue stress uses a synthetic discovery query. Quiet-policy behavior is
+     * covered directly in test_modem, so retain the legacy stress traffic. */
+    run->options.filter_background_traffic = 0;
 }
 
 static int run_pair(const char *label,

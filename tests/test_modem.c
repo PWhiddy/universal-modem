@@ -1,5 +1,6 @@
 #include "um.h"
 #include "../src/live_wire.h"
+#include "../src/traffic_policy.h"
 #include "../src/um_internal.h"
 
 #include <limits.h>
@@ -30,6 +31,189 @@ static uint32_t test_random(void)
     test_random_state ^= test_random_state >> 17u;
     test_random_state ^= test_random_state << 5u;
     return test_random_state;
+}
+
+static uint32_t policy_checksum_add(uint32_t sum, const uint8_t *bytes,
+                                    size_t length)
+{
+    while (length >= 2u) {
+        sum += ((uint32_t)bytes[0] << 8u) | bytes[1];
+        bytes += 2u;
+        length -= 2u;
+    }
+    if (length != 0u) {
+        sum += (uint32_t)bytes[0] << 8u;
+    }
+    return sum;
+}
+
+static uint16_t policy_checksum_finish(uint32_t sum)
+{
+    while ((sum >> 16u) != 0u) {
+        sum = (sum & UINT32_C(0xffff)) + (sum >> 16u);
+    }
+    return (uint16_t)~sum;
+}
+
+static void policy_write_u16(uint8_t *bytes, uint16_t value)
+{
+    bytes[0] = (uint8_t)(value >> 8u);
+    bytes[1] = (uint8_t)value;
+}
+
+static size_t make_policy_dns_query(uint8_t *packet, size_t capacity,
+                                    const char *name, uint16_t type)
+{
+    uint8_t *dns;
+    size_t offset = 12u;
+    const char *label = name;
+    const char *position = name;
+    size_t dns_length;
+    size_t packet_length;
+    uint16_t checksum;
+    uint32_t sum;
+    memset(packet, 0, capacity);
+    while (1) {
+        if (*position == '.' || *position == '\0') {
+            size_t label_length = (size_t)(position - label);
+            if (label_length == 0u || label_length > 63u ||
+                28u + offset + label_length + 6u > capacity) {
+                return 0u;
+            }
+            packet[28u + offset++] = (uint8_t)label_length;
+            memcpy(&packet[28u + offset], label, label_length);
+            offset += label_length;
+            if (*position == '\0') {
+                break;
+            }
+            label = position + 1;
+        }
+        ++position;
+    }
+    packet[28u + offset++] = 0u;
+    policy_write_u16(&packet[28u + offset], type);
+    offset += 2u;
+    policy_write_u16(&packet[28u + offset], 1u);
+    offset += 2u;
+    dns_length = offset;
+    packet_length = 28u + dns_length;
+    packet[0] = 0x45u;
+    policy_write_u16(&packet[2], (uint16_t)packet_length);
+    packet[8] = 64u;
+    packet[9] = 17u;
+    packet[12] = 10u;
+    packet[13] = 77u;
+    packet[14] = 0u;
+    packet[15] = 2u;
+    packet[16] = 1u;
+    packet[17] = 1u;
+    packet[18] = 1u;
+    packet[19] = 1u;
+    policy_write_u16(&packet[20], 53000u);
+    policy_write_u16(&packet[22], 53u);
+    policy_write_u16(&packet[24], (uint16_t)(packet_length - 20u));
+    dns = &packet[28];
+    policy_write_u16(dns, UINT16_C(0x4d2a));
+    policy_write_u16(&dns[2], UINT16_C(0x0100));
+    policy_write_u16(&dns[4], 1u);
+    checksum = policy_checksum_finish(policy_checksum_add(0u, packet, 20u));
+    policy_write_u16(&packet[10], checksum);
+    sum = policy_checksum_add(0u, &packet[12], 8u);
+    sum += 17u;
+    sum += (uint32_t)(packet_length - 20u);
+    sum = policy_checksum_add(sum, &packet[20], packet_length - 20u);
+    checksum = policy_checksum_finish(sum);
+    policy_write_u16(&packet[26],
+                     checksum == 0u ? UINT16_C(0xffff) : checksum);
+    return packet_length;
+}
+
+static void test_quiet_traffic_policy(void)
+{
+    static const char *allowed[] = {
+        "example.com",
+        "google.com",
+        "42-courier.push.apple.com",
+        "us-ne-courier-4.push-apple.com.akadns.net",
+        "query.ess.apple.com",
+        "init-cdn-lb.ess-apple.com.akadns.net",
+        "init.ess.g.aaplimg.com",
+        "ocsp.apple.com",
+        "valid.apple.com",
+        "notapple.com"
+    };
+    static const char *blocked[] = {
+        "news-edge.apple.com",
+        "apple.com",
+        "www.apple.com",
+        "init.itunes.apple.com",
+        "apps.mzstatic.com",
+        "api.apple-cloudkit.com",
+        "mask.icloud.com",
+        "gateway.fe2.apple-dns.net",
+        "detectportal.firefox.com",
+        "firefox.settings.services.mozilla.com",
+        "incoming.telemetry.mozilla.org",
+        "mozilla.cloudflare-dns.com",
+        "safebrowsing.googleapis.com",
+        "one.one.one.one"
+    };
+    uint8_t query[512];
+    uint8_t response[512];
+    size_t query_length;
+    size_t response_length = 0u;
+    size_t index;
+    um_traffic_policy_decision decision;
+    uint32_t sum;
+    ++tests_run;
+    for (index = 0u; index < sizeof(allowed) / sizeof(allowed[0]); ++index) {
+        query_length = make_policy_dns_query(query, sizeof(query),
+                                             allowed[index], 1u);
+        CHECK(query_length != 0u);
+        CHECK(um_traffic_policy_decide(query, query_length, 1, 1,
+                                       &decision) == 0);
+        CHECK(decision.action == UM_TRAFFIC_POLICY_PASS);
+    }
+    for (index = 0u; index < sizeof(blocked) / sizeof(blocked[0]); ++index) {
+        query_length = make_policy_dns_query(query, sizeof(query),
+                                             blocked[index], 65u);
+        CHECK(query_length != 0u);
+        CHECK(um_traffic_policy_decide(query, query_length, 1, 1,
+                                       &decision) == 0);
+        CHECK(decision.action ==
+              UM_TRAFFIC_POLICY_REJECT_BACKGROUND_DNS);
+        CHECK(strcmp(decision.dns_name, blocked[index]) == 0);
+    }
+    query_length = make_policy_dns_query(query, sizeof(query),
+                                         "news-edge.apple.com", 1u);
+    CHECK(um_traffic_policy_decide(query, query_length, 1, 0, &decision) ==
+          0);
+    CHECK(decision.action == UM_TRAFFIC_POLICY_PASS);
+    CHECK(um_traffic_policy_build_dns_rejection(
+              query, query_length, response, sizeof(response),
+              &response_length) == 0);
+    CHECK(response_length == query_length);
+    CHECK(memcmp(&response[12], &query[16], 4u) == 0);
+    CHECK(memcmp(&response[16], &query[12], 4u) == 0);
+    CHECK(response[20] == query[22] && response[21] == query[23]);
+    CHECK(response[22] == query[20] && response[23] == query[21]);
+    CHECK((response[30] & UINT8_C(0x80)) != 0u);
+    CHECK((response[31] & UINT8_C(0x0f)) == 3u);
+    CHECK(policy_checksum_finish(policy_checksum_add(0u, response, 20u)) ==
+          0u);
+    sum = policy_checksum_add(0u, &response[12], 8u);
+    sum += 17u;
+    sum += (uint32_t)(response_length - 20u);
+    sum = policy_checksum_add(sum, &response[20], response_length - 20u);
+    CHECK(policy_checksum_finish(sum) == 0u);
+
+    query_length = make_policy_dns_query(
+        query, sizeof(query), "b._dns-sd._udp.0.0.77.10.in-addr.arpa", 12u);
+    CHECK(um_traffic_policy_is_tunnel_discovery_dns(query, query_length) !=
+          0);
+    CHECK(um_traffic_policy_decide(query, query_length, 1, 1, &decision) ==
+          0);
+    CHECK(decision.action == UM_TRAFFIC_POLICY_REJECT_BACKGROUND_DNS);
 }
 
 static void test_crc(void)
@@ -1626,6 +1810,7 @@ static void test_adaptive_calibration_search(void)
 int main(void)
 {
     test_crc();
+    test_quiet_traffic_policy();
     test_fft_round_trip();
     test_qam_constellations();
     test_fec_rates();

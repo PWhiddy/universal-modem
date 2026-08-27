@@ -33,7 +33,7 @@ LIB_SOURCES := \
 	src/network.c \
 	src/qam.c
 
-LIB_SOURCES += src/session.c src/validation.c
+LIB_SOURCES += src/session.c src/traffic_policy.c src/validation.c
 LIB_OBJECTS := $(LIB_SOURCES:.c=.o)
 SIM_LIB_OBJECTS := $(filter-out src/audio.o src/network.o,$(LIB_OBJECTS))
 
@@ -60,6 +60,7 @@ test check: test_modem test_live_audio
 src/audio.o src/live.o: src/audio.h
 src/live.o src/network.o tests/test_live_audio.o: src/network.h
 src/live.o src/live_wire.o tests/test_modem.o tests/test_live_audio.o: src/live_wire.h
+src/live.o src/traffic_policy.o tests/test_modem.o: src/traffic_policy.h
 tests/test_live_audio.o: src/audio.h
 
 clean:

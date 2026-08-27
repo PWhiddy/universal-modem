@@ -25,6 +25,7 @@ static void usage(FILE *stream)
             "  --chunk-bytes N      Maximum calibrated frame body (default 512)\n"
             "  --retries N          Attempts per acknowledged frame (default 4)\n"
             "  --calib-high         Use the extended real-audio calibration\n"
+            "  --allow-background   Disable the default quiet-link firewall\n"
             "  calibration.config  Auto-loaded/saved; delete it to recalibrate\n");
 }
 
@@ -176,6 +177,7 @@ int main(int argc, char **argv)
     int high_quality = 0;
     int audio = 0;
     int link_test = 0;
+    int allow_background = 0;
     int endpoint = 0;
     int list_audio = 0;
     int noise_was_set = 0;
@@ -199,6 +201,8 @@ int main(int argc, char **argv)
             audio = 1;
         } else if (strcmp(argv[i], "--link-test") == 0) {
             link_test = 1;
+        } else if (strcmp(argv[i], "--allow-background") == 0) {
+            allow_background = 1;
         } else if (strcmp(argv[i], "--list-audio") == 0) {
             list_audio = 1;
         } else if (strcmp(argv[i], "--gateway") == 0) {
@@ -325,6 +329,7 @@ int main(int argc, char **argv)
         options.chunk_bytes = chunk_bytes;
         options.retry_limit = retries;
         options.calibrate_high_quality = high_quality;
+        options.filter_background_traffic = allow_background == 0;
         status = um_run_live_audio(&options, print_log, stdout);
         if (status == UM_ERR_INTERRUPTED) {
             return 130;
