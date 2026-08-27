@@ -67,6 +67,8 @@ typedef struct {
     unsigned network_background_remaining[SIM_ENDPOINTS];
     unsigned network_dns_retry_reads[SIM_ENDPOINTS];
     unsigned network_dns_retries_injected;
+    int network_dns_response_delayed;
+    int client_tcp_before_dns_drained;
     unsigned network_targets_read[SIM_ENDPOINTS];
     unsigned network_reads[SIM_ENDPOINTS];
     unsigned network_writes[SIM_ENDPOINTS];
@@ -328,7 +330,8 @@ static void make_proxy_background(uint8_t *packet, int endpoint,
         packet, SIM_BACKGROUND_BYTES,
         (uint8_t)(0x40u + background_number +
                   (unsigned)endpoint * 0x30u),
-        (uint16_t)(40000u + background_number), 443u);
+        (uint16_t)(40000u + background_number),
+        endpoint == SIM_CLIENT ? 53u : 443u);
     if (background_number == SIM_BACKGROUND_PACKETS) {
         packet[16] = 224u;
         packet[17] = 0u;
@@ -509,6 +512,17 @@ static void test_log(void *context, const char *message)
     if (strstr(message, "DNS response dns.test A") != NULL &&
         strstr(message, "rcode=0 answers=1") != NULL) {
         ++run->dns_response_logs;
+        if (run->options.role == UM_LIVE_CLIENT) {
+            /* log_proxy_packet follows remember_completed_dns, so this
+             * retry deterministically exercises the completed cache. */
+            (void)pthread_mutex_lock(&bus.mutex);
+            if (bus.network_dns_retries_injected == 2u) {
+                ++bus.network_dns_retry_ready[SIM_CLIENT];
+                ++bus.network_dns_retries_injected;
+                (void)pthread_cond_broadcast(&bus.changed);
+            }
+            (void)pthread_mutex_unlock(&bus.mutex);
+        }
     }
     {
         const char *batch = strstr(message, " batch=");
@@ -907,19 +921,30 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
         (void)pthread_mutex_unlock(&bus.mutex);
         return UM_ERR_TIMEOUT;
     }
-    if (bus.network_background_remaining[network->endpoint] != 0u) {
+    if (network->endpoint == SIM_CLIENT &&
+        bus.network_targets_read[SIM_CLIENT] == 0u &&
+        bus.network_input_ready[SIM_CLIENT] != 0) {
+        --bus.network_input_ready[SIM_CLIENT];
+        target_index = bus.network_targets_read[SIM_CLIENT]++;
+        ++bus.network_dns_retry_ready[SIM_CLIENT];
+        ++bus.network_dns_retries_injected;
+        (void)pthread_cond_broadcast(&bus.changed);
+    } else if (bus.network_dns_retry_ready[network->endpoint] != 0) {
+        --bus.network_dns_retry_ready[network->endpoint];
+        ++bus.network_dns_retry_reads[network->endpoint];
+        dns_retry = 1;
+        target_index = 0u;
+    } else if (bus.network_input_ready[network->endpoint] != 0) {
+        --bus.network_input_ready[network->endpoint];
+        target_index = bus.network_targets_read[network->endpoint]++;
+    } else if (bus.network_background_remaining[network->endpoint] != 0u) {
         background = 1;
         background_number =
             bus.network_background_remaining[network->endpoint];
         --bus.network_background_remaining[network->endpoint];
-    } else if (bus.network_dns_retry_ready[network->endpoint] != 0) {
-        bus.network_dns_retry_ready[network->endpoint] = 0;
-        ++bus.network_dns_retry_reads[network->endpoint];
-        dns_retry = 1;
-        target_index = 0u;
     } else {
-        --bus.network_input_ready[network->endpoint];
-        target_index = bus.network_targets_read[network->endpoint]++;
+        (void)pthread_mutex_unlock(&bus.mutex);
+        return UM_ERR_TIMEOUT;
     }
     ++bus.network_reads[network->endpoint];
     (void)pthread_mutex_unlock(&bus.mutex);
@@ -998,14 +1023,28 @@ int um_network_write(um_network *network, const uint8_t *packet,
     if (target_matches != 0) {
         ++bus.network_matches[network->endpoint];
         if (network->endpoint == SIM_GATEWAY) {
-            ++bus.network_input_ready[SIM_GATEWAY];
             if (target_index == 0u) {
+                bus.network_dns_response_delayed = 1;
                 bus.network_input_ready[SIM_CLIENT] +=
                     SIM_PROXY_PACKETS - 1u;
-                bus.network_dns_retry_ready[SIM_CLIENT] = 1;
+                ++bus.network_dns_retry_ready[SIM_CLIENT];
                 ++bus.network_dns_retries_injected;
+            } else {
+                ++bus.network_input_ready[SIM_GATEWAY];
+            }
+            if (target_index == 1u &&
+                bus.network_background_matches[SIM_GATEWAY] <
+                    SIM_FORWARDED_BACKGROUND_PACKETS) {
+                bus.client_tcp_before_dns_drained = 1;
             }
         }
+    }
+    if (background_matches != 0 && network->endpoint == SIM_CLIENT &&
+        bus.network_dns_response_delayed != 0) {
+        bus.network_dns_response_delayed = 0;
+        ++bus.network_input_ready[SIM_GATEWAY];
+    }
+    if (target_matches != 0 || background_matches != 0) {
         (void)pthread_cond_broadcast(&bus.changed);
     }
     (void)pthread_mutex_unlock(&bus.mutex);
@@ -1147,6 +1186,8 @@ static int run_pair(const char *label,
     memset(bus.network_dns_retry_reads, 0,
            sizeof(bus.network_dns_retry_reads));
     bus.network_dns_retries_injected = 0u;
+    bus.network_dns_response_delayed = 0;
+    bus.client_tcp_before_dns_drained = 0;
     memset(bus.network_targets_read, 0, sizeof(bus.network_targets_read));
     memset(bus.network_reads, 0, sizeof(bus.network_reads));
     memset(bus.network_writes, 0, sizeof(bus.network_writes));
@@ -1224,7 +1265,7 @@ static int run_pair(const char *label,
          (bus.network_opened[SIM_CLIENT] != 0 ||
           bus.network_opened[SIM_GATEWAY] != 0 ||
           bus.network_reads[SIM_CLIENT] !=
-              SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS + 1u ||
+              SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS + 3u ||
           bus.network_reads[SIM_GATEWAY] !=
               SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS ||
           bus.network_writes[SIM_CLIENT] != SIM_FORWARDED_PACKETS ||
@@ -1235,9 +1276,10 @@ static int run_pair(const char *label,
               SIM_FORWARDED_BACKGROUND_PACKETS ||
           bus.network_background_matches[SIM_GATEWAY] !=
               SIM_FORWARDED_BACKGROUND_PACKETS ||
-          bus.network_dns_retries_injected != 1u ||
-          bus.network_dns_retry_reads[SIM_CLIENT] != 1u ||
-          client.dns_retries_suppressed != 1u ||
+          bus.network_dns_retries_injected != 3u ||
+          bus.network_dns_retry_reads[SIM_CLIENT] != 3u ||
+          client.dns_retries_suppressed != 3u ||
+          bus.client_tcp_before_dns_drained == 0 ||
           client.multicast_dropped != 1u ||
           gateway.multicast_dropped != 1u)) ||
         (inject_proxy_retry != 0 &&
@@ -1269,8 +1311,8 @@ static int run_pair(const char *label,
            "cache-skips=%u recovery-probes=%u offer-refreshes=%u\n",
            label,
            link_test != 0 ? "256+256-byte explicit link test"
-                          : "cross-resolver DNS coalescing plus eight-packet "
-                            "TCP burst through multicast-saturated queues",
+                          : "queued/in-flight/completed DNS coalescing plus "
+                            "TCP progress through DNS-saturated queues",
            client.adaptive_upgrades, gateway.adaptive_upgrades,
            client.baseline_selections, gateway.baseline_selections,
            client.verification_fallbacks + gateway.verification_fallbacks,

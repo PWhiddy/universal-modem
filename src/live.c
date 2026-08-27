@@ -38,8 +38,12 @@
 #define LIVE_PROXY_BEGIN_BYTES 7u
 #define LIVE_PROXY_BURST_PACKETS 4u
 #define LIVE_PROXY_QUEUE_PACKETS 64u
-#define LIVE_PROXY_RECENT_DNS 8u
+#define LIVE_PROXY_RECENT_DNS 64u
+#define LIVE_PROXY_INFLIGHT_DNS 64u
 #define LIVE_PROXY_DNS_RETRY_SUPPRESS_MS 30000u
+#define LIVE_PROXY_DNS_INFLIGHT_SUPPRESS_MS 15000u
+#define LIVE_PROXY_DNS_QUEUE_LIMIT 48u
+#define LIVE_PROXY_DNS_BURST_PACKETS 3u
 #define LIVE_PROXY_INGRESS_DRAIN_LIMIT 512u
 #define LIVE_PROXY_IDLE_MS 350u
 #define LIVE_PROXY_ACK_TIMEOUT_MS 5000u
@@ -77,6 +81,12 @@ typedef struct {
     uint64_t completed_ms;
     int valid;
 } live_proxy_recent_dns;
+
+typedef struct {
+    live_proxy_dns_key key;
+    uint64_t sent_ms;
+    int valid;
+} live_proxy_inflight_dns;
 
 typedef struct {
     um_live_audio_options options;
@@ -119,6 +129,7 @@ typedef struct {
     size_t bytes_received;
     live_proxy_queued_packet queue[LIVE_PROXY_QUEUE_PACKETS];
     live_proxy_recent_dns recent_dns[LIVE_PROXY_RECENT_DNS];
+    live_proxy_inflight_dns inflight_dns[LIVE_PROXY_INFLIGHT_DNS];
     size_t queue_count;
     size_t queue_dropped;
     size_t queue_duplicates;
@@ -130,6 +141,7 @@ typedef struct {
     size_t dns_retries_logged_suppressed;
     size_t multicast_logged_dropped;
     size_t queue_logged_priority_evictions;
+    size_t consecutive_dns_sent;
     uint64_t started_ms;
     int have_last_completed_packet;
     int have_last_completed_batch;
@@ -2434,16 +2446,39 @@ static void remove_proxy_queue_entry(live_proxy_state *state, size_t index)
     --state->queue_count;
 }
 
-static size_t highest_proxy_queue_index(const live_proxy_state *state)
+static int proxy_queue_has_non_dns(const live_proxy_state *state)
 {
-    size_t selected = 0u;
     size_t index;
-    for (index = 1u; index < state->queue_count; ++index) {
-        if (state->queue[index].priority > state->queue[selected].priority) {
-            selected = index;
+    for (index = 0u; index < state->queue_count; ++index) {
+        if (state->queue[index].priority != LIVE_PROXY_PRIORITY_DNS) {
+            return 1;
         }
     }
-    return selected;
+    return 0;
+}
+
+static int select_proxy_queue_index(const live_proxy_state *state,
+                                    int allow_dns, int require_fit,
+                                    size_t maximum_packet_bytes,
+                                    size_t *selected)
+{
+    size_t index;
+    int found = 0;
+    for (index = 0u; index < state->queue_count; ++index) {
+        const live_proxy_queued_packet *queued = &state->queue[index];
+        if ((allow_dns == 0 &&
+             queued->priority == LIVE_PROXY_PRIORITY_DNS) ||
+            (require_fit != 0 &&
+             queued->length > maximum_packet_bytes)) {
+            continue;
+        }
+        if (found == 0 ||
+            queued->priority > state->queue[*selected].priority) {
+            *selected = index;
+            found = 1;
+        }
+    }
+    return found;
 }
 
 static int dns_query_recently_completed(live_proxy_state *state,
@@ -2474,6 +2509,93 @@ static int dns_query_recently_completed(live_proxy_state *state,
     return 0;
 }
 
+static int dns_query_is_inflight(live_proxy_state *state,
+                                 const uint8_t *packet,
+                                 size_t packet_length)
+{
+    live_proxy_dns_key key;
+    uint64_t now;
+    size_t index;
+    if (dns_packet_key(packet, packet_length, 0, &key) == 0) {
+        return 0;
+    }
+    /* Suppressed retries do not refresh sent_ms. A query accepted by the
+     * peer therefore gets a bounded quiet period, then one fresh upstream
+     * attempt is allowed if no response ever returned. */
+    now = monotonic_milliseconds();
+    for (index = 0u; index < LIVE_PROXY_INFLIGHT_DNS; ++index) {
+        live_proxy_inflight_dns *inflight = &state->inflight_dns[index];
+        if (inflight->valid == 0) {
+            continue;
+        }
+        if (now - inflight->sent_ms >
+            LIVE_PROXY_DNS_INFLIGHT_SUPPRESS_MS) {
+            inflight->valid = 0;
+            continue;
+        }
+        if (dns_keys_equal(&inflight->key, &key) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int dns_query_is_queued(const live_proxy_state *state,
+                               const uint8_t *packet,
+                               size_t packet_length)
+{
+    live_proxy_dns_key key;
+    size_t index;
+    if (dns_packet_key(packet, packet_length, 0, &key) == 0) {
+        return 0;
+    }
+    for (index = 0u; index < state->queue_count; ++index) {
+        live_proxy_dns_key queued;
+        if (dns_packet_key(state->queue[index].packet,
+                           state->queue[index].length, 0, &queued) != 0 &&
+            dns_keys_equal(&queued, &key) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void remember_inflight_dns(live_proxy_state *state,
+                                  const uint8_t *packet,
+                                  size_t packet_length)
+{
+    live_proxy_dns_key key;
+    uint64_t now;
+    uint64_t oldest = UINT64_MAX;
+    size_t oldest_slot = 0u;
+    size_t slot = LIVE_PROXY_INFLIGHT_DNS;
+    size_t index;
+    if (dns_packet_key(packet, packet_length, 0, &key) == 0) {
+        return;
+    }
+    now = monotonic_milliseconds();
+    for (index = 0u; index < LIVE_PROXY_INFLIGHT_DNS; ++index) {
+        live_proxy_inflight_dns *inflight = &state->inflight_dns[index];
+        if (inflight->valid != 0 &&
+            dns_keys_equal(&inflight->key, &key) != 0) {
+            slot = index;
+            break;
+        }
+        if (inflight->valid == 0 && slot == LIVE_PROXY_INFLIGHT_DNS) {
+            slot = index;
+        } else if (inflight->valid != 0 && inflight->sent_ms < oldest) {
+            oldest = inflight->sent_ms;
+            oldest_slot = index;
+        }
+    }
+    if (slot == LIVE_PROXY_INFLIGHT_DNS) {
+        slot = oldest_slot;
+    }
+    state->inflight_dns[slot].key = key;
+    state->inflight_dns[slot].sent_ms = now;
+    state->inflight_dns[slot].valid = 1;
+}
+
 static void remember_completed_dns(live_proxy_state *state,
                                    const uint8_t *packet,
                                    size_t packet_length)
@@ -2488,6 +2610,13 @@ static void remember_completed_dns(live_proxy_state *state,
         return;
     }
     now = monotonic_milliseconds();
+    for (index = 0u; index < LIVE_PROXY_INFLIGHT_DNS; ++index) {
+        live_proxy_inflight_dns *inflight = &state->inflight_dns[index];
+        if (inflight->valid != 0 &&
+            dns_keys_equal(&inflight->key, &key) != 0) {
+            inflight->valid = 0;
+        }
+    }
     for (index = 0u; index < LIVE_PROXY_RECENT_DNS; ++index) {
         live_proxy_recent_dns *recent = &state->recent_dns[index];
         if (recent->valid != 0 &&
@@ -2528,6 +2657,7 @@ static int enqueue_proxy_packet(live_proxy_state *state,
                                 const uint8_t *packet, size_t packet_length)
 {
     unsigned priority;
+    size_t queued_dns = 0u;
     size_t index;
     if (validate_ip_packet(packet, packet_length) != UM_OK) {
         return UM_ERR_HEADER;
@@ -2544,6 +2674,11 @@ static int enqueue_proxy_packet(live_proxy_state *state,
         ++state->dns_retries_suppressed;
         return UM_OK;
     }
+    if (dns_query_is_inflight(state, packet, packet_length) != 0 ||
+        dns_query_is_queued(state, packet, packet_length) != 0) {
+        ++state->dns_retries_suppressed;
+        return UM_OK;
+    }
     for (index = 0u; index < state->queue_count; ++index) {
         if (state->queue[index].length == packet_length &&
             memcmp(state->queue[index].packet, packet, packet_length) == 0) {
@@ -2552,6 +2687,19 @@ static int enqueue_proxy_packet(live_proxy_state *state,
         }
     }
     priority = proxy_packet_priority(packet, packet_length);
+    if (priority == LIVE_PROXY_PRIORITY_DNS) {
+        /* Keep part of the bounded queue available for traffic that must
+         * follow resolution (notably TCP), even during an OS DNS burst. */
+        for (index = 0u; index < state->queue_count; ++index) {
+            if (state->queue[index].priority == LIVE_PROXY_PRIORITY_DNS) {
+                ++queued_dns;
+            }
+        }
+        if (queued_dns >= LIVE_PROXY_DNS_QUEUE_LIMIT) {
+            ++state->queue_dropped;
+            return UM_OK;
+        }
+    }
     if (state->queue_count == LIVE_PROXY_QUEUE_PACKETS) {
         size_t lowest_index = 0u;
         unsigned lowest_priority = state->queue[0].priority;
@@ -2632,10 +2780,19 @@ static int pop_proxy_packet(live_proxy_state *state, uint8_t *packet,
                             size_t *packet_length, unsigned *priority)
 {
     size_t selected;
+    int allow_dns;
     if (state->queue_count == 0u) {
         return 0;
     }
-    selected = highest_proxy_queue_index(state);
+    /* DNS stays first, but an unbroken DNS stream cannot exclude every
+     * already-queued non-DNS packet from the link forever. */
+    allow_dns = !(state->consecutive_dns_sent >=
+                      LIVE_PROXY_DNS_BURST_PACKETS &&
+                  proxy_queue_has_non_dns(state) != 0);
+    if (select_proxy_queue_index(state, allow_dns, 0, 0u,
+                                 &selected) == 0) {
+        return 0;
+    }
     *packet_length = state->queue[selected].length;
     *priority = state->queue[selected].priority;
     memcpy(packet, state->queue[selected].packet, *packet_length);
@@ -2650,6 +2807,7 @@ static size_t build_proxy_batch(live_proxy_state *state, uint8_t *body,
 {
     size_t offset = LIVE_PROXY_BATCH_HEADER_BYTES;
     size_t count = 0u;
+    size_t dns_selected = 0u;
     if (body == NULL || highest_priority == NULL || packet_bytes == NULL ||
         body_capacity > UM_LIVE_MAX_BODY ||
         body_capacity <= LIVE_PROXY_BATCH_HEADER_BYTES) {
@@ -2658,14 +2816,43 @@ static size_t build_proxy_batch(live_proxy_state *state, uint8_t *body,
     *highest_priority = LIVE_PROXY_PRIORITY_BULK;
     *packet_bytes = 0u;
     while (state->queue_count != 0u && count < UINT8_MAX) {
-        size_t selected = highest_proxy_queue_index(state);
-        const live_proxy_queued_packet *queued = &state->queue[selected];
-        size_t needed = LIVE_PROXY_BATCH_ENTRY_BYTES + queued->length;
+        const live_proxy_queued_packet *queued;
+        size_t selected;
+        size_t needed;
+        int have_non_dns = proxy_queue_has_non_dns(state);
+        int allow_dns =
+            have_non_dns == 0 ||
+            state->consecutive_dns_sent + dns_selected <
+                LIVE_PROXY_DNS_BURST_PACKETS;
+        if (count == 0u) {
+            if (select_proxy_queue_index(state, allow_dns, 0, 0u,
+                                         &selected) == 0) {
+                break;
+            }
+        } else {
+            size_t maximum_packet_bytes;
+            if (body_capacity - offset <=
+                LIVE_PROXY_BATCH_ENTRY_BYTES) {
+                break;
+            }
+            maximum_packet_bytes = body_capacity - offset -
+                                   LIVE_PROXY_BATCH_ENTRY_BYTES;
+            if (select_proxy_queue_index(state, allow_dns, 1,
+                                         maximum_packet_bytes,
+                                         &selected) == 0) {
+                break;
+            }
+        }
+        queued = &state->queue[selected];
+        needed = LIVE_PROXY_BATCH_ENTRY_BYTES + queued->length;
         if (needed > body_capacity - offset) {
             break;
         }
-        if (count == 0u) {
+        if (queued->priority > *highest_priority) {
             *highest_priority = queued->priority;
+        }
+        if (queued->priority == LIVE_PROXY_PRIORITY_DNS) {
+            ++dns_selected;
         }
         write_u16(&body[offset], (uint16_t)queued->length);
         memcpy(&body[offset + LIVE_PROXY_BATCH_ENTRY_BYTES], queued->packet,
@@ -2761,6 +2948,21 @@ static int inspect_proxy_batch(const uint8_t *body, size_t body_length,
     return offset == body_length ? UM_OK : UM_ERR_HEADER;
 }
 
+static void account_transmitted_packet_priority(live_proxy_state *state,
+                                                const uint8_t *packet,
+                                                size_t packet_length)
+{
+    if (proxy_packet_priority(packet, packet_length) ==
+        LIVE_PROXY_PRIORITY_DNS) {
+        if (state->consecutive_dns_sent != SIZE_MAX) {
+            ++state->consecutive_dns_sent;
+        }
+        remember_inflight_dns(state, packet, packet_length);
+    } else {
+        state->consecutive_dns_sent = 0u;
+    }
+}
+
 static void account_proxy_batch(live_context *context,
                                 live_proxy_state *state, int transmitted,
                                 const uint8_t *body, size_t body_length)
@@ -2790,6 +2992,8 @@ static void account_proxy_batch(live_context *context,
         size_t packet_length = read_u16(&body[offset]);
         offset += LIVE_PROXY_BATCH_ENTRY_BYTES;
         if (transmitted != 0) {
+            account_transmitted_packet_priority(state, &body[offset],
+                                                packet_length);
             ++state->packets_sent;
             state->bytes_sent += packet_length;
             log_proxy_packet(context, state, 1,
@@ -2900,6 +3104,8 @@ static int send_proxy_packet(live_context *context, live_proxy_state *state,
             ((acknowledgement.body[4] & LIVE_PROXY_ACK_YIELD) != 0u) ==
                 (yield_token != 0)) {
             state->transmit_sequence = (uint16_t)(final_sequence + 1u);
+            account_transmitted_packet_priority(state, packet,
+                                                packet_length);
             ++state->packets_sent;
             state->bytes_sent += packet_length;
             log_proxy_packet(context, state, 1, packet_id, packet_length,
@@ -4066,11 +4272,15 @@ int um_run_live_audio(const um_live_audio_options *options,
     live_log(&context,
              "Local calibration mode=%s adaptive-max-probes=%zu "
              "probe-bytes=%u verification-trials=%u "
+             "body-range=%u-%u body-trials=%u "
              "robust-recovery-repeats=2-%u receiver-driven "
              "all-pass-primary-estimate=%.1fs per direction",
              options->calibrate_high_quality != 0 ? "high" : "default",
              calibration_probe_budget, UM_CALIBRATION_PROBE_BYTES,
              live_verification_trials(options->calibrate_high_quality),
+             UM_LIVE_MIN_BODY, UM_LIVE_MAX_BODY,
+             live_body_verification_trials(
+                 options->calibrate_high_quality),
              UM_MAX_SYMBOL_REPETITIONS,
              live_calibration_primary_seconds(
                  options->calibrate_high_quality));
