@@ -2457,6 +2457,25 @@ static int proxy_queue_has_non_dns(const live_proxy_state *state)
     return 0;
 }
 
+static int proxy_packet_is_dns_response(const uint8_t *packet,
+                                        size_t packet_length)
+{
+    live_proxy_dns_key key;
+    return dns_packet_key(packet, packet_length, 1, &key);
+}
+
+static int proxy_queue_has_dns_response(const live_proxy_state *state)
+{
+    size_t index;
+    for (index = 0u; index < state->queue_count; ++index) {
+        if (proxy_packet_is_dns_response(state->queue[index].packet,
+                                         state->queue[index].length) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int select_proxy_queue_index(const live_proxy_state *state,
                                     int allow_dns, int require_fit,
                                     size_t maximum_packet_bytes,
@@ -2803,18 +2822,21 @@ static int pop_proxy_packet(live_proxy_state *state, uint8_t *packet,
 static size_t build_proxy_batch(live_proxy_state *state, uint8_t *body,
                                 size_t body_capacity,
                                 unsigned *highest_priority,
-                                size_t *packet_bytes)
+                                size_t *packet_bytes,
+                                int *leading_dns_response)
 {
     size_t offset = LIVE_PROXY_BATCH_HEADER_BYTES;
     size_t count = 0u;
     size_t dns_selected = 0u;
     if (body == NULL || highest_priority == NULL || packet_bytes == NULL ||
+        leading_dns_response == NULL ||
         body_capacity > UM_LIVE_MAX_BODY ||
         body_capacity <= LIVE_PROXY_BATCH_HEADER_BYTES) {
         return 0u;
     }
     *highest_priority = LIVE_PROXY_PRIORITY_BULK;
     *packet_bytes = 0u;
+    *leading_dns_response = 0;
     while (state->queue_count != 0u && count < UINT8_MAX) {
         const live_proxy_queued_packet *queued;
         size_t selected;
@@ -2850,6 +2872,10 @@ static size_t build_proxy_batch(live_proxy_state *state, uint8_t *body,
         }
         if (queued->priority > *highest_priority) {
             *highest_priority = queued->priority;
+        }
+        if (count == 0u) {
+            *leading_dns_response = proxy_packet_is_dns_response(
+                queued->packet, queued->length);
         }
         if (queued->priority == LIVE_PROXY_PRIORITY_DNS) {
             ++dns_selected;
@@ -3714,6 +3740,8 @@ static int run_proxy_loop(live_context *context)
                 size_t batch_packet_bytes = 0u;
                 size_t packet_length = 0u;
                 unsigned priority = LIVE_PROXY_PRIORITY_BULK;
+                int leading_dns_response = 0;
+                int continue_response_burst = 0;
                 int yield_with_packet;
                 status = drain_proxy_ingress(
                     context, &state,
@@ -3723,13 +3751,25 @@ static int run_proxy_loop(live_context *context)
                 }
                 batch_length = build_proxy_batch(
                     &state, batch, frame_body_limit, &priority,
-                    &batch_packet_bytes);
+                    &batch_packet_bytes, &leading_dns_response);
                 (void)batch_packet_bytes;
                 if (batch_length != 0u) {
+                    continue_response_burst =
+                        leading_dns_response != 0 &&
+                        burst + 1u < LIVE_PROXY_BURST_PACKETS &&
+                        proxy_queue_has_dns_response(&state) != 0;
                     yield_with_packet =
-                        priority >= LIVE_PROXY_PRIORITY_CONTROL ||
-                        burst + 1u == LIVE_PROXY_BURST_PACKETS ||
-                        state.queue_count == 0u;
+                        continue_response_burst == 0 &&
+                        (priority >= LIVE_PROXY_PRIORITY_CONTROL ||
+                         burst + 1u == LIVE_PROXY_BURST_PACKETS ||
+                         state.queue_count == 0u);
+                    if (continue_response_burst != 0) {
+                        live_log(context,
+                                 "proxy DNS response backlog continuing "
+                                 "turn queued=%zu frame=%zu/%u",
+                                 state.queue_count, burst + 1u,
+                                 LIVE_PROXY_BURST_PACKETS);
+                    }
                     status = send_proxy_batch(
                         context, &state, batch, batch_length,
                         yield_with_packet, &token_yielded);
@@ -3740,7 +3780,8 @@ static int run_proxy_loop(live_context *context)
                         (context->options.proxy_test_packets != 0u &&
                          state.packets_sent >=
                              context->options.proxy_test_packets) ||
-                        priority >= LIVE_PROXY_PRIORITY_CONTROL) {
+                        (priority >= LIVE_PROXY_PRIORITY_CONTROL &&
+                         continue_response_burst == 0)) {
                         break;
                     }
                     continue;
@@ -3749,10 +3790,23 @@ static int run_proxy_loop(live_context *context)
                                      &priority) == 0) {
                     break;
                 }
+                continue_response_burst =
+                    proxy_packet_is_dns_response(packet, packet_length) !=
+                        0 &&
+                    burst + 1u < LIVE_PROXY_BURST_PACKETS &&
+                    proxy_queue_has_dns_response(&state) != 0;
                 yield_with_packet =
-                    priority >= LIVE_PROXY_PRIORITY_CONTROL ||
-                    burst + 1u == LIVE_PROXY_BURST_PACKETS ||
-                    state.queue_count == 0u;
+                    continue_response_burst == 0 &&
+                    (priority >= LIVE_PROXY_PRIORITY_CONTROL ||
+                     burst + 1u == LIVE_PROXY_BURST_PACKETS ||
+                     state.queue_count == 0u);
+                if (continue_response_burst != 0) {
+                    live_log(context,
+                             "proxy DNS response backlog continuing turn "
+                             "queued=%zu frame=%zu/%u",
+                             state.queue_count, burst + 1u,
+                             LIVE_PROXY_BURST_PACKETS);
+                }
                 status = send_proxy_packet(context, &state, packet,
                                            packet_length,
                                            frame_body_limit,
@@ -3762,12 +3816,14 @@ static int run_proxy_loop(live_context *context)
                     return status;
                 }
                 /* Return the half-duplex link promptly after interactive
-                 * DNS, ICMP, or TCP-control traffic. */
+                 * requests, except while draining an already-visible DNS
+                 * response backlog that the peer is waiting on. */
                 if (token_yielded != 0 ||
                     (context->options.proxy_test_packets != 0u &&
                      state.packets_sent >=
                          context->options.proxy_test_packets) ||
-                    priority >= LIVE_PROXY_PRIORITY_CONTROL) {
+                    (priority >= LIVE_PROXY_PRIORITY_CONTROL &&
+                     continue_response_burst == 0)) {
                     break;
                 }
             }

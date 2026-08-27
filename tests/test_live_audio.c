@@ -128,6 +128,7 @@ typedef struct {
     unsigned dns_query_logs;
     unsigned dns_response_logs;
     unsigned dns_retries_suppressed;
+    unsigned dns_response_bursts;
     unsigned multicast_dropped;
     unsigned multi_packet_batches;
     unsigned body_stepdowns;
@@ -326,12 +327,38 @@ static size_t proxy_target_length(int endpoint, unsigned target_index)
 static void make_proxy_background(uint8_t *packet, int endpoint,
                                   unsigned background_number)
 {
-    make_ipv4_packet(
-        packet, SIM_BACKGROUND_BYTES,
-        (uint8_t)(0x40u + background_number +
-                  (unsigned)endpoint * 0x30u),
-        (uint16_t)(40000u + background_number),
-        endpoint == SIM_CLIENT ? 53u : 443u);
+    if (endpoint == SIM_GATEWAY) {
+        uint8_t *dns;
+        make_ipv4_packet(packet, SIM_BACKGROUND_BYTES,
+                         (uint8_t)(0x70u + background_number), 53u,
+                         (uint16_t)(40000u + background_number));
+        packet[12] = 1u;
+        packet[13] = 1u;
+        packet[14] = 1u;
+        packet[15] = 1u;
+        packet[16] = 10u;
+        packet[17] = 0u;
+        packet[18] = 0u;
+        packet[19] = 2u;
+        dns = &packet[28];
+        memset(dns, 0, SIM_BACKGROUND_BYTES - 28u);
+        dns[0] = 0x70u;
+        dns[1] = (uint8_t)background_number;
+        dns[2] = 0x81u;
+        dns[3] = 0x83u;
+        dns[5] = 1u;
+        dns[12] = 2u;
+        memcpy(&dns[13], "bg", 2u);
+        dns[15] = 4u;
+        memcpy(&dns[16], "test", 4u);
+        dns[22] = 1u;
+        dns[24] = 1u;
+        finalize_ipv4_checksums(packet, SIM_BACKGROUND_BYTES);
+    } else {
+        make_ipv4_packet(packet, SIM_BACKGROUND_BYTES,
+                         (uint8_t)(0x40u + background_number),
+                         (uint16_t)(40000u + background_number), 53u);
+    }
     if (background_number == SIM_BACKGROUND_PACKETS) {
         packet[16] = 224u;
         packet[17] = 0u;
@@ -523,6 +550,10 @@ static void test_log(void *context, const char *message)
             }
             (void)pthread_mutex_unlock(&bus.mutex);
         }
+    }
+    if (strstr(message,
+               "proxy DNS response backlog continuing turn") != NULL) {
+        ++run->dns_response_bursts;
     }
     {
         const char *batch = strstr(message, " batch=");
@@ -1279,6 +1310,7 @@ static int run_pair(const char *label,
           bus.network_dns_retries_injected != 3u ||
           bus.network_dns_retry_reads[SIM_CLIENT] != 3u ||
           client.dns_retries_suppressed != 3u ||
+          gateway.dns_response_bursts == 0u ||
           bus.client_tcp_before_dns_drained == 0 ||
           client.multicast_dropped != 1u ||
           gateway.multicast_dropped != 1u)) ||
@@ -1308,7 +1340,8 @@ static int run_pair(const char *label,
     printf("paired live %s passed: connection, adaptive 2-way calibration, "
            "delayed capture restart, %s; upgrades=%u/%u "
            "fallbacks=%u/%u verification-stepdowns=%u calibrations=%u "
-           "cache-skips=%u recovery-probes=%u offer-refreshes=%u\n",
+           "cache-skips=%u recovery-probes=%u offer-refreshes=%u "
+           "dns-response-bursts=%u/%u\n",
            label,
            link_test != 0 ? "256+256-byte explicit link test"
                           : "queued/in-flight/completed DNS coalescing plus "
@@ -1318,7 +1351,8 @@ static int run_pair(const char *label,
            client.verification_fallbacks + gateway.verification_fallbacks,
            expected_calibrations, client.cache_skips + gateway.cache_skips,
            client.recovery_probes + gateway.recovery_probes,
-           gateway.offer_refreshes);
+           gateway.offer_refreshes, client.dns_response_bursts,
+           gateway.dns_response_bursts);
     return 0;
 }
 
