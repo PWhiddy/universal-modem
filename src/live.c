@@ -1085,9 +1085,10 @@ static int calibration_body_receiver(live_context *context,
 }
 
 static float live_candidate_score(const um_modem_config *config,
-                                  const um_rx_metrics *metrics)
+                                  const um_rx_metrics *metrics,
+                                  size_t rate_payload_bytes)
 {
-    float raw = um_calibration_payload_rate(config, 128u);
+    float raw = um_calibration_payload_rate(config, rate_payload_bytes);
     float quality = 1.0f /
                     (1.0f + 4.0f * metrics->evm_rms * metrics->evm_rms);
     return raw * quality;
@@ -1126,6 +1127,8 @@ static void log_calibration_search_results(
     unsigned prefix_passes;
     unsigned recovery_attempts;
     unsigned recovery_passes;
+    unsigned recovery_band_attempts;
+    unsigned recovery_band_passes;
     const char *qam_state;
     um_calibration_search_step_results(
         search, UM_CALIB_STEP_REPETITIONS, &repetition_attempts,
@@ -1141,21 +1144,26 @@ static void log_calibration_search_results(
     um_calibration_search_step_results(
         search, UM_CALIB_STEP_MORE_REPETITIONS, &recovery_attempts,
         &recovery_passes);
+    um_calibration_search_step_results(
+        search, UM_CALIB_STEP_ULTRA_ROBUST_BAND, &recovery_band_attempts,
+        &recovery_band_passes);
     qam_state = qam_attempts != 0u && qam_passes == 0u
                     ? "(no-pass; deprioritized)"
                     : "";
     live_log(context,
              "calib search learned pass/try repetitions=%u/%u qam=%u/%u%s "
              "fec=%u/%u high-band=%u/%u prefix=%u/%u "
-             "recovery-repeats=%u/%u",
+             "recovery-repeats=%u/%u recovery-bands=%u/%u",
              repetition_passes, repetition_attempts, qam_passes,
              qam_attempts, qam_state,
              fec_passes, fec_attempts, band_passes, band_attempts,
              prefix_passes, prefix_attempts, recovery_passes,
-             recovery_attempts);
+             recovery_attempts, recovery_band_passes,
+             recovery_band_attempts);
 }
 
-static double live_calibration_primary_seconds(int high_quality)
+static double live_calibration_primary_seconds(int high_quality,
+                                               size_t rate_payload_bytes)
 {
     um_modem_config calibration_control =
         live_calibration_control_config();
@@ -1167,7 +1175,8 @@ static double live_calibration_primary_seconds(int high_quality)
     size_t probes = 0u;
     int next_status;
 
-    if (um_calibration_search_init(&search, high_quality) != UM_OK) {
+    if (um_calibration_search_init(&search, high_quality,
+                                   rate_payload_bytes) != UM_OK) {
         return 0.0;
     }
     if (um_modulate_frame(&calibration_control, ready_wire,
@@ -1419,6 +1428,7 @@ static int calibration_receiver(live_context *context, unsigned direction,
     float candidate_scores[UM_CALIBRATION_SEARCH_MAX_NODES];
     size_t rank_count = 0u;
     size_t sender_maximum_body_bytes;
+    size_t rate_payload_bytes;
     int status;
     {
         size_t index;
@@ -1437,7 +1447,12 @@ static int calibration_receiver(live_context *context, unsigned direction,
     }
     high_quality = begin_message->body[1] != 0u;
     verification_trials = live_verification_trials(high_quality);
-    status = um_calibration_search_init(&search, high_quality);
+    rate_payload_bytes = sender_maximum_body_bytes;
+    if (rate_payload_bytes > context->options.chunk_bytes) {
+        rate_payload_bytes = context->options.chunk_bytes;
+    }
+    status = um_calibration_search_init(&search, high_quality,
+                                        rate_payload_bytes);
     if (status != UM_OK) {
         return status;
     }
@@ -1491,7 +1506,8 @@ static int calibration_receiver(live_context *context, unsigned direction,
             probe.sequence == (uint16_t)probe_number &&
             probe.body_length == sizeof(expected) &&
             memcmp(probe.body, expected, sizeof(expected)) == 0) {
-            float score = live_candidate_score(&config, &metrics);
+            float score = live_candidate_score(&config, &metrics,
+                                                rate_payload_bytes);
             int robust_gate =
                 um_modem_config_uses_robust_gate(&config);
             int has_margin =
@@ -1518,8 +1534,8 @@ static int calibration_receiver(live_context *context, unsigned direction,
                          "calib rx probe=%zu/%zu id=%zu step=%s PASS qam=%u "
                          "fec=%s cp=%u window=%u repeats=%u "
                          "band=%.0f-%.0fHz level=%.1fdBFS norm=%.2fx "
-                         "clip=%.3f%% snr=%.1fdB evm=%.3f rate=%.0fbps "
-                         "score=%.0f gate=%s",
+                         "clip=%.3f%% snr=%.1fdB evm=%.3f "
+                         "rate@%zuB=%.0fbps score=%.0f gate=%s",
                          probe_number + 1u, probe_budget, candidate_id,
                          um_calibration_step_name(step),
                          1u << config.qam_bits, fec_name(config.fec_rate),
@@ -1535,7 +1551,10 @@ static int calibration_receiver(live_context *context, unsigned direction,
                          metrics.normalization_gain,
                          100.0 * (double)metrics.clipped_sample_fraction,
                          metrics.estimated_snr_db, metrics.evm_rms,
-                         um_calibration_payload_rate(&config, 128u), score,
+                         rate_payload_bytes,
+                         um_calibration_payload_rate(&config,
+                                                     rate_payload_bytes),
+                         score,
                          robust_gate != 0 ? "crc+sync/snr" : "snr/evm");
             }
         } else {
@@ -1586,7 +1605,8 @@ static int calibration_receiver(live_context *context, unsigned direction,
         int abort_status;
         live_log(context,
                  "calib no full-size mode passed through four physical "
-                 "repetitions; adaptive search stopped");
+                 "repetitions or the ultra-robust recovery bands; "
+                 "adaptive search stopped");
         abort_status = send_calibration_abort(context, &bootstrap, direction,
                                               probe_number, 3u);
         return abort_status == UM_OK ? UM_ERR_CRC : abort_status;
@@ -4629,19 +4649,31 @@ int um_run_live_audio(const um_live_audio_options *options,
              (double)UM_SAMPLE_RATE / data_default.fft_size);
     live_log(&context,
              "Local calibration mode=%s adaptive-max-probes=%zu "
-             "probe-bytes=%u verification-trials=%u "
+             "probe-bytes=%u rate-body=%zu verification-trials=%u "
              "body-range=%u-%u body-trials=%u "
              "robust-recovery-repeats=2-%u receiver-driven "
              "all-pass-primary-estimate=%.1fs per direction",
              options->calibrate_high_quality != 0 ? "high" : "default",
              calibration_probe_budget, UM_CALIBRATION_PROBE_BYTES,
+             options->chunk_bytes,
              live_verification_trials(options->calibrate_high_quality),
              UM_LIVE_MIN_BODY, UM_LIVE_MAX_BODY,
              live_body_verification_trials(
                  options->calibrate_high_quality),
              UM_MAX_SYMBOL_REPETITIONS,
              live_calibration_primary_seconds(
-                 options->calibrate_high_quality));
+                 options->calibrate_high_quality, options->chunk_bytes));
+    live_log(&context,
+             "High-calibration envelope fixed-fft=%u symbol=%.1fms "
+             "spacing=%.4fHz qam=4/16/64 fec=1/2-3/4 "
+             "cp=0.7-21.3ms repetitions=1-%u training=2-4 "
+             "sync=10.7-42.7ms gap=0-64.0ms band=750-21000Hz; "
+             "failed-baseline recovery bands="
+             "1500-5484,1500-4500,2250-5484,3000-6984Hz",
+             UM_FFT_SIZE,
+             1000.0 * (double)UM_FFT_SIZE / UM_SAMPLE_RATE,
+             (double)UM_SAMPLE_RATE / UM_FFT_SIZE,
+             UM_MAX_SYMBOL_REPETITIONS);
     load_local_calibration(&context);
     while (!live_interrupted) {
         context.link_stage_started = 0;

@@ -15,6 +15,48 @@ typedef struct {
 
 #define CALIBRATION_DEFAULT_BUDGET 12u
 #define CALIBRATION_HIGH_BUDGET 64u
+#define CALIBRATION_HIGH_RATE_PAYLOAD_BYTES 512u
+
+static const unsigned calibration_prefix_values[] = {
+    1024u, 896u, 768u, 640u, 512u, 384u, 256u, 128u, 64u, 32u};
+static const unsigned calibration_high_values[] = {
+    298u, 362u, 448u, 512u, 640u, 768u, 853u, 896u};
+static const unsigned calibration_low_values[] = {128u, 96u, 64u, 48u, 32u};
+static const unsigned calibration_narrow_values[] = {48u, 64u, 96u, 128u};
+static const unsigned calibration_sync_values[] = {
+    2048u, 1536u, 1024u, 768u, 512u};
+static const unsigned calibration_gap_values[] = {
+    3072u, 2560u, 2048u, 1536u, 1024u, 512u, 0u};
+
+static um_modem_config calibration_wide_anchor(void)
+{
+    um_modem_config config = um_modem_default_config();
+    config.first_bin = 48u;
+    config.last_bin = 768u;
+    config.cyclic_prefix = 256u;
+    config.window_samples = 64u;
+    config.sync_samples = 1024u;
+    config.sync_gap = 1536u;
+    config.training_symbols = 2u;
+    config.qam_bits = 4u;
+    config.fec_rate = UM_FEC_RATE_2_3;
+    return config;
+}
+
+static um_modem_config calibration_pristine_anchor(void)
+{
+    um_modem_config config = um_modem_default_config();
+    config.first_bin = 32u;
+    config.last_bin = 896u;
+    config.cyclic_prefix = 64u;
+    config.window_samples = 32u;
+    config.sync_samples = 512u;
+    config.sync_gap = 512u;
+    config.training_symbols = 2u;
+    config.qam_bits = 6u;
+    config.fec_rate = UM_FEC_RATE_3_4;
+    return config;
+}
 
 static size_t divide_round_up(size_t value, size_t divisor)
 {
@@ -103,6 +145,12 @@ const char *um_calibration_step_name(um_calibration_step step)
         return "grounded-data-default";
     case UM_CALIB_STEP_MORE_REPETITIONS:
         return "more-repetitions-recovery";
+    case UM_CALIB_STEP_WIDE_ANCHOR:
+        return "wide-speed-anchor";
+    case UM_CALIB_STEP_PRISTINE_ANCHOR:
+        return "pristine-speed-anchor";
+    case UM_CALIB_STEP_ULTRA_ROBUST_BAND:
+        return "ultra-robust-band";
     default:
         return "unknown";
     }
@@ -134,6 +182,11 @@ static float search_step_bias(um_calibration_step step)
         return 1.20f;
     case UM_CALIB_STEP_MORE_REPETITIONS:
         return 0.85f;
+    case UM_CALIB_STEP_WIDE_ANCHOR:
+    case UM_CALIB_STEP_PRISTINE_ANCHOR:
+        return 1.10f;
+    case UM_CALIB_STEP_ULTRA_ROBUST_BAND:
+        return 0.90f;
     default:
         return 1.0f;
     }
@@ -159,7 +212,8 @@ static int search_add(um_calibration_search *search, size_t parent,
     index = search->node_count++;
     search->nodes[index].config = *config;
     search->nodes[index].priority =
-        um_calibration_payload_rate(config, 128u) * search_step_bias(step);
+        um_calibration_payload_rate(config, search->rate_payload_bytes) *
+        search_step_bias(step);
     search->nodes[index].parent = parent;
     search->nodes[index].step = step;
     search->nodes[index].tested = 0;
@@ -192,26 +246,19 @@ static unsigned next_higher_value(unsigned current, const unsigned *values,
     return current;
 }
 
-static int improves_probe_rate(const um_modem_config *base,
+static int improves_probe_rate(const um_calibration_search *search,
+                               const um_modem_config *base,
                                const um_modem_config *candidate)
 {
     return um_calibration_payload_rate(candidate,
-                                       UM_CALIBRATION_PROBE_BYTES) >
+                                       search->rate_payload_bytes) >
            um_calibration_payload_rate(base,
-                                       UM_CALIBRATION_PROBE_BYTES) +
+                                       search->rate_payload_bytes) +
                0.5f;
 }
 
 static int search_expand(um_calibration_search *search, size_t parent)
 {
-    static const unsigned prefix_values[] = {1024u, 896u, 768u, 640u,
-                                             512u, 384u, 256u, 128u};
-    static const unsigned high_values[] = {298u, 362u, 448u, 512u,
-                                           640u, 768u};
-    static const unsigned low_values[] = {128u, 96u, 64u, 48u};
-    static const unsigned narrow_values[] = {48u, 64u, 96u, 128u};
-    static const unsigned sync_values[] = {2048u, 1536u, 1024u};
-    static const unsigned gap_values[] = {3072u, 2560u, 2048u};
     const um_modem_config *base = &search->nodes[parent].config;
     um_modem_config candidate;
     size_t option;
@@ -235,6 +282,20 @@ static int search_expand(um_calibration_search *search, size_t parent)
         if (status != UM_OK) {
             return status;
         }
+        if (search->high_quality != 0) {
+            candidate = calibration_wide_anchor();
+            status = search_add(search, parent, UM_CALIB_STEP_WIDE_ANCHOR,
+                                &candidate);
+            if (status != UM_OK) {
+                return status;
+            }
+            candidate = calibration_pristine_anchor();
+            status = search_add(search, parent,
+                                UM_CALIB_STEP_PRISTINE_ANCHOR, &candidate);
+            if (status != UM_OK) {
+                return status;
+            }
+        }
     }
     if (base->symbol_repetitions > 1u) {
         ADD_CHANGED(symbol_repetitions, base->symbol_repetitions - 1u,
@@ -243,7 +304,7 @@ static int search_expand(um_calibration_search *search, size_t parent)
     for (value = base->qam_bits + 2u; value <= 6u; value += 2u) {
         candidate = *base;
         candidate.qam_bits = value;
-        if (improves_probe_rate(base, &candidate) != 0) {
+        if (improves_probe_rate(search, base, &candidate) != 0) {
             status = search_add(search, parent, UM_CALIB_STEP_QAM,
                                 &candidate);
             if (status != UM_OK) {
@@ -256,7 +317,7 @@ static int search_expand(um_calibration_search *search, size_t parent)
          value <= (unsigned)UM_FEC_RATE_3_4; ++value) {
         candidate = *base;
         candidate.fec_rate = (um_fec_rate)value;
-        if (improves_probe_rate(base, &candidate) != 0) {
+        if (improves_probe_rate(search, base, &candidate) != 0) {
             status = search_add(search, parent, UM_CALIB_STEP_FEC,
                                 &candidate);
             if (status != UM_OK) {
@@ -265,22 +326,34 @@ static int search_expand(um_calibration_search *search, size_t parent)
             break;
         }
     }
-    value = next_lower_value(base->cyclic_prefix, prefix_values,
-                             sizeof(prefix_values) / sizeof(prefix_values[0]));
+    value = next_lower_value(
+        base->cyclic_prefix, calibration_prefix_values,
+        sizeof(calibration_prefix_values) /
+            sizeof(calibration_prefix_values[0]));
     if (value != base->cyclic_prefix) {
-        ADD_CHANGED(cyclic_prefix, value, UM_CALIB_STEP_PREFIX);
+        candidate = *base;
+        candidate.cyclic_prefix = value;
+        if (candidate.window_samples > value) {
+            candidate.window_samples = value;
+        }
+        status = search_add(search, parent, UM_CALIB_STEP_PREFIX,
+                            &candidate);
+        if (status != UM_OK) {
+            return status;
+        }
     }
     for (option = 0u;
          option < (search->high_quality != 0
-                       ? sizeof(high_values) / sizeof(high_values[0])
+                       ? sizeof(calibration_high_values) /
+                             sizeof(calibration_high_values[0])
                        : 4u);
          ++option) {
-        if (high_values[option] <= base->last_bin) {
+        if (calibration_high_values[option] <= base->last_bin) {
             continue;
         }
         candidate = *base;
-        candidate.last_bin = high_values[option];
-        if (improves_probe_rate(base, &candidate) != 0) {
+        candidate.last_bin = calibration_high_values[option];
+        if (improves_probe_rate(search, base, &candidate) != 0) {
             status = search_add(search, parent, UM_CALIB_STEP_HIGH_BAND,
                                 &candidate);
             if (status != UM_OK) {
@@ -289,14 +362,16 @@ static int search_expand(um_calibration_search *search, size_t parent)
             break;
         }
     }
-    for (option = 0u; option < sizeof(low_values) / sizeof(low_values[0]);
+    for (option = 0u;
+         option < sizeof(calibration_low_values) /
+                      sizeof(calibration_low_values[0]);
          ++option) {
-        if (low_values[option] >= base->first_bin) {
+        if (calibration_low_values[option] >= base->first_bin) {
             continue;
         }
         candidate = *base;
-        candidate.first_bin = low_values[option];
-        if (improves_probe_rate(base, &candidate) != 0) {
+        candidate.first_bin = calibration_low_values[option];
+        if (improves_probe_rate(search, base, &candidate) != 0) {
             status = search_add(search, parent, UM_CALIB_STEP_LOW_BAND,
                                 &candidate);
             if (status != UM_OK) {
@@ -305,25 +380,29 @@ static int search_expand(um_calibration_search *search, size_t parent)
             break;
         }
     }
-    if (base->training_symbols > 3u) {
+    if (base->training_symbols > 2u) {
         ADD_CHANGED(training_symbols, base->training_symbols - 1u,
                     UM_CALIB_STEP_TRAINING);
     }
     if (search->high_quality != 0) {
-        value = next_lower_value(base->sync_samples, sync_values,
-                                 sizeof(sync_values) /
-                                     sizeof(sync_values[0]));
+        value = next_lower_value(
+            base->sync_samples, calibration_sync_values,
+            sizeof(calibration_sync_values) /
+                sizeof(calibration_sync_values[0]));
         if (value != base->sync_samples) {
             ADD_CHANGED(sync_samples, value, UM_CALIB_STEP_SYNC);
         }
-        value = next_lower_value(base->sync_gap, gap_values,
-                                 sizeof(gap_values) / sizeof(gap_values[0]));
+        value = next_lower_value(
+            base->sync_gap, calibration_gap_values,
+            sizeof(calibration_gap_values) /
+                sizeof(calibration_gap_values[0]));
         if (value != base->sync_gap) {
             ADD_CHANGED(sync_gap, value, UM_CALIB_STEP_GAP);
         }
         value = next_higher_value(
-            base->first_bin, narrow_values,
-            sizeof(narrow_values) / sizeof(narrow_values[0]));
+            base->first_bin, calibration_narrow_values,
+            sizeof(calibration_narrow_values) /
+                sizeof(calibration_narrow_values[0]));
         if (value != base->first_bin && value < base->last_bin) {
             ADD_CHANGED(first_bin, value, UM_CALIB_STEP_NARROW_BAND);
         }
@@ -337,26 +416,70 @@ static int search_expand_recovery(um_calibration_search *search,
 {
     const um_calibration_search_node *node = &search->nodes[failed];
     um_modem_config candidate;
+    int status;
     if ((failed != 0u && node->step != UM_CALIB_STEP_MORE_REPETITIONS) ||
-        um_modem_config_uses_robust_gate(&node->config) == 0 ||
-        node->config.symbol_repetitions >= UM_MAX_SYMBOL_REPETITIONS) {
+        um_modem_config_uses_robust_gate(&node->config) == 0) {
         return UM_OK;
     }
+    if (node->config.symbol_repetitions < UM_MAX_SYMBOL_REPETITIONS) {
+        candidate = node->config;
+        ++candidate.symbol_repetitions;
+        return search_add(search, failed, UM_CALIB_STEP_MORE_REPETITIONS,
+                          &candidate);
+    }
+    if (node->config.first_bin != 64u || node->config.last_bin != 298u) {
+        return UM_OK;
+    }
+
+    /*
+     * Repetition cannot repair carriers that are consistently buried in a
+     * fade or narrow-band interferer.  Once the full-band four-repeat mode
+     * has failed, try several deliberately low-rate acoustic cores.  These
+     * are independent alternatives: failure in one core must not prune the
+     * others, while a passing core becomes a normal parent from which the
+     * adaptive search can cautiously recover speed.
+     */
     candidate = node->config;
-    ++candidate.symbol_repetitions;
-    return search_add(search, failed, UM_CALIB_STEP_MORE_REPETITIONS,
+    candidate.last_bin = 234u; /* 1.500-5.484 kHz */
+    status = search_add(search, failed, UM_CALIB_STEP_ULTRA_ROBUST_BAND,
+                        &candidate);
+    if (status != UM_OK) {
+        return status;
+    }
+    candidate = node->config;
+    candidate.last_bin = 192u; /* 1.500-4.500 kHz */
+    status = search_add(search, failed, UM_CALIB_STEP_ULTRA_ROBUST_BAND,
+                        &candidate);
+    if (status != UM_OK) {
+        return status;
+    }
+    candidate = node->config;
+    candidate.first_bin = 96u;
+    candidate.last_bin = 234u; /* 2.250-5.484 kHz */
+    status = search_add(search, failed, UM_CALIB_STEP_ULTRA_ROBUST_BAND,
+                        &candidate);
+    if (status != UM_OK) {
+        return status;
+    }
+    candidate = node->config;
+    candidate.first_bin = 128u; /* 3.000-6.984 kHz */
+    return search_add(search, failed, UM_CALIB_STEP_ULTRA_ROBUST_BAND,
                       &candidate);
 }
 
-int um_calibration_search_init(um_calibration_search *search, int high_quality)
+int um_calibration_search_init(um_calibration_search *search,
+                               int high_quality,
+                               size_t rate_payload_bytes)
 {
     um_modem_config baseline;
-    if (search == NULL) {
+    if (search == NULL || rate_payload_bytes == 0u ||
+        rate_payload_bytes > UM_MAX_PAYLOAD) {
         return UM_ERR_ARGUMENT;
     }
     memset(search, 0, sizeof(*search));
     search->high_quality = high_quality != 0;
     search->budget = um_calibration_search_budget(high_quality);
+    search->rate_payload_bytes = rate_payload_bytes;
     baseline = um_modem_robust_config();
     return search_add(search, 0u, UM_CALIB_STEP_BASELINE, &baseline);
 }
@@ -387,6 +510,11 @@ static unsigned search_variant(const um_calibration_search_node *node)
         return 0u;
     case UM_CALIB_STEP_MORE_REPETITIONS:
         return node->config.symbol_repetitions;
+    case UM_CALIB_STEP_WIDE_ANCHOR:
+    case UM_CALIB_STEP_PRISTINE_ANCHOR:
+        return 0u;
+    case UM_CALIB_STEP_ULTRA_ROBUST_BAND:
+        return (node->config.first_bin << 16u) | node->config.last_bin;
     default:
         return 0u;
     }
@@ -437,6 +565,10 @@ static unsigned search_failure_limit(um_calibration_step step)
     case UM_CALIB_STEP_LOW_BAND:
     case UM_CALIB_STEP_NARROW_BAND:
         return 2u;
+    case UM_CALIB_STEP_WIDE_ANCHOR:
+    case UM_CALIB_STEP_PRISTINE_ANCHOR:
+    case UM_CALIB_STEP_ULTRA_ROBUST_BAND:
+        return 1u;
     case UM_CALIB_STEP_FEC:
     case UM_CALIB_STEP_PREFIX:
         return 4u;
@@ -451,6 +583,9 @@ static unsigned search_success_limit(um_calibration_step step)
     case UM_CALIB_STEP_BASELINE:
     case UM_CALIB_STEP_DATA_DEFAULT:
     case UM_CALIB_STEP_MORE_REPETITIONS:
+    case UM_CALIB_STEP_WIDE_ANCHOR:
+    case UM_CALIB_STEP_PRISTINE_ANCHOR:
+    case UM_CALIB_STEP_ULTRA_ROBUST_BAND:
         return 1u;
     default:
         /*
@@ -529,7 +664,12 @@ static float search_dynamic_priority(const um_calibration_search *search,
             case UM_CALIB_STEP_DATA_DEFAULT:
                 exploration = 5.00f;
                 break;
+            case UM_CALIB_STEP_WIDE_ANCHOR:
+            case UM_CALIB_STEP_PRISTINE_ANCHOR:
+                exploration = 5.00f;
+                break;
             case UM_CALIB_STEP_MORE_REPETITIONS:
+            case UM_CALIB_STEP_ULTRA_ROBUST_BAND:
                 exploration = 1.50f;
                 break;
             default:
@@ -785,7 +925,10 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
     }
     result->config = um_modem_robust_config();
     fill_probe(probe, sizeof(probe), UINT32_C(0xc001d00d));
-    search_status = um_calibration_search_init(&search, high_quality);
+    search_status = um_calibration_search_init(
+        &search, high_quality,
+        high_quality != 0 ? CALIBRATION_HIGH_RATE_PAYLOAD_BYTES
+                          : UM_CALIBRATION_PROBE_BYTES);
     if (search_status != UM_OK) {
         return search_status;
     }
@@ -836,7 +979,8 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                         : um_modem_metrics_have_margin(&candidate, &metrics)) !=
                        0;
         result->estimated_seconds += duration;
-        raw_bps = um_calibration_payload_rate(&candidate, 128u);
+        raw_bps = um_calibration_payload_rate(
+            &candidate, search.rate_payload_bytes);
         quality = reliable != 0
                       ? 1.0f /
                             (1.0f + 4.0f * metrics.evm_rms * metrics.evm_rms)
@@ -859,7 +1003,7 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                 "calib %zu id=%zu step=%s%s band=%.0f-%.0fHz qam=%u "
                 "cp=%.2fms fec=%s "
                 "win=%u repeats=%u: %s snr=%.1fdB evm=%.3f "
-                "payload=%.0fbps score=%.0f",
+                "payload=%.0fbps rate@%zuB=%.0fbps score=%.0f",
                 result->candidates_tested, candidate_id,
                 um_calibration_step_name(step),
                 baseline != 0 ? " baseline" : "",
@@ -877,7 +1021,7 @@ int um_calibrate_simulated(const um_channel_config *channel, int high_quality,
                     : status == UM_OK ? "marginal"
                                       : um_status_string(status),
                 metrics.estimated_snr_db, metrics.evm_rms, payload_bps,
-                score);
+                search.rate_payload_bytes, raw_bps, score);
             logger(logger_context, line);
         }
         search_status = um_calibration_search_record(

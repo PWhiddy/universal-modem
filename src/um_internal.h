@@ -40,6 +40,9 @@ typedef enum {
     UM_CALIB_STEP_NARROW_BAND,
     UM_CALIB_STEP_DATA_DEFAULT,
     UM_CALIB_STEP_MORE_REPETITIONS,
+    UM_CALIB_STEP_WIDE_ANCHOR,
+    UM_CALIB_STEP_PRISTINE_ANCHOR,
+    UM_CALIB_STEP_ULTRA_ROBUST_BAND,
     UM_CALIB_STEP_COUNT
 } um_calibration_step;
 
@@ -56,6 +59,7 @@ typedef struct {
 typedef struct {
     int high_quality;
     size_t budget;
+    size_t rate_payload_bytes;
     size_t node_count;
     size_t tested_count;
     size_t passed_count;
@@ -127,7 +131,8 @@ int um_modem_metrics_have_margin(const um_modem_config *config,
                                  const um_rx_metrics *metrics);
 size_t um_calibration_search_budget(int high_quality);
 int um_calibration_search_init(um_calibration_search *search,
-                               int high_quality);
+                               int high_quality,
+                               size_t rate_payload_bytes);
 int um_calibration_search_next(um_calibration_search *search,
                                size_t *candidate_id,
                                um_modem_config *config,

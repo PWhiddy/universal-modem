@@ -179,14 +179,23 @@ int um_modem_config_uses_robust_gate(const um_modem_config *config)
         return 0;
     }
     robust = um_modem_robust_config();
+    /*
+     * Keep the permissive CRC/sync/SNR gate confined to modes that are
+     * monotonically no more aggressive than the bootstrap: the same PHY,
+     * coding and acquisition geometry, at least as much repetition, and a
+     * carrier subset.  This admits the deliberate narrow-band emergency
+     * modes without allowing an ordinary optimized QPSK mode to merely
+     * resemble the bootstrap and bypass its EVM margin.
+     */
     return config->fft_size == robust.fft_size &&
-           config->first_bin == robust.first_bin &&
-           config->last_bin == robust.last_bin &&
-           config->cyclic_prefix == robust.cyclic_prefix &&
+           config->first_bin >= robust.first_bin &&
+           config->last_bin <= robust.last_bin &&
+           config->first_bin <= config->last_bin &&
+           config->cyclic_prefix >= robust.cyclic_prefix &&
            config->window_samples == robust.window_samples &&
-           config->sync_samples == robust.sync_samples &&
-           config->sync_gap == robust.sync_gap &&
-           config->training_symbols == robust.training_symbols &&
+           config->sync_samples >= robust.sync_samples &&
+           config->sync_gap >= robust.sync_gap &&
+           config->training_symbols >= robust.training_symbols &&
            config->symbol_repetitions >= robust.symbol_repetitions &&
            config->qam_bits == robust.qam_bits &&
            config->fec_rate == robust.fec_rate;
