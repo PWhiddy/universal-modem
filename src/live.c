@@ -2360,6 +2360,14 @@ static int tcp_handshake_is_obsolete_for_followup(
     return followup.sequence == next_sequence;
 }
 
+static int tcp_packet_starts_connection(const uint8_t *packet,
+                                        size_t length)
+{
+    live_proxy_tcp_segment segment;
+    return parse_ipv4_tcp_segment(packet, length, &segment) != 0 &&
+           (segment.flags & 0x16u) == 0x02u;
+}
+
 static int tcp_segments_are_queued_retransmissions(
     const uint8_t *new_packet, size_t new_length,
     const uint8_t *old_packet, size_t old_length)
@@ -4180,6 +4188,7 @@ static int decide_proxy_token_offer(live_context *context,
                                     live_proxy_state *state,
                                     uint32_t window_id,
                                     uint8_t window_count,
+                                    int tcp_syn_received,
                                     int *accept_token)
 {
     int status;
@@ -4191,6 +4200,15 @@ static int decide_proxy_token_offer(live_context *context,
                                  LIVE_PROXY_RESPONSE_WAIT_MS);
     if (status != UM_OK) {
         return status;
+    }
+    if (tcp_syn_received != 0) {
+        state->deferred_tcp_ack_windows = 0u;
+        *accept_token = 1;
+        live_log(context,
+                 "proxy token offer window=%u accepted reason=tcp-syn-"
+                 "response-turn queued=%zu",
+                 window_id, state->queue_count);
+        return UM_OK;
     }
     if (state->queue_count == 0u) {
         ++state->token_offers_declined;
@@ -4228,6 +4246,7 @@ static int receive_proxy_window(live_context *context,
     size_t cell_capacity;
     size_t expected_count;
     uint8_t full_bitmap;
+    int tcp_syn_received = 0;
     int accept_yield = 0;
     int status;
     if (message == NULL || token_received == NULL ||
@@ -4330,6 +4349,10 @@ static int receive_proxy_window(live_context *context,
             if (status != UM_OK) {
                 return status;
             }
+            if (tcp_packet_starts_connection(
+                    &state->receive_window[offset], packet_length) != 0) {
+                tcp_syn_received = 1;
+            }
             remember_completed_dns(state, &state->receive_window[offset],
                                    packet_length);
             offset += packet_length;
@@ -4340,7 +4363,8 @@ static int receive_proxy_window(live_context *context,
                         state->receive_window_total, cell.count);
     if (cell.yield_token != 0) {
         status = decide_proxy_token_offer(context, state, cell.window_id,
-                                          cell.count, &accept_yield);
+                                          cell.count, tcp_syn_received,
+                                          &accept_yield);
         if (status != UM_OK) {
             return status;
         }

@@ -30,6 +30,7 @@ enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
     (SIM_BACKGROUND_PACKETS - SIM_FILTERED_BACKGROUND_PACKETS -      \
      SIM_COALESCED_BACKGROUND_PACKETS)
 #define SIM_PROXY_PACKETS 10u
+#define SIM_TCP_SYN_PACKET_INDEX 8u
 #define SIM_TCP_ACK_PACKET_INDEX SIM_PROXY_PACKETS
 #define SIM_FORWARDED_PACKETS \
     (SIM_PROXY_PACKETS + SIM_FORWARDED_BACKGROUND_PACKETS)
@@ -148,6 +149,7 @@ typedef struct {
     unsigned tcp_acks_coalesced;
     unsigned tcp_retransmits_coalesced;
     unsigned tcp_stale_syns_dropped;
+    unsigned tcp_syn_response_turns;
     unsigned tcp_detail_logs;
     unsigned multi_packet_batches;
     unsigned multi_packet_windows;
@@ -351,6 +353,23 @@ static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
         if (target_index == SIM_TCP_ACK_PACKET_INDEX) {
             packet[33] = 0x10u;
         }
+        if (target_index == SIM_TCP_SYN_PACKET_INDEX) {
+            uint32_t sequence = endpoint == SIM_CLIENT
+                                    ? UINT32_C(0x10203040)
+                                    : UINT32_C(0x50607080);
+            uint32_t acknowledgement = endpoint == SIM_CLIENT
+                                           ? 0u
+                                           : UINT32_C(0x10203041);
+            packet[24] = (uint8_t)(sequence >> 24u);
+            packet[25] = (uint8_t)(sequence >> 16u);
+            packet[26] = (uint8_t)(sequence >> 8u);
+            packet[27] = (uint8_t)sequence;
+            packet[28] = (uint8_t)(acknowledgement >> 24u);
+            packet[29] = (uint8_t)(acknowledgement >> 16u);
+            packet[30] = (uint8_t)(acknowledgement >> 8u);
+            packet[31] = (uint8_t)acknowledgement;
+            packet[33] = endpoint == SIM_CLIENT ? 0x02u : 0x12u;
+        }
         finalize_ipv4_checksums(packet, length);
     }
 }
@@ -364,6 +383,9 @@ static size_t proxy_target_length(int endpoint, unsigned target_index)
     if (target_index == 1u) {
         return endpoint == SIM_CLIENT ? SIM_LARGE_REQUEST_BYTES
                                       : SIM_LARGE_RESPONSE_BYTES;
+    }
+    if (target_index == SIM_TCP_SYN_PACKET_INDEX) {
+        return 40u;
     }
     if (target_index == SIM_TCP_ACK_PACKET_INDEX) {
         return 40u;
@@ -925,6 +947,10 @@ static void test_log(void *context, const char *message)
                    "%u", &count) == 1) {
             run->tcp_stale_syns_dropped = count;
         }
+    }
+    if (strstr(message,
+               "accepted reason=tcp-syn-response-turn") != NULL) {
+        ++run->tcp_syn_response_turns;
     }
     if (strstr(message, "traffic=IPv4/TCP ") != NULL &&
         strstr(message, " flags=0x") != NULL &&
@@ -1740,6 +1766,7 @@ static int run_pair(const char *label,
           gateway.tcp_retransmits_coalesced != 1u ||
           client.tcp_stale_syns_dropped != 1u ||
           gateway.tcp_stale_syns_dropped != 1u ||
+          gateway.tcp_syn_response_turns != 1u ||
           client.tcp_detail_logs == 0u ||
           gateway.tcp_detail_logs == 0u ||
           client.rate_breakdowns == 0u ||
