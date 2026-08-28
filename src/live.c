@@ -44,6 +44,8 @@
 #define LIVE_PROXY_QUEUE_PACKETS 64u
 #define LIVE_PROXY_RECENT_DNS 64u
 #define LIVE_PROXY_INFLIGHT_DNS 64u
+#define LIVE_PROXY_DNS_ADDRESS_CACHE 128u
+#define LIVE_PROXY_DNS_NAME_BYTES 96u
 #define LIVE_PROXY_DNS_RETRY_SUPPRESS_MS 30000u
 #define LIVE_PROXY_DNS_INFLIGHT_SUPPRESS_MS 15000u
 #define LIVE_PROXY_DNS_QUEUE_LIMIT 48u
@@ -53,6 +55,7 @@
 #define LIVE_PROXY_IDLE_MS 350u
 #define LIVE_PROXY_ACK_TIMEOUT_MS 5000u
 #define LIVE_PROXY_RECEIVE_TIMEOUT_MS 6500u
+#define LIVE_PROXY_GOODPUT_LOG_MS 10000u
 #define LIVE_PROXY_TOTAL_MASK UINT16_C(0x7fff)
 #define LIVE_PROXY_YIELD_FLAG UINT16_C(0x8000)
 #define LIVE_PROXY_BATCH_YIELD 0x01u
@@ -109,6 +112,13 @@ typedef struct {
 } live_proxy_inflight_dns;
 
 typedef struct {
+    uint8_t address[16];
+    uint8_t address_length;
+    char name[LIVE_PROXY_DNS_NAME_BYTES];
+    uint64_t expires_ms;
+} live_proxy_dns_address;
+
+typedef struct {
     um_live_audio_options options;
     um_audio *audio;
     um_network *network;
@@ -152,6 +162,8 @@ typedef struct {
     live_proxy_queued_packet queue[LIVE_PROXY_QUEUE_PACKETS];
     live_proxy_recent_dns recent_dns[LIVE_PROXY_RECENT_DNS];
     live_proxy_inflight_dns inflight_dns[LIVE_PROXY_INFLIGHT_DNS];
+    live_proxy_dns_address dns_addresses[LIVE_PROXY_DNS_ADDRESS_CACHE];
+    size_t next_dns_address;
     size_t queue_count;
     size_t queue_dropped;
     size_t queue_duplicates;
@@ -179,6 +191,7 @@ typedef struct {
     size_t queue_logged_priority_evictions;
     size_t consecutive_dns_sent;
     uint64_t started_ms;
+    uint64_t last_goodput_log_ms;
     int have_last_completed_window;
     int have_last_commit;
     int last_commit_piggybacked;
@@ -2561,6 +2574,159 @@ static int describe_dns(const uint8_t *packet, size_t length,
     return 1;
 }
 
+static void remember_dns_address(live_proxy_state *state,
+                                 const uint8_t *address,
+                                 size_t address_length, const char *name,
+                                 uint32_t ttl)
+{
+    uint64_t now = monotonic_milliseconds();
+    uint64_t ttl_seconds = ttl == 0u ? 1u : ttl;
+    size_t selected = SIZE_MAX;
+    size_t index;
+    if (state == NULL || address == NULL || name == NULL ||
+        (address_length != 4u && address_length != 16u)) {
+        return;
+    }
+    if (ttl_seconds > 86400u) {
+        ttl_seconds = 86400u;
+    }
+    for (index = 0u; index < LIVE_PROXY_DNS_ADDRESS_CACHE; ++index) {
+        live_proxy_dns_address *entry = &state->dns_addresses[index];
+        if (entry->address_length == address_length &&
+            memcmp(entry->address, address, address_length) == 0) {
+            selected = index;
+            break;
+        }
+        if (selected == SIZE_MAX &&
+            (entry->address_length == 0u || entry->expires_ms <= now)) {
+            selected = index;
+        }
+    }
+    if (selected == SIZE_MAX) {
+        selected = state->next_dns_address++ % LIVE_PROXY_DNS_ADDRESS_CACHE;
+    }
+    state->dns_addresses[selected].address_length = (uint8_t)address_length;
+    memcpy(state->dns_addresses[selected].address, address, address_length);
+    (void)snprintf(state->dns_addresses[selected].name,
+                   sizeof(state->dns_addresses[selected].name), "%s", name);
+    state->dns_addresses[selected].expires_ms = now + ttl_seconds * 1000u;
+}
+
+static void remember_dns_response_addresses(live_proxy_state *state,
+                                            const uint8_t *packet,
+                                            size_t length)
+{
+    const uint8_t *dns;
+    size_t transport_offset;
+    size_t dns_length;
+    size_t offset = 12u;
+    uint16_t udp_length;
+    uint16_t question_count;
+    uint16_t answer_count;
+    size_t index;
+    char question[LIVE_PROXY_DNS_NAME_BYTES];
+    if (state == NULL || validate_ip_packet(packet, length) != UM_OK ||
+        (packet[0] >> 4u) != 4u || packet[9] != 17u ||
+        (read_u16(&packet[6]) & UINT16_C(0x3fff)) != 0u) {
+        return;
+    }
+    transport_offset = (size_t)(packet[0] & 0x0fu) * 4u;
+    if (transport_offset + 20u > length ||
+        read_u16(&packet[transport_offset]) != 53u) {
+        return;
+    }
+    udp_length = read_u16(&packet[transport_offset + 4u]);
+    if (udp_length < 20u || transport_offset + udp_length != length) {
+        return;
+    }
+    dns = &packet[transport_offset + 8u];
+    dns_length = udp_length - 8u;
+    if ((read_u16(&dns[2]) & UINT16_C(0x8000)) == 0u) {
+        return;
+    }
+    question_count = read_u16(&dns[4]);
+    answer_count = read_u16(&dns[6]);
+    if (question_count == 0u || answer_count == 0u) {
+        return;
+    }
+    for (index = 0u; index < question_count; ++index) {
+        char name[LIVE_PROXY_DNS_NAME_BYTES];
+        size_t next = 0u;
+        if (read_dns_name(dns, dns_length, offset, name, sizeof(name),
+                          &next) == 0 ||
+            next + 4u > dns_length) {
+            return;
+        }
+        if (index == 0u) {
+            (void)snprintf(question, sizeof(question), "%s", name);
+        }
+        offset = next + 4u;
+    }
+    for (index = 0u; index < answer_count; ++index) {
+        char owner[LIVE_PROXY_DNS_NAME_BYTES];
+        size_t next = 0u;
+        uint16_t type;
+        uint16_t record_class;
+        uint32_t ttl;
+        uint16_t data_length;
+        if (read_dns_name(dns, dns_length, offset, owner, sizeof(owner),
+                          &next) == 0 ||
+            next + 10u > dns_length) {
+            return;
+        }
+        type = read_u16(&dns[next]);
+        record_class = read_u16(&dns[next + 2u]);
+        ttl = read_u32(&dns[next + 4u]);
+        data_length = read_u16(&dns[next + 8u]);
+        offset = next + 10u;
+        if ((size_t)data_length > dns_length - offset) {
+            return;
+        }
+        if (record_class == 1u && type == 1u && data_length == 4u) {
+            remember_dns_address(state, &dns[offset], 4u, question, ttl);
+        } else if (record_class == 1u && type == 28u &&
+                   data_length == 16u) {
+            remember_dns_address(state, &dns[offset], 16u, question, ttl);
+        }
+        offset += data_length;
+    }
+}
+
+static const char *dns_name_for_address(const live_proxy_state *state,
+                                        const uint8_t *address,
+                                        size_t address_length)
+{
+    uint64_t now = monotonic_milliseconds();
+    size_t index;
+    if (state == NULL || address == NULL) {
+        return NULL;
+    }
+    for (index = 0u; index < LIVE_PROXY_DNS_ADDRESS_CACHE; ++index) {
+        const live_proxy_dns_address *entry = &state->dns_addresses[index];
+        if (entry->expires_ms > now &&
+            entry->address_length == address_length &&
+            memcmp(entry->address, address, address_length) == 0) {
+            return entry->name;
+        }
+    }
+    return NULL;
+}
+
+static void describe_ipv4_host(const live_proxy_state *state,
+                               const uint8_t address[4], char *description,
+                               size_t description_capacity)
+{
+    const char *name = dns_name_for_address(state, address, 4u);
+    if (name != NULL) {
+        (void)snprintf(description, description_capacity,
+                       "%u.%u.%u.%u(%.60s)", address[0], address[1],
+                       address[2], address[3], name);
+    } else {
+        (void)snprintf(description, description_capacity, "%u.%u.%u.%u",
+                       address[0], address[1], address[2], address[3]);
+    }
+}
+
 static void describe_icmp_packet(const uint8_t *packet, size_t length,
                                  size_t transport_offset, unsigned version,
                                  const char *family, char *description,
@@ -2613,7 +2779,8 @@ static void describe_icmp_packet(const uint8_t *packet, size_t length,
                    "%s/ICMP type=%u code=%u", family, type, code);
 }
 
-static void describe_proxy_packet(const uint8_t *packet, size_t length,
+static void describe_proxy_packet(const live_proxy_state *state,
+                                  const uint8_t *packet, size_t length,
                                   char *description,
                                   size_t description_capacity)
 {
@@ -2639,13 +2806,17 @@ static void describe_proxy_packet(const uint8_t *packet, size_t length,
             describe_dns(packet, length, transport_offset,
                          dns_description, sizeof(dns_description)) != 0;
         if (version == 4u) {
+            char source[80];
+            char destination[80];
+            describe_ipv4_host(state, &packet[12], source, sizeof(source));
+            describe_ipv4_host(state, &packet[16], destination,
+                               sizeof(destination));
             (void)snprintf(
                 description, description_capacity,
-                "%s/%s %u.%u.%u.%u:%u->%u.%u.%u.%u:%u%s%s%s",
+                "%s/%s %s:%u->%s:%u%s%s%s",
                 family, protocol == 6u ? "TCP" : "UDP",
-                packet[12], packet[13], packet[14], packet[15],
-                (unsigned)read_u16(&packet[transport_offset]), packet[16],
-                packet[17], packet[18], packet[19],
+                source, (unsigned)read_u16(&packet[transport_offset]),
+                destination,
                 (unsigned)read_u16(&packet[transport_offset + 2u]),
                 is_dns != 0 ? " DNS" : "",
                 have_dns_description != 0 ? " " : "",
@@ -3222,14 +3393,14 @@ static void log_proxy_packet(live_context *context,
                              uint32_t packet_id, size_t packet_length,
                              size_t fragments, const uint8_t *packet)
 {
-    char description[256];
+    char description[384];
     double seconds = (double)(monotonic_milliseconds() - state->started_ms) /
                      1000.0;
     size_t bytes = transmitted != 0 ? state->bytes_sent
                                     : state->bytes_received;
     size_t dns_bytes = transmitted != 0 ? state->dns_bytes_sent
                                         : state->dns_bytes_received;
-    describe_proxy_packet(packet, packet_length, description,
+    describe_proxy_packet(state, packet, packet_length, description,
                           sizeof(description));
     live_log(context,
              "proxy %s packet=%u traffic=%s bytes=%zu fragments=%zu "
@@ -3245,6 +3416,39 @@ static void log_proxy_packet(live_context *context,
              seconds > 0.0
                  ? (double)((bytes - dns_bytes) * 8u) / seconds
                  : 0.0);
+}
+
+static void maybe_log_proxy_goodput(live_context *context,
+                                    live_proxy_state *state, int force)
+{
+    uint64_t now = monotonic_milliseconds();
+    size_t upload_bytes;
+    size_t download_bytes;
+    double seconds;
+    if (force == 0 &&
+        now - state->last_goodput_log_ms < LIVE_PROXY_GOODPUT_LOG_MS) {
+        return;
+    }
+    upload_bytes = context->options.role == UM_LIVE_CLIENT
+                       ? state->bytes_sent
+                       : state->bytes_received;
+    download_bytes = context->options.role == UM_LIVE_CLIENT
+                         ? state->bytes_received
+                         : state->bytes_sent;
+    seconds = (double)(now - state->started_ms) / 1000.0;
+    live_log(context,
+             "proxy internet-goodput wall=%.1fs upload=%.0fbps "
+             "download=%.0fbps total=%.0fbps uploaded=%zuB "
+             "downloaded=%zuB",
+             seconds,
+             seconds > 0.0 ? (double)upload_bytes * 8.0 / seconds : 0.0,
+             seconds > 0.0 ? (double)download_bytes * 8.0 / seconds : 0.0,
+             seconds > 0.0
+                 ? ((double)upload_bytes + (double)download_bytes) * 8.0 /
+                       seconds
+                 : 0.0,
+             upload_bytes, download_bytes);
+    state->last_goodput_log_ms = now;
 }
 
 static int inspect_proxy_batch(const uint8_t *body, size_t body_length,
@@ -3355,6 +3559,7 @@ static void account_proxy_packet_bytes(live_proxy_state *state,
                                        size_t packet_length)
 {
     int dns = proxy_packet_is_dns_traffic(packet, packet_length);
+    remember_dns_response_addresses(state, packet, packet_length);
     if (transmitted != 0) {
         ++state->packets_sent;
         state->bytes_sent += packet_length;
@@ -4071,6 +4276,7 @@ static int run_proxy_loop(live_context *context)
     int have_token = context->options.role == UM_LIVE_CLIENT;
     memset(&state, 0, sizeof(state));
     state.started_ms = monotonic_milliseconds();
+    state.last_goodput_log_ms = state.started_ms;
     live_log(context,
              "state=PROXYING interface=%s mtu=%u tx-frame-body=%zu "
              "rx-frame-body=%zu window-cell-payload=%zu window-body=%zu "
@@ -4091,6 +4297,7 @@ static int run_proxy_loop(live_context *context)
                 state.packets_sent >= context->options.proxy_test_packets &&
                 state.packets_received >=
                     context->options.proxy_test_packets) {
+                maybe_log_proxy_goodput(context, &state, 1);
                 status = send_proxy_completion(context, &state);
                 if (status == UM_OK) {
                     live_log(context,
@@ -4131,6 +4338,7 @@ static int run_proxy_loop(live_context *context)
                 return status;
             }
             if (peer_completed != 0) {
+                maybe_log_proxy_goodput(context, &state, 1);
                 live_log(context,
                          "state=COMPLETE bidirectional network proxy test "
                          "passed packets=%zu each direction",
@@ -4139,6 +4347,7 @@ static int run_proxy_loop(live_context *context)
             }
             have_token = 1;
         }
+        maybe_log_proxy_goodput(context, &state, 0);
     }
     return UM_ERR_INTERRUPTED;
 }

@@ -146,6 +146,8 @@ typedef struct {
     unsigned window_starts;
     unsigned window_repairs;
     unsigned rate_breakdowns;
+    unsigned internet_goodput_logs;
+    unsigned domain_annotations;
     unsigned body_stepdowns;
     unsigned reconnecting;
 } runner;
@@ -290,7 +292,7 @@ static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
             packet[19] = 2u;
         }
         dns = &packet[28];
-        memset(dns, 0, 26u);
+        memset(dns, 0, length - 28u);
         dns[0] = 0x4du;
         dns[1] = 0x2au;
         dns[2] = endpoint == SIM_CLIENT ? 0x01u : 0x81u;
@@ -323,6 +325,22 @@ static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
                       target_index),
             endpoint == SIM_CLIENT ? 50000u : 443u,
             endpoint == SIM_CLIENT ? 443u : 50000u);
+        if (endpoint == SIM_CLIENT) {
+            packet[16] = 93u;
+            packet[17] = 184u;
+            packet[18] = 216u;
+            packet[19] = 34u;
+        } else {
+            packet[12] = 93u;
+            packet[13] = 184u;
+            packet[14] = 216u;
+            packet[15] = 34u;
+            packet[16] = 10u;
+            packet[17] = 0u;
+            packet[18] = 0u;
+            packet[19] = 2u;
+        }
+        finalize_ipv4_checksums(packet, length);
     }
 }
 
@@ -805,6 +823,14 @@ static void test_log(void *context, const char *message)
     if (strstr(message, "dns-rate=") != NULL &&
         strstr(message, "non-dns-rate=") != NULL) {
         ++run->rate_breakdowns;
+    }
+    if (strstr(message, "proxy internet-goodput wall=") != NULL &&
+        strstr(message, " upload=") != NULL &&
+        strstr(message, " download=") != NULL) {
+        ++run->internet_goodput_logs;
+    }
+    if (strstr(message, "93.184.216.34(dns.test)") != NULL) {
+        ++run->domain_annotations;
     }
     if (run->options.role == UM_LIVE_CLIENT &&
         (strstr(message, "proxy token commit sequence=") != NULL ||
@@ -1573,7 +1599,10 @@ static int run_pair(const char *label,
           client.tcp_acks_coalesced != 1u ||
           gateway.tcp_acks_coalesced != 1u ||
           client.rate_breakdowns == 0u ||
-          gateway.rate_breakdowns == 0u)) ||
+          gateway.rate_breakdowns == 0u ||
+          client.internet_goodput_logs == 0u ||
+          gateway.internet_goodput_logs == 0u ||
+          client.domain_annotations + gateway.domain_annotations == 0u)) ||
         (inject_proxy_retry != 0 &&
          (bus.proxy_drops != 2u || bus.begin_ack_drops != 1u ||
           bus.commit_drops != 1u ||
