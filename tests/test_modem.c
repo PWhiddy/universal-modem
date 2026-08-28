@@ -133,11 +133,6 @@ static void test_quiet_traffic_policy(void)
     static const char *allowed[] = {
         "example.com",
         "google.com",
-        "42-courier.push.apple.com",
-        "us-ne-courier-4.push-apple.com.akadns.net",
-        "query.ess.apple.com",
-        "init-cdn-lb.ess-apple.com.akadns.net",
-        "init.ess.g.aaplimg.com",
         "ocsp.apple.com",
         "valid.apple.com",
         "notapple.com"

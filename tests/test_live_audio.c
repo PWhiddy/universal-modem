@@ -25,7 +25,7 @@ enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
 #define SIM_BACKGROUND_BYTES 64u
 #define SIM_BACKGROUND_PACKETS 16u
 #define SIM_FILTERED_BACKGROUND_PACKETS 3u
-#define SIM_COALESCED_BACKGROUND_PACKETS 1u
+#define SIM_COALESCED_BACKGROUND_PACKETS 2u
 #define SIM_FORWARDED_BACKGROUND_PACKETS                              \
     (SIM_BACKGROUND_PACKETS - SIM_FILTERED_BACKGROUND_PACKETS -      \
      SIM_COALESCED_BACKGROUND_PACKETS)
@@ -77,6 +77,7 @@ typedef struct {
     unsigned network_dns_retries_injected;
     int network_dns_response_delayed;
     int client_tcp_before_dns_drained;
+    int client_tcp_data_before_control;
     unsigned network_targets_read[SIM_ENDPOINTS];
     unsigned network_reads[SIM_ENDPOINTS];
     unsigned network_writes[SIM_ENDPOINTS];
@@ -145,6 +146,8 @@ typedef struct {
     unsigned stale_dns_icmp_dropped;
     unsigned discovery_dns_deprioritized;
     unsigned tcp_acks_coalesced;
+    unsigned tcp_retransmits_coalesced;
+    unsigned tcp_detail_logs;
     unsigned multi_packet_batches;
     unsigned multi_packet_windows;
     unsigned window_starts;
@@ -444,6 +447,30 @@ static void make_coalescible_tcp_ack(uint8_t *packet, int endpoint,
     finalize_ipv4_checksums(packet, 40u);
 }
 
+static void make_coalescible_tcp_retransmission(
+    uint8_t *packet, int endpoint, unsigned background_number)
+{
+    make_ipv4_tcp_packet(packet, SIM_BACKGROUND_BYTES, 0x6au,
+                         endpoint == SIM_CLIENT ? 51001u : 443u,
+                         endpoint == SIM_CLIENT ? 443u : 51001u);
+    if (endpoint == SIM_GATEWAY) {
+        packet[12] = 1u;
+        packet[13] = 1u;
+        packet[14] = 1u;
+        packet[15] = 1u;
+        packet[16] = 10u;
+        packet[17] = 0u;
+        packet[18] = 0u;
+        packet[19] = 2u;
+    }
+    /* Same flow, sequence, flags, and payload; only replaceable header
+     * metadata advances between the two unsent copies. */
+    packet[4] = 0u;
+    packet[5] = (uint8_t)background_number;
+    packet[31] = (uint8_t)(11u - background_number);
+    finalize_ipv4_checksums(packet, SIM_BACKGROUND_BYTES);
+}
+
 static void make_tunnel_discovery_dns(uint8_t *packet, int endpoint)
 {
     uint8_t *dns;
@@ -506,6 +533,11 @@ static void make_proxy_background(uint8_t *packet, int endpoint,
     }
     if (background_number == 13u || background_number == 12u) {
         make_coalescible_tcp_ack(packet, endpoint, background_number);
+        return;
+    }
+    if (background_number == 10u || background_number == 9u) {
+        make_coalescible_tcp_retransmission(packet, endpoint,
+                                            background_number);
         return;
     }
     if (background_number == 11u) {
@@ -838,13 +870,30 @@ static void test_log(void *context, const char *message)
             run->tcp_acks_coalesced = count;
         }
     }
+    {
+        const char *coalesced =
+            strstr(message, "tcp-retransmits-coalesced=");
+        unsigned count;
+        if (coalesced != NULL &&
+            sscanf(coalesced + strlen("tcp-retransmits-coalesced="),
+                   "%u", &count) == 1) {
+            run->tcp_retransmits_coalesced = count;
+        }
+    }
+    if (strstr(message, "traffic=IPv4/TCP ") != NULL &&
+        strstr(message, " flags=0x") != NULL &&
+        strstr(message, " payload=") != NULL) {
+        ++run->tcp_detail_logs;
+    }
     if (strstr(message, "dns-rate=") != NULL &&
         strstr(message, "non-dns-rate=") != NULL) {
         ++run->rate_breakdowns;
     }
     if (strstr(message, "proxy internet-goodput wall=") != NULL &&
         strstr(message, " upload=") != NULL &&
-        strstr(message, " download=") != NULL) {
+        strstr(message, " download=") != NULL &&
+        strstr(message, " recent-upload=") != NULL &&
+        strstr(message, " recent-download=") != NULL) {
         ++run->internet_goodput_logs;
     }
     if (strstr(message, "93.184.216.34(dns.test)") != NULL) {
@@ -1340,6 +1389,12 @@ int um_network_write(um_network *network, const uint8_t *packet,
             }
         }
     }
+    if (background_matches != 0 && network->endpoint == SIM_GATEWAY &&
+        (background_number == 9u || background_number == 10u) &&
+        (bus.network_background_seen[SIM_GATEWAY] &
+         ((UINT32_C(1) << 12u) | (UINT32_C(1) << 13u))) == 0u) {
+        bus.client_tcp_data_before_control = 1;
+    }
     if (target_matches != 0) {
         ++bus.network_matches[network->endpoint];
         if (network->endpoint == SIM_GATEWAY) {
@@ -1526,6 +1581,7 @@ static int run_pair(const char *label,
     bus.network_dns_retries_injected = 0u;
     bus.network_dns_response_delayed = 0;
     bus.client_tcp_before_dns_drained = 0;
+    bus.client_tcp_data_before_control = 0;
     memset(bus.network_targets_read, 0, sizeof(bus.network_targets_read));
     memset(bus.network_reads, 0, sizeof(bus.network_reads));
     memset(bus.network_writes, 0, sizeof(bus.network_writes));
@@ -1623,6 +1679,7 @@ static int run_pair(const char *label,
           bus.network_dns_retry_reads[SIM_CLIENT] != 3u ||
           client.dns_retries_suppressed != 3u ||
           bus.client_tcp_before_dns_drained == 0 ||
+          bus.client_tcp_data_before_control == 0 ||
           client.multicast_dropped != 1u ||
           gateway.multicast_dropped != 1u ||
           client.broadcast_dropped != 1u ||
@@ -1633,6 +1690,10 @@ static int run_pair(const char *label,
           gateway.discovery_dns_deprioritized != 1u ||
           client.tcp_acks_coalesced != 1u ||
           gateway.tcp_acks_coalesced != 1u ||
+          client.tcp_retransmits_coalesced != 1u ||
+          gateway.tcp_retransmits_coalesced != 1u ||
+          client.tcp_detail_logs == 0u ||
+          gateway.tcp_detail_logs == 0u ||
           client.rate_breakdowns == 0u ||
           gateway.rate_breakdowns == 0u ||
           client.internet_goodput_logs == 0u ||
