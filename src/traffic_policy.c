@@ -32,12 +32,14 @@ typedef struct {
 } quiet_domain_rule;
 
 static const quiet_domain_rule imessage_allow_rules[] = {
+
+/*
     {"push.apple.com", "Apple Push Notification service"},
     {"push-apple.com.akadns.net", "APNs load-balancing alias"},
     {"ess.apple.com", "observed iMessage identity/query service"},
     {"ess-apple.com.akadns.net", "observed iMessage service alias"},
     {"ess.g.aaplimg.com", "observed iMessage service CDN alias"},
-
+*/
     /* Apple lists these as certificate-validation dependencies for its
      * services.  They also support ordinary foreground HTTPS validation. */
     {"certs.apple.com", "Apple certificate validation"},
@@ -58,6 +60,13 @@ static const quiet_domain_rule quiet_block_rules[] = {
     {"metrics.icloud.com", "iCloud diagnostics"},
     {"time.apple.com", "background time synchronization"},
     {"time-macos.apple.com", "background time synchronization"},
+    
+    // blocking these temp
+    {"push.apple.com", "Apple Push Notification service"},
+    {"push-apple.com.akadns.net", "APNs load-balancing alias"},
+    {"ess.apple.com", "observed iMessage identity/query service"},
+    {"ess-apple.com.akadns.net", "observed iMessage service alias"},
+    {"ess.g.aaplimg.com", "observed iMessage service CDN alias"},
 
     /* Apple services outside the requested APNs/iMessage text path. */
     {"news-edge.apple.com", "Apple News"},
