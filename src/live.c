@@ -189,6 +189,7 @@ typedef struct {
     size_t discovery_dns_dropped;
     size_t tcp_acks_coalesced;
     size_t tcp_retransmits_coalesced;
+    size_t tcp_stale_syns_dropped;
     size_t background_dns_rejected;
     size_t background_packets_dropped;
     size_t queue_priority_evictions;
@@ -202,6 +203,7 @@ typedef struct {
     size_t discovery_dns_logged_dropped;
     size_t tcp_acks_logged_coalesced;
     size_t tcp_retransmits_logged_coalesced;
+    size_t tcp_stale_syns_logged_dropped;
     size_t background_dns_logged_rejected;
     size_t background_packets_logged_dropped;
     size_t queue_logged_priority_evictions;
@@ -2333,6 +2335,31 @@ static int parse_ipv4_tcp_segment(const uint8_t *packet, size_t length,
     return 1;
 }
 
+static int tcp_handshake_is_obsolete_for_followup(
+    const uint8_t *handshake_packet, size_t handshake_length,
+    const uint8_t *followup_packet, size_t followup_length)
+{
+    live_proxy_tcp_segment handshake;
+    live_proxy_tcp_segment followup;
+    uint32_t next_sequence;
+    if (parse_ipv4_tcp_segment(handshake_packet, handshake_length,
+                               &handshake) == 0 ||
+        parse_ipv4_tcp_segment(followup_packet, followup_length,
+                               &followup) == 0 ||
+        memcmp(&handshake_packet[12], &followup_packet[12], 8u) != 0 ||
+        handshake.source_port != followup.source_port ||
+        handshake.destination_port != followup.destination_port ||
+        (handshake.flags & 0x02u) == 0u ||
+        (handshake.flags & 0x25u) != 0u ||
+        (followup.flags & 0x10u) == 0u ||
+        (followup.flags & 0x06u) != 0u) {
+        return 0;
+    }
+    next_sequence = handshake.sequence + 1u +
+                    (uint32_t)handshake.payload_length;
+    return followup.sequence == next_sequence;
+}
+
 static int tcp_segments_are_queued_retransmissions(
     const uint8_t *new_packet, size_t new_length,
     const uint8_t *old_packet, size_t old_length)
@@ -3235,7 +3262,26 @@ static int enqueue_proxy_packet(live_proxy_state *state,
         return UM_OK;
     }
     priority = proxy_packet_priority(packet, packet_length);
-    for (index = 0u; index < state->queue_count; ++index) {
+    index = 0u;
+    while (index < state->queue_count) {
+        /* An ACK/data segment at SYN+1 proves that this same TCP endpoint
+         * has already advanced past its queued SYN (or SYN-ACK). Sending
+         * that stale handshake retry after the follow-up restarts or resets
+         * the live connection. This only removes packets that are still in
+         * the local queue; transmitted packets remain TCP's responsibility. */
+        if (tcp_handshake_is_obsolete_for_followup(
+                state->queue[index].packet, state->queue[index].length,
+                packet, packet_length) != 0) {
+            remove_proxy_queue_entry(state, index);
+            ++state->tcp_stale_syns_dropped;
+            continue;
+        }
+        if (tcp_handshake_is_obsolete_for_followup(
+                packet, packet_length, state->queue[index].packet,
+                state->queue[index].length) != 0) {
+            ++state->tcp_stale_syns_dropped;
+            return UM_OK;
+        }
         if (state->queue[index].length == packet_length &&
             memcmp(state->queue[index].packet, packet, packet_length) == 0) {
             ++state->queue_duplicates;
@@ -3264,6 +3310,7 @@ static int enqueue_proxy_packet(live_proxy_state *state,
             ++state->tcp_retransmits_coalesced;
             return UM_OK;
         }
+        ++index;
     }
     if (um_traffic_policy_is_tunnel_discovery_dns(packet,
                                                    packet_length) != 0) {
@@ -3408,6 +3455,8 @@ static int drain_proxy_ingress(live_context *context,
         state->tcp_acks_coalesced != state->tcp_acks_logged_coalesced ||
         state->tcp_retransmits_coalesced !=
             state->tcp_retransmits_logged_coalesced ||
+        state->tcp_stale_syns_dropped !=
+            state->tcp_stale_syns_logged_dropped ||
         state->background_dns_rejected !=
             state->background_dns_logged_rejected ||
         state->background_packets_dropped !=
@@ -3422,6 +3471,7 @@ static int drain_proxy_ingress(live_context *context,
                  "discovery-dns-deprioritized=%zu "
                  "discovery-dns-dropped=%zu tcp-acks-coalesced=%zu "
                  "tcp-retransmits-coalesced=%zu "
+                 "stale-tcp-syns-dropped=%zu "
                  "background-dns-rejected=%zu "
                  "background-packets-dropped=%zu "
                  "priority-evictions=%zu",
@@ -3435,6 +3485,7 @@ static int drain_proxy_ingress(live_context *context,
                  state->discovery_dns_dropped,
                  state->tcp_acks_coalesced,
                  state->tcp_retransmits_coalesced,
+                 state->tcp_stale_syns_dropped,
                  state->background_dns_rejected,
                  state->background_packets_dropped,
                  state->queue_priority_evictions);
@@ -3453,6 +3504,8 @@ static int drain_proxy_ingress(live_context *context,
         state->tcp_acks_logged_coalesced = state->tcp_acks_coalesced;
         state->tcp_retransmits_logged_coalesced =
             state->tcp_retransmits_coalesced;
+        state->tcp_stale_syns_logged_dropped =
+            state->tcp_stale_syns_dropped;
         state->background_dns_logged_rejected =
             state->background_dns_rejected;
         state->background_packets_logged_dropped =

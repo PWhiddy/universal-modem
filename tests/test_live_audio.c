@@ -25,7 +25,7 @@ enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
 #define SIM_BACKGROUND_BYTES 64u
 #define SIM_BACKGROUND_PACKETS 16u
 #define SIM_FILTERED_BACKGROUND_PACKETS 3u
-#define SIM_COALESCED_BACKGROUND_PACKETS 2u
+#define SIM_COALESCED_BACKGROUND_PACKETS 3u
 #define SIM_FORWARDED_BACKGROUND_PACKETS                              \
     (SIM_BACKGROUND_PACKETS - SIM_FILTERED_BACKGROUND_PACKETS -      \
      SIM_COALESCED_BACKGROUND_PACKETS)
@@ -147,6 +147,7 @@ typedef struct {
     unsigned discovery_dns_deprioritized;
     unsigned tcp_acks_coalesced;
     unsigned tcp_retransmits_coalesced;
+    unsigned tcp_stale_syns_dropped;
     unsigned tcp_detail_logs;
     unsigned multi_packet_batches;
     unsigned multi_packet_windows;
@@ -375,7 +376,8 @@ static size_t proxy_background_length(unsigned background_number)
     if (background_number == 14u) {
         return 56u;
     }
-    if (background_number == 13u || background_number == 12u) {
+    if (background_number == 13u || background_number == 12u ||
+        background_number == 8u) {
         return 40u;
     }
     if (background_number == 11u) {
@@ -471,6 +473,36 @@ static void make_coalescible_tcp_retransmission(
     finalize_ipv4_checksums(packet, SIM_BACKGROUND_BYTES);
 }
 
+static void make_stale_tcp_syn_pair(uint8_t *packet, int endpoint,
+                                    unsigned background_number)
+{
+    size_t length = proxy_background_length(background_number);
+    uint32_t sequence = background_number == 8u
+                            ? UINT32_C(0x12345678)
+                            : UINT32_C(0x12345679);
+    make_ipv4_tcp_packet(packet, length, 0x5cu,
+                         endpoint == SIM_CLIENT ? 51002u : 443u,
+                         endpoint == SIM_CLIENT ? 443u : 51002u);
+    if (endpoint == SIM_GATEWAY) {
+        packet[12] = 1u;
+        packet[13] = 1u;
+        packet[14] = 1u;
+        packet[15] = 1u;
+        packet[16] = 10u;
+        packet[17] = 0u;
+        packet[18] = 0u;
+        packet[19] = 2u;
+    }
+    packet[4] = 0u;
+    packet[5] = (uint8_t)background_number;
+    packet[24] = (uint8_t)(sequence >> 24u);
+    packet[25] = (uint8_t)(sequence >> 16u);
+    packet[26] = (uint8_t)(sequence >> 8u);
+    packet[27] = (uint8_t)sequence;
+    packet[33] = background_number == 8u ? 0x02u : 0x18u;
+    finalize_ipv4_checksums(packet, length);
+}
+
 static void make_tunnel_discovery_dns(uint8_t *packet, int endpoint)
 {
     uint8_t *dns;
@@ -538,6 +570,10 @@ static void make_proxy_background(uint8_t *packet, int endpoint,
     if (background_number == 10u || background_number == 9u) {
         make_coalescible_tcp_retransmission(packet, endpoint,
                                             background_number);
+        return;
+    }
+    if (background_number == 8u || background_number == 7u) {
+        make_stale_tcp_syn_pair(packet, endpoint, background_number);
         return;
     }
     if (background_number == 11u) {
@@ -878,6 +914,16 @@ static void test_log(void *context, const char *message)
             sscanf(coalesced + strlen("tcp-retransmits-coalesced="),
                    "%u", &count) == 1) {
             run->tcp_retransmits_coalesced = count;
+        }
+    }
+    {
+        const char *dropped =
+            strstr(message, "stale-tcp-syns-dropped=");
+        unsigned count;
+        if (dropped != NULL &&
+            sscanf(dropped + strlen("stale-tcp-syns-dropped="),
+                   "%u", &count) == 1) {
+            run->tcp_stale_syns_dropped = count;
         }
     }
     if (strstr(message, "traffic=IPv4/TCP ") != NULL &&
@@ -1692,6 +1738,8 @@ static int run_pair(const char *label,
           gateway.tcp_acks_coalesced != 1u ||
           client.tcp_retransmits_coalesced != 1u ||
           gateway.tcp_retransmits_coalesced != 1u ||
+          client.tcp_stale_syns_dropped != 1u ||
+          gateway.tcp_stale_syns_dropped != 1u ||
           client.tcp_detail_logs == 0u ||
           gateway.tcp_detail_logs == 0u ||
           client.rate_breakdowns == 0u ||
