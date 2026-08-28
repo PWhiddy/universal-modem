@@ -19,7 +19,7 @@ enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
 
 #define SIM_DNS_REQUEST_BYTES 64u
 #define SIM_DNS_RESPONSE_BYTES 96u
-#define SIM_LARGE_REQUEST_BYTES UM_NETWORK_MTU
+#define SIM_LARGE_REQUEST_BYTES UM_NETWORK_MIN_MTU
 #define SIM_LARGE_RESPONSE_BYTES 413u
 #define SIM_SMALL_TCP_BYTES 60u
 #define SIM_BACKGROUND_BYTES 64u
@@ -30,6 +30,7 @@ enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
     (SIM_BACKGROUND_PACKETS - SIM_FILTERED_BACKGROUND_PACKETS -      \
      SIM_COALESCED_BACKGROUND_PACKETS)
 #define SIM_PROXY_PACKETS 10u
+#define SIM_TCP_ACK_PACKET_INDEX SIM_PROXY_PACKETS
 #define SIM_FORWARDED_PACKETS \
     (SIM_PROXY_PACKETS + SIM_FORWARDED_BACKGROUND_PACKETS)
 
@@ -100,6 +101,7 @@ struct um_audio {
 
 struct um_network {
     int endpoint;
+    unsigned mtu;
     char interface_name[24];
 };
 
@@ -133,6 +135,8 @@ typedef struct {
     unsigned commit_retries;
     unsigned packet_token_commits;
     unsigned packet_token_accepts;
+    unsigned token_offers_declined;
+    unsigned tcp_ack_turns_deferred;
     unsigned dns_query_logs;
     unsigned dns_response_logs;
     unsigned dns_retries_suppressed;
@@ -340,6 +344,9 @@ static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
             packet[18] = 0u;
             packet[19] = 2u;
         }
+        if (target_index == SIM_TCP_ACK_PACKET_INDEX) {
+            packet[33] = 0x10u;
+        }
         finalize_ipv4_checksums(packet, length);
     }
 }
@@ -353,6 +360,9 @@ static size_t proxy_target_length(int endpoint, unsigned target_index)
     if (target_index == 1u) {
         return endpoint == SIM_CLIENT ? SIM_LARGE_REQUEST_BYTES
                                       : SIM_LARGE_RESPONSE_BYTES;
+    }
+    if (target_index == SIM_TCP_ACK_PACKET_INDEX) {
+        return 40u;
     }
     return SIM_SMALL_TCP_BYTES;
 }
@@ -724,6 +734,14 @@ static void test_log(void *context, const char *message)
     }
     if (strstr(message, "proxy packet token commit sequence=") != NULL) {
         ++run->packet_token_commits;
+    }
+    if (strstr(message, "proxy token offer window=") != NULL &&
+        strstr(message, " declined reason=") != NULL) {
+        ++run->token_offers_declined;
+    }
+    if (strstr(message,
+               "declined reason=defer-replaceable-tcp-acks") != NULL) {
+        ++run->tcp_ack_turns_deferred;
     }
     if (strstr(message, "DNS query dns.test A") != NULL) {
         ++run->dns_query_logs;
@@ -1111,12 +1129,13 @@ int um_audio_write(um_audio *audio, const float *samples, size_t frame_count)
     return status;
 }
 
-int um_network_open(um_network **network, um_live_role role,
+int um_network_open(um_network **network, um_live_role role, unsigned mtu,
                     um_log_callback logger, void *logger_context)
 {
     um_network *opened;
     int endpoint;
-    if (network == NULL ||
+    if (network == NULL || mtu < UM_NETWORK_MIN_MTU ||
+        mtu > UM_NETWORK_MAX_MTU ||
         (role != UM_LIVE_CLIENT && role != UM_LIVE_GATEWAY)) {
         return UM_ERR_ARGUMENT;
     }
@@ -1126,6 +1145,7 @@ int um_network_open(um_network **network, um_live_role role,
         return UM_ERR_MEMORY;
     }
     opened->endpoint = endpoint;
+    opened->mtu = mtu;
     (void)snprintf(opened->interface_name, sizeof(opened->interface_name),
                    "sim-tun-%s", endpoint == SIM_CLIENT ? "client"
                                                         : "gateway");
@@ -1171,7 +1191,7 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
                     unsigned timeout_ms, size_t *packet_length)
 {
     struct timespec deadline;
-    uint8_t generated[UM_NETWORK_MTU];
+    uint8_t generated[UM_NETWORK_MAX_PACKET];
     size_t length;
     unsigned background_number = 0u;
     unsigned target_index = 0u;
@@ -1182,7 +1202,7 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
         return UM_ERR_ARGUMENT;
     }
     *packet_length = 0u;
-    if (capacity < UM_NETWORK_MTU) {
+    if (capacity < UM_NETWORK_MIN_MTU) {
         return UM_ERR_CAPACITY;
     }
     (void)clock_gettime(CLOCK_REALTIME, &deadline);
@@ -1258,7 +1278,7 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
 int um_network_write(um_network *network, const uint8_t *packet,
                      size_t packet_length, unsigned timeout_ms)
 {
-    uint8_t expected[UM_NETWORK_MTU];
+    uint8_t expected[UM_NETWORK_MAX_PACKET];
     size_t expected_length = 0u;
     unsigned target_index;
     unsigned target_candidate;
@@ -1338,6 +1358,13 @@ int um_network_write(um_network *network, const uint8_t *packet,
                 bus.client_tcp_before_dns_drained = 1;
             }
         }
+        if (network->endpoint == SIM_CLIENT &&
+            target_index == SIM_PROXY_PACKETS - 1u) {
+            /* Model the cumulative ACK emitted by a TCP stack after the last
+             * synthetic payload.  It should exercise the proxy's bounded
+             * ACK-only token deferral without inventing application data. */
+            ++bus.network_input_ready[network->endpoint];
+        }
     }
     if (background_matches != 0 && network->endpoint == SIM_CLIENT &&
         bus.network_dns_response_delayed != 0) {
@@ -1355,6 +1382,11 @@ int um_network_write(um_network *network, const uint8_t *packet,
 const char *um_network_interface_name(const um_network *network)
 {
     return network != NULL ? network->interface_name : NULL;
+}
+
+unsigned um_network_mtu(const um_network *network)
+{
+    return network != NULL ? network->mtu : 0u;
 }
 
 static void *run_endpoint(void *argument)
@@ -1534,7 +1566,10 @@ static int run_pair(const char *label,
 
     (void)pthread_mutex_lock(&bus.mutex);
     (void)clock_gettime(CLOCK_REALTIME, &deadline);
-    add_milliseconds(&deadline, link_test != 0 ? 60000u : 180000u);
+    /* Sanitized/debug OFDM builds are several times slower than optimized
+     * builds.  Leave enough headroom that a valid run is not asynchronously
+     * cancelled during thread teardown by the harness itself. */
+    add_milliseconds(&deadline, link_test != 0 ? 120000u : 360000u);
     while (bus.runners_done < 2) {
         status = pthread_cond_timedwait(&bus.changed, &bus.mutex, &deadline);
         if (status == ETIMEDOUT) {
@@ -1573,7 +1608,7 @@ static int run_pair(const char *label,
          (bus.network_opened[SIM_CLIENT] != 0 ||
           bus.network_opened[SIM_GATEWAY] != 0 ||
           bus.network_reads[SIM_CLIENT] !=
-              SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS + 3u ||
+              SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS + 4u ||
           bus.network_reads[SIM_GATEWAY] !=
               SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS ||
           bus.network_writes[SIM_CLIENT] != SIM_FORWARDED_PACKETS ||
@@ -1612,6 +1647,9 @@ static int run_pair(const char *label,
         (link_test == 0 &&
          (client.packet_token_commits + gateway.packet_token_commits < 2u ||
           client.packet_token_accepts + gateway.packet_token_accepts < 2u ||
+          client.tcp_ack_turns_deferred +
+                  gateway.tcp_ack_turns_deferred ==
+              0u ||
           client.dns_query_logs + gateway.dns_query_logs < 2u ||
           client.dns_response_logs + gateway.dns_response_logs < 2u ||
           client.multi_packet_batches == 0u ||
@@ -1635,7 +1673,8 @@ static int run_pair(const char *label,
            "delayed capture restart, %s; upgrades=%u/%u "
            "fallbacks=%u/%u verification-stepdowns=%u calibrations=%u "
            "cache-skips=%u recovery-probes=%u offer-refreshes=%u "
-           "bounded-window-repairs=%u\n",
+           "bounded-window-repairs=%u declined-token-offers=%u "
+           "deferred-ack-turns=%u\n",
            label,
            link_test != 0 ? "256+256-byte explicit link test"
                           : "queued/in-flight/completed DNS coalescing plus "
@@ -1646,7 +1685,10 @@ static int run_pair(const char *label,
            expected_calibrations, client.cache_skips + gateway.cache_skips,
            client.recovery_probes + gateway.recovery_probes,
            gateway.offer_refreshes,
-           client.window_repairs + gateway.window_repairs);
+           client.window_repairs + gateway.window_repairs,
+           client.token_offers_declined + gateway.token_offers_declined,
+           client.tcp_ack_turns_deferred +
+               gateway.tcp_ack_turns_deferred);
     return 0;
 }
 
@@ -1686,7 +1728,8 @@ int main(void)
         found = 0;
         if (um_calibration_config_load(gateway_path, UM_LIVE_GATEWAY, &cached,
                                        &cached_body_bytes, &found) != UM_OK ||
-            found == 0 || cached_body_bytes != 384u) {
+            found == 0 || cached_body_bytes < 384u ||
+            cached_body_bytes > UM_LIVE_MAX_BODY) {
             fprintf(stderr, "gateway calibration cache was not saved\n");
             status = 1;
         }

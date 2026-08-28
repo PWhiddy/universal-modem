@@ -1,4 +1,5 @@
 #include "um.h"
+#include "live_wire.h"
 #include "network.h"
 
 #include <stdio.h>
@@ -22,7 +23,7 @@ static void usage(FILE *stream)
             "  --output-device ID   Playback device ID shown at startup\n"
             "  --link-test          Finite bidirectional data test; no TUN/routes\n"
             "  --test-bytes N       Link-test bytes each direction (default 1024)\n"
-            "  --chunk-bytes N      Maximum calibrated frame body (default 512)\n"
+            "  --chunk-bytes N      Maximum calibrated frame body (default 2048)\n"
             "  --retries N          Attempts per acknowledged frame (default 4)\n"
             "  --calib-high         Use the extended real-audio calibration\n"
             "  --allow-background   Disable the default quiet-link firewall\n"
@@ -184,7 +185,7 @@ int main(int argc, char **argv)
     const char *input_device = "default";
     const char *output_device = "default";
     size_t test_bytes = 1024u;
-    size_t chunk_bytes = 512u;
+    size_t chunk_bytes = UM_LIVE_MAX_BODY;
     unsigned retries = 4u;
     int i;
 
@@ -234,8 +235,10 @@ int main(int argc, char **argv)
             char *end = NULL;
             unsigned long value = strtoul(argv[++i], &end, 10);
             if (end == argv[i] || *end != '\0' || value == 0ul ||
-                value > 512ul) {
-                fprintf(stderr, "chunk bytes must be between 1 and 512\n");
+                value > UM_LIVE_MAX_BODY) {
+                fprintf(stderr,
+                        "chunk bytes must be between 1 and %u\n",
+                        UM_LIVE_MAX_BODY);
                 return 2;
             }
             chunk_bytes = (size_t)value;

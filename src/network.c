@@ -66,6 +66,7 @@ static struct {
 struct um_network {
     int fd;
     um_live_role role;
+    unsigned mtu;
     char interface_name[IFNAMSIZ];
     um_log_callback logger;
     void *logger_context;
@@ -699,7 +700,7 @@ static int linux_configure_interface(um_network *network)
         "mtu", mtu, "up", NULL
     };
     int status;
-    (void)snprintf(mtu, sizeof(mtu), "%u", UM_NETWORK_MTU);
+    (void)snprintf(mtu, sizeof(mtu), "%u", network->mtu);
     status = linux_run(network, address);
     if (status == UM_OK) {
         status = linux_run(network, link);
@@ -899,7 +900,7 @@ static int mac_configure_interface(um_network *network)
         mtu, "up", NULL
     };
     char output[768];
-    (void)snprintf(mtu, sizeof(mtu), "%u", UM_NETWORK_MTU);
+    (void)snprintf(mtu, sizeof(mtu), "%u", network->mtu);
     return mac_run(network, command, output, sizeof(output));
 }
 
@@ -1342,12 +1343,13 @@ static void mac_cleanup(um_network *network)
 }
 #endif
 
-int um_network_open(um_network **network, um_live_role role,
+int um_network_open(um_network **network, um_live_role role, unsigned mtu,
                     um_log_callback logger, void *logger_context)
 {
     um_network *opened;
     int status;
     if (network == NULL || logger == NULL ||
+        mtu < UM_NETWORK_MIN_MTU || mtu > UM_NETWORK_MAX_MTU ||
         (role != UM_LIVE_CLIENT && role != UM_LIVE_GATEWAY)) {
         return UM_ERR_ARGUMENT;
     }
@@ -1358,6 +1360,7 @@ int um_network_open(um_network **network, um_live_role role,
     }
     opened->fd = -1;
     opened->role = role;
+    opened->mtu = mtu;
     opened->logger = logger;
     opened->logger_context = logger_context;
 #if defined(__linux__)
@@ -1437,7 +1440,7 @@ int um_network_open(um_network **network, um_live_role role,
                                        : UM_TUN_GATEWAY_ADDRESS,
                 role == UM_LIVE_CLIENT ? UM_TUN_GATEWAY_ADDRESS
                                        : UM_TUN_CLIENT_ADDRESS,
-                UM_NETWORK_MTU);
+                opened->mtu);
 #if defined(__linux__)
     status = linux_leave_network_privilege();
     if (status != UM_OK) {
@@ -1580,4 +1583,9 @@ int um_network_write(um_network *network, const uint8_t *packet,
 const char *um_network_interface_name(const um_network *network)
 {
     return network != NULL ? network->interface_name : NULL;
+}
+
+unsigned um_network_mtu(const um_network *network)
+{
+    return network != NULL ? network->mtu : 0u;
 }
