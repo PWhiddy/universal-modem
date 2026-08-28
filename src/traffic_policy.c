@@ -123,6 +123,7 @@ static const quiet_domain_rule quiet_block_rules[] = {
     {"spocs.getpocket.com", "Firefox sponsored Pocket content"},
     {"safebrowsing.google.com", "Firefox Safe Browsing refresh"},
     {"safebrowsing.googleapis.com", "Firefox Safe Browsing refresh"},
+    {"webservices.mozgcp.net", "firefox nonsense"},
 
     /* Catch all remaining Apple-controlled service zones.  The APNs, ESS,
      * and certificate-validation exceptions above are checked first.  This
