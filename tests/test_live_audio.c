@@ -23,9 +23,9 @@ enum { SIM_CLIENT = 0, SIM_GATEWAY = 1, SIM_ENDPOINTS = 2 };
 #define SIM_LARGE_RESPONSE_BYTES 413u
 #define SIM_SMALL_TCP_BYTES 60u
 #define SIM_BACKGROUND_BYTES 64u
-#define SIM_BACKGROUND_PACKETS 16u
+#define SIM_BACKGROUND_PACKETS 18u
 #define SIM_FILTERED_BACKGROUND_PACKETS 3u
-#define SIM_COALESCED_BACKGROUND_PACKETS 3u
+#define SIM_COALESCED_BACKGROUND_PACKETS 4u
 #define SIM_FORWARDED_BACKGROUND_PACKETS                              \
     (SIM_BACKGROUND_PACKETS - SIM_FILTERED_BACKGROUND_PACKETS -      \
      SIM_COALESCED_BACKGROUND_PACKETS)
@@ -76,9 +76,8 @@ typedef struct {
     unsigned network_background_remaining[SIM_ENDPOINTS];
     unsigned network_dns_retry_reads[SIM_ENDPOINTS];
     unsigned network_dns_retries_injected;
-    int network_dns_response_delayed;
     int client_tcp_before_dns_drained;
-    int client_tcp_data_before_control;
+    int client_tcp_control_before_data;
     unsigned network_targets_read[SIM_ENDPOINTS];
     unsigned network_reads[SIM_ENDPOINTS];
     unsigned network_writes[SIM_ENDPOINTS];
@@ -137,8 +136,6 @@ typedef struct {
     unsigned commit_retries;
     unsigned packet_token_commits;
     unsigned packet_token_accepts;
-    unsigned token_offers_declined;
-    unsigned tcp_ack_turns_deferred;
     unsigned dns_query_logs;
     unsigned dns_response_logs;
     unsigned dns_retries_suppressed;
@@ -148,9 +145,12 @@ typedef struct {
     unsigned discovery_dns_deprioritized;
     unsigned tcp_acks_coalesced;
     unsigned tcp_retransmits_coalesced;
+    unsigned tcp_syn_fallbacks_coalesced;
     unsigned tcp_stale_syns_dropped;
-    unsigned tcp_syn_response_turns;
     unsigned tcp_detail_logs;
+    unsigned tcp_diagnostic_logs;
+    unsigned tcp_capture_logs;
+    unsigned tcp_bad_checksum_logs;
     unsigned multi_packet_batches;
     unsigned multi_packet_windows;
     unsigned window_starts;
@@ -399,7 +399,8 @@ static size_t proxy_background_length(unsigned background_number)
         return 56u;
     }
     if (background_number == 13u || background_number == 12u ||
-        background_number == 8u) {
+        background_number == 8u || background_number == 18u ||
+        background_number == 17u) {
         return 40u;
     }
     if (background_number == 11u) {
@@ -475,8 +476,8 @@ static void make_coalescible_tcp_retransmission(
     uint8_t *packet, int endpoint, unsigned background_number)
 {
     make_ipv4_tcp_packet(packet, SIM_BACKGROUND_BYTES, 0x6au,
-                         endpoint == SIM_CLIENT ? 51001u : 443u,
-                         endpoint == SIM_CLIENT ? 443u : 51001u);
+                         endpoint == SIM_CLIENT ? 51000u : 443u,
+                         endpoint == SIM_CLIENT ? 443u : 51000u);
     if (endpoint == SIM_GATEWAY) {
         packet[12] = 1u;
         packet[13] = 1u;
@@ -493,6 +494,32 @@ static void make_coalescible_tcp_retransmission(
     packet[5] = (uint8_t)background_number;
     packet[31] = (uint8_t)(11u - background_number);
     finalize_ipv4_checksums(packet, SIM_BACKGROUND_BYTES);
+}
+
+static void make_tcp_syn_fallback(uint8_t *packet, int endpoint,
+                                  unsigned background_number)
+{
+    make_ipv4_tcp_packet(packet, 40u, 0u,
+                         endpoint == SIM_CLIENT ? 51003u : 443u,
+                         endpoint == SIM_CLIENT ? 443u : 51003u);
+    if (endpoint == SIM_GATEWAY) {
+        packet[12] = 1u;
+        packet[13] = 1u;
+        packet[14] = 1u;
+        packet[15] = 1u;
+        packet[16] = 10u;
+        packet[17] = 0u;
+        packet[18] = 0u;
+        packet[19] = 2u;
+    }
+    packet[4] = 0u;
+    packet[5] = (uint8_t)background_number;
+    packet[24] = 0x34u;
+    packet[25] = 0x56u;
+    packet[26] = 0x78u;
+    packet[27] = 0x90u;
+    packet[33] = background_number == 18u ? 0xc2u : 0x02u;
+    finalize_ipv4_checksums(packet, 40u);
 }
 
 static void make_stale_tcp_syn_pair(uint8_t *packet, int endpoint,
@@ -598,6 +625,10 @@ static void make_proxy_background(uint8_t *packet, int endpoint,
         make_stale_tcp_syn_pair(packet, endpoint, background_number);
         return;
     }
+    if (background_number == 18u || background_number == 17u) {
+        make_tcp_syn_fallback(packet, endpoint, background_number);
+        return;
+    }
     if (background_number == 11u) {
         make_tunnel_discovery_dns(packet, endpoint);
         return;
@@ -634,7 +665,7 @@ static void make_proxy_background(uint8_t *packet, int endpoint,
                          (uint8_t)(0x40u + background_number),
                          (uint16_t)(40000u + background_number), 53u);
     }
-    if (background_number == SIM_BACKGROUND_PACKETS) {
+    if (background_number == 16u) {
         packet[16] = 224u;
         packet[17] = 0u;
         packet[18] = 0u;
@@ -825,14 +856,6 @@ static void test_log(void *context, const char *message)
     if (strstr(message, "proxy packet token commit sequence=") != NULL) {
         ++run->packet_token_commits;
     }
-    if (strstr(message, "proxy token offer window=") != NULL &&
-        strstr(message, " declined reason=") != NULL) {
-        ++run->token_offers_declined;
-    }
-    if (strstr(message,
-               "declined reason=defer-replaceable-tcp-acks") != NULL) {
-        ++run->tcp_ack_turns_deferred;
-    }
     if (strstr(message, "DNS query dns.test A") != NULL) {
         ++run->dns_query_logs;
     }
@@ -939,6 +962,16 @@ static void test_log(void *context, const char *message)
         }
     }
     {
+        const char *coalesced =
+            strstr(message, "tcp-syn-fallbacks-coalesced=");
+        unsigned count;
+        if (coalesced != NULL &&
+            sscanf(coalesced + strlen("tcp-syn-fallbacks-coalesced="),
+                   "%u", &count) == 1) {
+            run->tcp_syn_fallbacks_coalesced = count;
+        }
+    }
+    {
         const char *dropped =
             strstr(message, "stale-tcp-syns-dropped=");
         unsigned count;
@@ -948,14 +981,20 @@ static void test_log(void *context, const char *message)
             run->tcp_stale_syns_dropped = count;
         }
     }
-    if (strstr(message,
-               "accepted reason=tcp-syn-response-turn") != NULL) {
-        ++run->tcp_syn_response_turns;
-    }
     if (strstr(message, "traffic=IPv4/TCP ") != NULL &&
         strstr(message, " flags=0x") != NULL &&
         strstr(message, " payload=") != NULL) {
         ++run->tcp_detail_logs;
+    }
+    if (strstr(message, "proxy tcp-diag stage=") != NULL) {
+        ++run->tcp_diagnostic_logs;
+        if (strstr(message, "stage=capture") != NULL) {
+            ++run->tcp_capture_logs;
+        }
+        if (strstr(message, "ip-check=bad") != NULL ||
+            strstr(message, "tcp-check=bad") != NULL) {
+            ++run->tcp_bad_checksum_logs;
+        }
     }
     if (strstr(message, "dns-rate=") != NULL &&
         strstr(message, "non-dns-rate=") != NULL) {
@@ -1279,7 +1318,10 @@ int um_network_open(um_network **network, um_live_role role, unsigned mtu,
     bus.network_opened[endpoint] = 1;
     bus.network_background_remaining[endpoint] = SIM_BACKGROUND_PACKETS;
     if (endpoint == SIM_CLIENT) {
-        bus.network_input_ready[endpoint] = 1;
+        /* Queue DNS and TCP together from the start so TCP progress through
+         * DNS saturation is a scheduling assertion, not a thread-timing
+         * accident. */
+        bus.network_input_ready[endpoint] = 2;
     }
     (void)pthread_cond_broadcast(&bus.changed);
     (void)pthread_mutex_unlock(&bus.mutex);
@@ -1462,18 +1504,22 @@ int um_network_write(um_network *network, const uint8_t *packet,
         }
     }
     if (background_matches != 0 && network->endpoint == SIM_GATEWAY &&
-        (background_number == 9u || background_number == 10u) &&
+        (background_number == 12u || background_number == 13u) &&
         (bus.network_background_seen[SIM_GATEWAY] &
-         ((UINT32_C(1) << 12u) | (UINT32_C(1) << 13u))) == 0u) {
-        bus.client_tcp_data_before_control = 1;
+         ((UINT32_C(1) << 9u) | (UINT32_C(1) << 10u))) == 0u) {
+        bus.client_tcp_control_before_data = 1;
     }
     if (target_matches != 0) {
         ++bus.network_matches[network->endpoint];
         if (network->endpoint == SIM_GATEWAY) {
             if (target_index == 0u) {
-                bus.network_dns_response_delayed = 1;
-                bus.network_input_ready[SIM_CLIENT] +=
-                    SIM_PROXY_PACKETS - 1u;
+                unsigned targets_read =
+                    bus.network_targets_read[SIM_CLIENT];
+                ++bus.network_input_ready[SIM_GATEWAY];
+                if (targets_read < SIM_PROXY_PACKETS) {
+                    bus.network_input_ready[SIM_CLIENT] +=
+                        SIM_PROXY_PACKETS - targets_read;
+                }
                 ++bus.network_dns_retry_ready[SIM_CLIENT];
                 ++bus.network_dns_retries_injected;
             } else {
@@ -1485,18 +1531,6 @@ int um_network_write(um_network *network, const uint8_t *packet,
                 bus.client_tcp_before_dns_drained = 1;
             }
         }
-        if (network->endpoint == SIM_CLIENT &&
-            target_index == SIM_PROXY_PACKETS - 1u) {
-            /* Model the cumulative ACK emitted by a TCP stack after the last
-             * synthetic payload.  It should exercise the proxy's bounded
-             * ACK-only token deferral without inventing application data. */
-            ++bus.network_input_ready[network->endpoint];
-        }
-    }
-    if (background_matches != 0 && network->endpoint == SIM_CLIENT &&
-        bus.network_dns_response_delayed != 0) {
-        bus.network_dns_response_delayed = 0;
-        ++bus.network_input_ready[SIM_GATEWAY];
     }
     if (target_matches != 0 || background_matches != 0) {
         (void)pthread_cond_broadcast(&bus.changed);
@@ -1651,9 +1685,8 @@ static int run_pair(const char *label,
     memset(bus.network_dns_retry_reads, 0,
            sizeof(bus.network_dns_retry_reads));
     bus.network_dns_retries_injected = 0u;
-    bus.network_dns_response_delayed = 0;
     bus.client_tcp_before_dns_drained = 0;
-    bus.client_tcp_data_before_control = 0;
+    bus.client_tcp_control_before_data = 0;
     memset(bus.network_targets_read, 0, sizeof(bus.network_targets_read));
     memset(bus.network_reads, 0, sizeof(bus.network_reads));
     memset(bus.network_writes, 0, sizeof(bus.network_writes));
@@ -1736,7 +1769,8 @@ static int run_pair(const char *label,
          (bus.network_opened[SIM_CLIENT] != 0 ||
           bus.network_opened[SIM_GATEWAY] != 0 ||
           bus.network_reads[SIM_CLIENT] !=
-              SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS + 4u ||
+              SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS +
+                  bus.network_dns_retry_reads[SIM_CLIENT] ||
           bus.network_reads[SIM_GATEWAY] !=
               SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS ||
           bus.network_writes[SIM_CLIENT] != SIM_FORWARDED_PACKETS ||
@@ -1751,7 +1785,7 @@ static int run_pair(const char *label,
           bus.network_dns_retry_reads[SIM_CLIENT] != 3u ||
           client.dns_retries_suppressed != 3u ||
           bus.client_tcp_before_dns_drained == 0 ||
-          bus.client_tcp_data_before_control == 0 ||
+          bus.client_tcp_control_before_data == 0 ||
           client.multicast_dropped != 1u ||
           gateway.multicast_dropped != 1u ||
           client.broadcast_dropped != 1u ||
@@ -1762,13 +1796,20 @@ static int run_pair(const char *label,
           gateway.discovery_dns_deprioritized != 1u ||
           client.tcp_acks_coalesced != 1u ||
           gateway.tcp_acks_coalesced != 1u ||
-          client.tcp_retransmits_coalesced != 1u ||
-          gateway.tcp_retransmits_coalesced != 1u ||
+          client.tcp_retransmits_coalesced != 2u ||
+          gateway.tcp_retransmits_coalesced != 2u ||
+          client.tcp_syn_fallbacks_coalesced != 1u ||
+          gateway.tcp_syn_fallbacks_coalesced != 1u ||
           client.tcp_stale_syns_dropped != 1u ||
           gateway.tcp_stale_syns_dropped != 1u ||
-          gateway.tcp_syn_response_turns != 1u ||
           client.tcp_detail_logs == 0u ||
           gateway.tcp_detail_logs == 0u ||
+          client.tcp_diagnostic_logs == 0u ||
+          gateway.tcp_diagnostic_logs == 0u ||
+          client.tcp_capture_logs == 0u ||
+          gateway.tcp_capture_logs == 0u ||
+          client.tcp_bad_checksum_logs != 0u ||
+          gateway.tcp_bad_checksum_logs != 0u ||
           client.rate_breakdowns == 0u ||
           gateway.rate_breakdowns == 0u ||
           client.internet_goodput_logs == 0u ||
@@ -1783,9 +1824,6 @@ static int run_pair(const char *label,
         (link_test == 0 &&
          (client.packet_token_commits + gateway.packet_token_commits < 2u ||
           client.packet_token_accepts + gateway.packet_token_accepts < 2u ||
-          client.tcp_ack_turns_deferred +
-                  gateway.tcp_ack_turns_deferred ==
-              0u ||
           client.dns_query_logs + gateway.dns_query_logs < 2u ||
           client.dns_response_logs + gateway.dns_response_logs < 2u ||
           client.multi_packet_batches == 0u ||
@@ -1801,6 +1839,54 @@ static int run_pair(const char *label,
                 "gateway=%s\n",
                 label, timed_out, um_status_string(client.status),
                 um_status_string(gateway.status));
+        fprintf(stderr,
+                "  network reads=%u/%u writes=%u/%u matches=%u/%u "
+                "background=%u/%u dns-retries=%u/%u/%u order=%d/%d\n",
+                bus.network_reads[SIM_CLIENT],
+                bus.network_reads[SIM_GATEWAY],
+                bus.network_writes[SIM_CLIENT],
+                bus.network_writes[SIM_GATEWAY],
+                bus.network_matches[SIM_CLIENT],
+                bus.network_matches[SIM_GATEWAY],
+                bus.network_background_matches[SIM_CLIENT],
+                bus.network_background_matches[SIM_GATEWAY],
+                bus.network_dns_retries_injected,
+                bus.network_dns_retry_reads[SIM_CLIENT],
+                client.dns_retries_suppressed,
+                bus.client_tcp_before_dns_drained,
+                bus.client_tcp_control_before_data);
+        fprintf(stderr,
+                "  filters multicast=%u/%u broadcast=%u/%u stale-icmp=%u/%u "
+                "discovery=%u/%u ack-coalesce=%u/%u retransmit=%u/%u "
+                "syn-fallback=%u/%u stale-syn=%u/%u\n",
+                client.multicast_dropped, gateway.multicast_dropped,
+                client.broadcast_dropped, gateway.broadcast_dropped,
+                client.stale_dns_icmp_dropped,
+                gateway.stale_dns_icmp_dropped,
+                client.discovery_dns_deprioritized,
+                gateway.discovery_dns_deprioritized,
+                client.tcp_acks_coalesced, gateway.tcp_acks_coalesced,
+                client.tcp_retransmits_coalesced,
+                gateway.tcp_retransmits_coalesced,
+                client.tcp_syn_fallbacks_coalesced,
+                gateway.tcp_syn_fallbacks_coalesced,
+                client.tcp_stale_syns_dropped,
+                gateway.tcp_stale_syns_dropped);
+        fprintf(stderr,
+                "  telemetry tcp=%u/%u capture=%u/%u bad-check=%u/%u "
+                "rates=%u/%u goodput=%u/%u domains=%u/%u windows=%u/%u "
+                "repairs=%u drops=%u/%u stepdowns=%u\n",
+                client.tcp_diagnostic_logs, gateway.tcp_diagnostic_logs,
+                client.tcp_capture_logs, gateway.tcp_capture_logs,
+                client.tcp_bad_checksum_logs,
+                gateway.tcp_bad_checksum_logs, client.rate_breakdowns,
+                gateway.rate_breakdowns, client.internet_goodput_logs,
+                gateway.internet_goodput_logs, client.domain_annotations,
+                gateway.domain_annotations, client.multi_packet_windows,
+                gateway.multi_packet_windows,
+                client.window_repairs + gateway.window_repairs,
+                bus.window_drops, bus.body_drops,
+                client.body_stepdowns + gateway.body_stepdowns);
         print_logs(&client);
         print_logs(&gateway);
         return 1;
@@ -1809,8 +1895,7 @@ static int run_pair(const char *label,
            "delayed capture restart, %s; upgrades=%u/%u "
            "fallbacks=%u/%u verification-stepdowns=%u calibrations=%u "
            "cache-skips=%u recovery-probes=%u offer-refreshes=%u "
-           "bounded-window-repairs=%u declined-token-offers=%u "
-           "deferred-ack-turns=%u\n",
+           "bounded-window-repairs=%u\n",
            label,
            link_test != 0 ? "256+256-byte explicit link test"
                           : "queued/in-flight/completed DNS coalescing plus "
@@ -1821,10 +1906,7 @@ static int run_pair(const char *label,
            expected_calibrations, client.cache_skips + gateway.cache_skips,
            client.recovery_probes + gateway.recovery_probes,
            gateway.offer_refreshes,
-           client.window_repairs + gateway.window_repairs,
-           client.token_offers_declined + gateway.token_offers_declined,
-           client.tcp_ack_turns_deferred +
-               gateway.tcp_ack_turns_deferred);
+           client.window_repairs + gateway.window_repairs);
     return 0;
 }
 
