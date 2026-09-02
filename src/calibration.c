@@ -125,28 +125,22 @@ int um_calibration_guard_config(const um_modem_config *measured,
     size_t index;
     unsigned lower_high_edge = measured != NULL ? measured->last_bin : 0u;
     unsigned higher_low_edge = measured != NULL ? measured->first_bin : 0u;
-    unsigned longer_prefix = UINT_MAX;
+    int payload_strengthened = 0;
     if (measured == NULL || guarded == NULL ||
         um_modem_config_validate(measured) != UM_OK) {
         return UM_ERR_ARGUMENT;
     }
     *guarded = *measured;
 
-    /* Spend the reliability reserve on coding before constellation size.
-     * Dropping both by one tier turned a verified 16-QAM frontier into a
-     * QPSK 2/3 link whose physical ceiling was below common TLS handshake
-     * deadlines.  Rate-1/2 coding retains every convolutional output bit;
-     * 16-QAM with that code has more redundancy than the measured 16-QAM
-     * 2/3 or 3/4 frontier while carrying 50-100% more useful bits than the
-     * old guarded mode.  Only a measured 64-QAM mode is stepped down to
-     * 16-QAM. */
-    guarded->fec_rate = UM_FEC_RATE_1_2;
-    if (guarded->qam_bits > 4u) {
-        guarded->qam_bits = 4u;
+    if (guarded->fec_rate > UM_FEC_RATE_1_2) {
+        guarded->fec_rate = (um_fec_rate)((unsigned)guarded->fec_rate - 1u);
+        payload_strengthened = 1;
     }
-    if (guarded->qam_bits == 2u &&
-        measured->fec_rate == UM_FEC_RATE_1_2 &&
-        guarded->symbol_repetitions < 2u) {
+    if (guarded->qam_bits > 2u) {
+        guarded->qam_bits -= 2u;
+        payload_strengthened = 1;
+    }
+    if (payload_strengthened == 0 && guarded->symbol_repetitions < 2u) {
         guarded->symbol_repetitions = 2u;
     }
 
@@ -187,24 +181,8 @@ int um_calibration_guard_config(const um_modem_config *measured,
         }
     }
 
-    /* Back off delay-spread tolerance by one measured tier, with a 10.7 ms
-     * room-acoustics floor.  Forcing every passing mode all the way to the
-     * 21.3 ms maximum discarded up to a third of the symbol capacity even
-     * when calibration had demonstrated a much shorter prefix. */
-    for (index = 0u;
-         index < sizeof(calibration_prefix_values) /
-                     sizeof(calibration_prefix_values[0]);
-         ++index) {
-        unsigned value = calibration_prefix_values[index];
-        if (value > measured->cyclic_prefix && value < longer_prefix) {
-            longer_prefix = value;
-        }
-    }
-    if (longer_prefix != UINT_MAX) {
-        guarded->cyclic_prefix = longer_prefix;
-    }
-    if (guarded->cyclic_prefix < 512u) {
-        guarded->cyclic_prefix = 512u;
+    if (guarded->cyclic_prefix < 1024u) {
+        guarded->cyclic_prefix = 1024u;
     }
     if (guarded->window_samples < 64u) {
         guarded->window_samples = 64u;

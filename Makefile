@@ -33,9 +33,11 @@ LIB_SOURCES := \
 	src/network.c \
 	src/qam.c
 
-LIB_SOURCES += src/session.c src/traffic_policy.c src/validation.c
+LIB_SOURCES += src/session.c src/tcp_relay.c src/traffic_policy.c \
+	src/validation.c
 LIB_OBJECTS := $(LIB_SOURCES:.c=.o)
-SIM_LIB_OBJECTS := $(filter-out src/audio.o src/network.o,$(LIB_OBJECTS))
+SIM_LIB_OBJECTS := $(filter-out src/audio.o src/network.o src/tcp_relay.o,\
+	$(LIB_OBJECTS))
 
 .PHONY: all clean test check
 
@@ -50,19 +52,26 @@ test_modem: tests/test_modem.o $(LIB_OBJECTS)
 test_live_audio: tests/test_live_audio.o $(SIM_LIB_OBJECTS)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
-test check: test_modem test_live_audio
+test_tcp_relay: tests/test_tcp_relay.o src/network.o src/tcp_relay.o
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+test check: test_modem test_live_audio test_tcp_relay
 	./test_modem
 	./test_live_audio
+	./test_tcp_relay
 
 %.o: %.c include/um.h src/um_internal.h
 	$(CC) $(CPPFLAGS) $(CSTD) $(CFLAGS) $(WARNINGS) -c $< -o $@
 
 src/audio.o src/live.o: src/audio.h
-src/live.o src/network.o tests/test_live_audio.o: src/network.h
+src/live.o src/network.o tests/test_live_audio.o tests/test_tcp_relay.o: \
+	src/network.h
+src/network.o src/tcp_relay.o tests/test_tcp_relay.o: src/tcp_relay.h
 src/live.o src/live_wire.o tests/test_modem.o tests/test_live_audio.o: src/live_wire.h
 src/live.o src/traffic_policy.o tests/test_modem.o: src/traffic_policy.h
 tests/test_live_audio.o: src/audio.h
 
 clean:
 	rm -f $(LIB_OBJECTS) src/main.o tests/test_modem.o tests/test_live_audio.o \
-		universal-modem test_modem test_live_audio
+		tests/test_tcp_relay.o universal-modem test_modem test_live_audio \
+		test_tcp_relay

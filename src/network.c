@@ -10,6 +10,7 @@
 #endif
 
 #include "network.h"
+#include "tcp_relay.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -80,6 +81,8 @@ struct um_network {
     char nft_table[32];
     unsigned iptables_rules;
     int nft_table_created;
+    um_tcp_relay *tcp_relay;
+    uint16_t tcp_relay_port;
     int route_low_added;
     int route_high_added;
     int dns_configured;
@@ -473,6 +476,20 @@ static int linux_set_forwarding(um_network *network)
 
 static int linux_add_iptables(um_network *network)
 {
+    char relay_port[16];
+    const char *redirect[] = {
+        network->iptables_path, "-w", "5", "-t", "nat", "-I",
+        "PREROUTING", "1", "-i", network->interface_name, "-s",
+        UM_TUN_SUBNET, "-p", "tcp", "!", "-d", UM_TUN_SUBNET,
+        "-m", "comment", "--comment", network->firewall_tag, "-j",
+        "REDIRECT", "--to-ports", relay_port, NULL
+    };
+    const char *input[] = {
+        network->iptables_path, "-w", "5", "-I", "INPUT", "1", "-i",
+        network->interface_name, "-s", UM_TUN_SUBNET, "-p", "tcp",
+        "--dport", relay_port, "-m", "comment", "--comment",
+        network->firewall_tag, "-j", "ACCEPT", NULL
+    };
     const char *nat[] = {
         network->iptables_path, "-w", "5", "-t", "nat", "-A",
         "POSTROUTING", "-s", UM_TUN_SUBNET, "-o", network->egress_name,
@@ -492,23 +509,35 @@ static int linux_add_iptables(um_network *network)
         "RELATED,ESTABLISHED", "-m", "comment", "--comment",
         network->firewall_tag, "-j", "ACCEPT", NULL
     };
-    int status = linux_run(network, nat);
+    int status;
+    (void)snprintf(relay_port, sizeof(relay_port), "%u",
+                   (unsigned)network->tcp_relay_port);
+    status = linux_run(network, redirect);
     if (status == UM_OK) {
         network->iptables_rules = 1u;
-        status = linux_run(network, forward_out);
+        status = linux_run(network, input);
     }
     if (status == UM_OK) {
         network->iptables_rules = 2u;
-        status = linux_run(network, forward_in);
+        status = linux_run(network, nat);
     }
     if (status == UM_OK) {
         network->iptables_rules = 3u;
+        status = linux_run(network, forward_out);
+    }
+    if (status == UM_OK) {
+        network->iptables_rules = 4u;
+        status = linux_run(network, forward_in);
+    }
+    if (status == UM_OK) {
+        network->iptables_rules = 5u;
     }
     return status;
 }
 
 static void linux_remove_iptables(um_network *network)
 {
+    char relay_port[16];
     const char *forward_in[] = {
         network->iptables_path, "-w", "5", "-D", "FORWARD", "-i",
         network->egress_name, "-o", network->interface_name, "-d",
@@ -528,22 +557,50 @@ static void linux_remove_iptables(um_network *network)
         "-m", "comment", "--comment", network->firewall_tag, "-j",
         "MASQUERADE", NULL
     };
-    if (network->iptables_rules >= 3u) {
+    const char *input[] = {
+        network->iptables_path, "-w", "5", "-D", "INPUT", "-i",
+        network->interface_name, "-s", UM_TUN_SUBNET, "-p", "tcp",
+        "--dport", relay_port, "-m", "comment", "--comment",
+        network->firewall_tag, "-j", "ACCEPT", NULL
+    };
+    const char *redirect[] = {
+        network->iptables_path, "-w", "5", "-t", "nat", "-D",
+        "PREROUTING", "-i", network->interface_name, "-s", UM_TUN_SUBNET,
+        "-p", "tcp", "!", "-d", UM_TUN_SUBNET, "-m", "comment",
+        "--comment", network->firewall_tag, "-j", "REDIRECT",
+        "--to-ports", relay_port, NULL
+    };
+    (void)snprintf(relay_port, sizeof(relay_port), "%u",
+                   (unsigned)network->tcp_relay_port);
+    if (network->iptables_rules >= 5u) {
         (void)linux_run(network, forward_in);
     }
-    if (network->iptables_rules >= 2u) {
+    if (network->iptables_rules >= 4u) {
         (void)linux_run(network, forward_out);
     }
-    if (network->iptables_rules >= 1u) {
+    if (network->iptables_rules >= 3u) {
         (void)linux_run(network, nat);
+    }
+    if (network->iptables_rules >= 2u) {
+        (void)linux_run(network, input);
+    }
+    if (network->iptables_rules >= 1u) {
+        (void)linux_run(network, redirect);
     }
     network->iptables_rules = 0u;
 }
 
 static int linux_add_nft(um_network *network)
 {
+    char relay_port[16];
+    char relay_target[20];
     const char *add_table[] = {
         network->nft_path, "add", "table", "ip", network->nft_table, NULL
+    };
+    const char *add_redirect_chain[] = {
+        network->nft_path, "add", "chain", "ip", network->nft_table,
+        "prerouting", "{", "type", "nat", "hook", "prerouting",
+        "priority", "dstnat", ";", "policy", "accept", ";", "}", NULL
     };
     const char *add_nat_chain[] = {
         network->nft_path, "add", "chain", "ip", network->nft_table,
@@ -554,6 +611,22 @@ static int linux_add_nft(um_network *network)
         network->nft_path, "add", "chain", "ip", network->nft_table,
         "forward", "{", "type", "filter", "hook", "forward", "priority",
         "-10", ";", "policy", "accept", ";", "}", NULL
+    };
+    const char *add_input_chain[] = {
+        network->nft_path, "add", "chain", "ip", network->nft_table,
+        "input", "{", "type", "filter", "hook", "input", "priority",
+        "-10", ";", "policy", "accept", ";", "}", NULL
+    };
+    const char *add_redirect[] = {
+        network->nft_path, "add", "rule", "ip", network->nft_table,
+        "prerouting", "iifname", network->interface_name, "ip", "saddr",
+        UM_TUN_SUBNET, "ip", "daddr", "!=", UM_TUN_SUBNET, "meta",
+        "l4proto", "tcp", "redirect", "to", relay_target, NULL
+    };
+    const char *add_input[] = {
+        network->nft_path, "add", "rule", "ip", network->nft_table,
+        "input", "iifname", network->interface_name, "ip", "saddr",
+        UM_TUN_SUBNET, "tcp", "dport", relay_port, "accept", NULL
     };
     const char *add_nat[] = {
         network->nft_path, "add", "rule", "ip", network->nft_table,
@@ -571,13 +644,30 @@ static int linux_add_nft(um_network *network)
         network->interface_name, "ip", "daddr", UM_TUN_SUBNET, "ct",
         "state", "related,established", "accept", NULL
     };
-    int status = linux_run(network, add_table);
+    int status;
+    (void)snprintf(relay_port, sizeof(relay_port), "%u",
+                   (unsigned)network->tcp_relay_port);
+    (void)snprintf(relay_target, sizeof(relay_target), ":%u",
+                   (unsigned)network->tcp_relay_port);
+    status = linux_run(network, add_table);
     if (status == UM_OK) {
         network->nft_table_created = 1;
+        status = linux_run(network, add_redirect_chain);
+    }
+    if (status == UM_OK) {
         status = linux_run(network, add_nat_chain);
     }
     if (status == UM_OK) {
         status = linux_run(network, add_forward_chain);
+    }
+    if (status == UM_OK) {
+        status = linux_run(network, add_input_chain);
+    }
+    if (status == UM_OK) {
+        status = linux_run(network, add_redirect);
+    }
+    if (status == UM_OK) {
+        status = linux_run(network, add_input);
     }
     if (status == UM_OK) {
         status = linux_run(network, add_nat);
@@ -742,6 +832,13 @@ static int linux_configure_gateway(um_network *network)
     if (status != UM_OK) {
         return status;
     }
+    status = um_tcp_relay_open_transparent(
+        &network->tcp_relay, UM_TUN_GATEWAY_ADDRESS, network->logger,
+        network->logger_context, &network->tcp_relay_port);
+    if (status != UM_OK) {
+        network_log(network, "Could not start the transparent TCP relay");
+        return status;
+    }
     if (network->iptables_path != NULL) {
         status = linux_add_iptables(network);
         if (status != UM_OK) {
@@ -766,8 +863,11 @@ static int linux_configure_gateway(um_network *network)
         status = UM_ERR_NETWORK;
     }
     if (status == UM_OK) {
-        network_log(network, "Gateway NAT active subnet=%s egress=%s",
-                    UM_TUN_SUBNET, network->egress_name);
+        network_log(network,
+                    "Gateway network active subnet=%s egress=%s "
+                    "split-tcp-port=%u",
+                    UM_TUN_SUBNET, network->egress_name,
+                    (unsigned)network->tcp_relay_port);
     }
     return status;
 }
@@ -796,6 +896,8 @@ static void linux_cleanup(um_network *network)
     if (network->role == UM_LIVE_GATEWAY) {
         linux_remove_iptables(network);
         linux_remove_nft(network);
+        um_tcp_relay_close(network->tcp_relay);
+        network->tcp_relay = NULL;
         if (network->forwarding_changed != 0) {
             if (linux_write_forwarding(network->forwarding_original) !=
                 UM_OK) {
