@@ -12,7 +12,8 @@ typedef enum {
     UM_TRAFFIC_POLICY_DROP_BROADCAST,
     UM_TRAFFIC_POLICY_DROP_STALE_DNS_ICMP,
     UM_TRAFFIC_POLICY_DROP_BACKGROUND,
-    UM_TRAFFIC_POLICY_REJECT_BACKGROUND_DNS
+    UM_TRAFFIC_POLICY_REJECT_BACKGROUND_DNS,
+    UM_TRAFFIC_POLICY_REJECT_QUIC
 } um_traffic_policy_action;
 
 typedef struct {
@@ -27,6 +28,9 @@ int um_traffic_policy_decide(const uint8_t *packet, size_t packet_length,
                              um_traffic_policy_decision *decision);
 int um_traffic_policy_build_dns_rejection(
     const uint8_t *query, size_t query_length, uint8_t *response,
+    size_t response_capacity, size_t *response_length);
+int um_traffic_policy_build_port_unreachable(
+    const uint8_t *packet, size_t packet_length, uint8_t *response,
     size_t response_capacity, size_t *response_length);
 int um_traffic_policy_is_tunnel_discovery_dns(const uint8_t *packet,
                                               size_t packet_length);

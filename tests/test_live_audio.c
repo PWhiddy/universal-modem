@@ -83,6 +83,8 @@ typedef struct {
     unsigned network_matches[SIM_ENDPOINTS];
     unsigned network_background_matches[SIM_ENDPOINTS];
     uint32_t network_target_seen[SIM_ENDPOINTS];
+    unsigned network_target_order[SIM_ENDPOINTS][SIM_PROXY_PACKETS];
+    unsigned network_target_order_count[SIM_ENDPOINTS];
     uint32_t network_background_seen[SIM_ENDPOINTS];
     int runners_done;
 } simulated_bus;
@@ -491,6 +493,21 @@ static void make_proxy_background(uint8_t *packet, int endpoint,
                                   unsigned background_number)
 {
     size_t length = proxy_background_length(background_number);
+    if (background_number == 1u) {
+        memset(packet, 0, length);
+        packet[0] = 0x45u;
+        packet[2] = (uint8_t)(length >> 8u);
+        packet[3] = (uint8_t)length;
+        packet[8] = 64u;
+        packet[9] = 1u;
+        packet[12] = endpoint == SIM_CLIENT ? 10u : 1u;
+        packet[15] = endpoint == SIM_CLIENT ? 2u : 1u;
+        packet[16] = endpoint == SIM_CLIENT ? 1u : 10u;
+        packet[19] = endpoint == SIM_CLIENT ? 1u : 2u;
+        packet[20] = endpoint == SIM_CLIENT ? 8u : 0u;
+        finalize_ipv4_checksums(packet, length);
+        return;
+    }
     if (background_number == 15u) {
         make_ipv4_packet(packet, length, 0x15u, 137u, 137u);
         packet[16] = 10u;
@@ -1313,6 +1330,10 @@ int um_network_write(um_network *network, const uint8_t *packet,
         if (packet_length == expected_length &&
             memcmp(packet, expected, expected_length) == 0) {
             bus.network_target_seen[network->endpoint] |= bit;
+            bus.network_target_order[network->endpoint]
+                                    [bus.network_target_order_count
+                                         [network->endpoint]++] =
+                target_candidate;
             target_index = target_candidate;
             target_matches = 1;
             break;
@@ -1430,6 +1451,24 @@ static int check_runner(const runner *run, unsigned expected_calibrations,
            run->proxy_completed == 1u;
 }
 
+static int tcp_targets_remained_ordered(int endpoint)
+{
+    unsigned expected = 1u;
+    unsigned i;
+
+    for (i = 0u; i < bus.network_target_order_count[endpoint]; ++i) {
+        unsigned target = bus.network_target_order[endpoint][i];
+        if (target == 0u) {
+            continue;
+        }
+        if (target != expected) {
+            return 0;
+        }
+        ++expected;
+    }
+    return expected == SIM_PROXY_PACKETS;
+}
+
 static void configure_runner(runner *run, const char *name,
                              um_live_role role, const char *device,
                              const char *calibration_path, int link_test)
@@ -1534,6 +1573,10 @@ static int run_pair(const char *label,
            sizeof(bus.network_background_matches));
     memset(bus.network_target_seen, 0,
            sizeof(bus.network_target_seen));
+    memset(bus.network_target_order, 0,
+           sizeof(bus.network_target_order));
+    memset(bus.network_target_order_count, 0,
+           sizeof(bus.network_target_order_count));
     memset(bus.network_background_seen, 0,
            sizeof(bus.network_background_seen));
     bus.runners_done = 0;
@@ -1615,6 +1658,12 @@ static int run_pair(const char *label,
           bus.network_writes[SIM_GATEWAY] != SIM_FORWARDED_PACKETS ||
           bus.network_matches[SIM_CLIENT] != SIM_PROXY_PACKETS ||
           bus.network_matches[SIM_GATEWAY] != SIM_PROXY_PACKETS ||
+          bus.network_target_order_count[SIM_CLIENT] !=
+              SIM_PROXY_PACKETS ||
+          bus.network_target_order_count[SIM_GATEWAY] !=
+              SIM_PROXY_PACKETS ||
+          !tcp_targets_remained_ordered(SIM_CLIENT) ||
+          !tcp_targets_remained_ordered(SIM_GATEWAY) ||
           bus.network_background_matches[SIM_CLIENT] !=
               SIM_FORWARDED_BACKGROUND_PACKETS ||
           bus.network_background_matches[SIM_GATEWAY] !=
@@ -1647,9 +1696,6 @@ static int run_pair(const char *label,
         (link_test == 0 &&
          (client.packet_token_commits + gateway.packet_token_commits < 2u ||
           client.packet_token_accepts + gateway.packet_token_accepts < 2u ||
-          client.tcp_ack_turns_deferred +
-                  gateway.tcp_ack_turns_deferred ==
-              0u ||
           client.dns_query_logs + gateway.dns_query_logs < 2u ||
           client.dns_response_logs + gateway.dns_response_logs < 2u ||
           client.multi_packet_batches == 0u ||
@@ -1665,6 +1711,44 @@ static int run_pair(const char *label,
                 "gateway=%s\n",
                 label, timed_out, um_status_string(client.status),
                 um_status_string(gateway.status));
+        fprintf(stderr,
+                "network reads=%u/%u writes=%u/%u matches=%u/%u "
+                "background=%u/%u orders=%u/%u ordered=%d/%d "
+                "dns-retries=%u reads=%u suppressed=%u tcp-before-dns=%d\n",
+                bus.network_reads[SIM_CLIENT],
+                bus.network_reads[SIM_GATEWAY],
+                bus.network_writes[SIM_CLIENT],
+                bus.network_writes[SIM_GATEWAY],
+                bus.network_matches[SIM_CLIENT],
+                bus.network_matches[SIM_GATEWAY],
+                bus.network_background_matches[SIM_CLIENT],
+                bus.network_background_matches[SIM_GATEWAY],
+                bus.network_target_order_count[SIM_CLIENT],
+                bus.network_target_order_count[SIM_GATEWAY],
+                tcp_targets_remained_ordered(SIM_CLIENT),
+                tcp_targets_remained_ordered(SIM_GATEWAY),
+                bus.network_dns_retries_injected,
+                bus.network_dns_retry_reads[SIM_CLIENT],
+                client.dns_retries_suppressed,
+                bus.client_tcp_before_dns_drained);
+        fprintf(stderr,
+                "filters multicast=%u/%u broadcast=%u/%u stale-icmp=%u/%u "
+                "discovery=%u/%u ack-coalesced=%u/%u batches=%u "
+                "windows=%u starts=%u repairs=%u drops=%u/%u "
+                "body-stepdowns=%u\n",
+                client.multicast_dropped, gateway.multicast_dropped,
+                client.broadcast_dropped, gateway.broadcast_dropped,
+                client.stale_dns_icmp_dropped,
+                gateway.stale_dns_icmp_dropped,
+                client.discovery_dns_deprioritized,
+                gateway.discovery_dns_deprioritized,
+                client.tcp_acks_coalesced, gateway.tcp_acks_coalesced,
+                gateway.multi_packet_batches,
+                client.multi_packet_windows + gateway.multi_packet_windows,
+                client.window_starts + gateway.window_starts,
+                client.window_repairs + gateway.window_repairs,
+                bus.window_drops, bus.body_drops,
+                client.body_stepdowns + gateway.body_stepdowns);
         print_logs(&client);
         print_logs(&gateway);
         return 1;

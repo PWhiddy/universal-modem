@@ -178,6 +178,7 @@ typedef struct {
     size_t discovery_dns_dropped;
     size_t tcp_acks_coalesced;
     size_t background_dns_rejected;
+    size_t quic_rejected;
     size_t background_packets_dropped;
     size_t queue_priority_evictions;
     size_t queue_logged_dropped;
@@ -190,6 +191,7 @@ typedef struct {
     size_t discovery_dns_logged_dropped;
     size_t tcp_acks_logged_coalesced;
     size_t background_dns_logged_rejected;
+    size_t quic_logged_rejected;
     size_t background_packets_logged_dropped;
     size_t queue_logged_priority_evictions;
     size_t consecutive_dns_sent;
@@ -2873,6 +2875,22 @@ static void describe_proxy_packet(const live_proxy_state *state,
                 have_dns_description != 0 ? " " : "",
                 have_dns_description != 0 ? dns_description : "");
         }
+        if (protocol == 6u && transport_offset + 20u <= length) {
+            size_t tcp_header =
+                (size_t)(packet[transport_offset + 12u] >> 4u) * 4u;
+            size_t used = strlen(description);
+            if (tcp_header >= 20u &&
+                transport_offset + tcp_header <= length &&
+                used < description_capacity) {
+                (void)snprintf(
+                    &description[used], description_capacity - used,
+                    " flags=0x%02x seq=%u ack=%u payload=%zu",
+                    (unsigned)packet[transport_offset + 13u],
+                    (unsigned)read_u32(&packet[transport_offset + 4u]),
+                    (unsigned)read_u32(&packet[transport_offset + 8u]),
+                    length - transport_offset - tcp_header);
+            }
+        }
     } else if (protocol == 1u || protocol == 58u) {
         describe_icmp_packet(packet, length, transport_offset, version,
                              family, description, description_capacity);
@@ -2918,6 +2936,72 @@ static int proxy_queue_only_replaceable_tcp_acks(
     return 1;
 }
 
+static int proxy_tcp_packets_share_flow(
+    const live_proxy_queued_packet *left,
+    const live_proxy_queued_packet *right)
+{
+    size_t left_offset;
+    size_t right_offset;
+    unsigned version;
+    if (left == NULL || right == NULL || left->length == 0u ||
+        right->length == 0u ||
+        (left->packet[0] >> 4u) != (right->packet[0] >> 4u)) {
+        return 0;
+    }
+    version = left->packet[0] >> 4u;
+    if (version == 4u) {
+        if (left->length < 20u || right->length < 20u ||
+            left->packet[9] != 6u || right->packet[9] != 6u ||
+            (read_u16(&left->packet[6]) & UINT16_C(0x1fff)) != 0u ||
+            (read_u16(&right->packet[6]) & UINT16_C(0x1fff)) != 0u ||
+            memcmp(&left->packet[12], &right->packet[12], 8u) != 0) {
+            return 0;
+        }
+        left_offset = (size_t)(left->packet[0] & 0x0fu) * 4u;
+        right_offset = (size_t)(right->packet[0] & 0x0fu) * 4u;
+    } else if (version == 6u) {
+        if (left->length < 40u || right->length < 40u ||
+            left->packet[6] != 6u || right->packet[6] != 6u ||
+            memcmp(&left->packet[8], &right->packet[8], 32u) != 0) {
+            return 0;
+        }
+        left_offset = 40u;
+        right_offset = 40u;
+    } else {
+        return 0;
+    }
+    return left_offset + 4u <= left->length &&
+           right_offset + 4u <= right->length &&
+           memcmp(&left->packet[left_offset], &right->packet[right_offset],
+                  4u) == 0;
+}
+
+static int proxy_queue_has_earlier_same_tcp_flow(
+    const live_proxy_state *state, size_t candidate)
+{
+    size_t index;
+    for (index = 0u; index < candidate; ++index) {
+        if (proxy_tcp_packets_share_flow(&state->queue[index],
+                                         &state->queue[candidate]) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int proxy_queue_has_later_same_tcp_flow(
+    const live_proxy_state *state, size_t candidate)
+{
+    size_t index;
+    for (index = candidate + 1u; index < state->queue_count; ++index) {
+        if (proxy_tcp_packets_share_flow(&state->queue[candidate],
+                                         &state->queue[index]) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int select_proxy_queue_index(const live_proxy_state *state,
                                     int allow_dns, int require_fit,
                                     size_t maximum_packet_bytes,
@@ -2930,7 +3014,8 @@ static int select_proxy_queue_index(const live_proxy_state *state,
         if ((allow_dns == 0 &&
              queued->priority == LIVE_PROXY_PRIORITY_DNS) ||
             (require_fit != 0 &&
-             queued->length > maximum_packet_bytes)) {
+             queued->length > maximum_packet_bytes) ||
+            proxy_queue_has_earlier_same_tcp_flow(state, index) != 0) {
             continue;
         }
         if (found == 0 ||
@@ -3186,14 +3271,20 @@ static int enqueue_proxy_packet(live_proxy_state *state,
     }
     if (state->queue_count == LIVE_PROXY_QUEUE_PACKETS) {
         size_t lowest_index = 0u;
-        unsigned lowest_priority = state->queue[0].priority;
-        for (index = 1u; index < state->queue_count; ++index) {
-            if (state->queue[index].priority < lowest_priority) {
+        unsigned lowest_priority = 0u;
+        int have_lowest = 0;
+        for (index = 0u; index < state->queue_count; ++index) {
+            if (proxy_queue_has_later_same_tcp_flow(state, index) != 0) {
+                continue;
+            }
+            if (have_lowest == 0 ||
+                state->queue[index].priority <= lowest_priority) {
                 lowest_index = index;
                 lowest_priority = state->queue[index].priority;
+                have_lowest = 1;
             }
         }
-        if (priority <= lowest_priority) {
+        if (have_lowest == 0 || priority <= lowest_priority) {
             ++state->queue_dropped;
             return UM_OK;
         }
@@ -3277,6 +3368,26 @@ static int drain_proxy_ingress(live_context *context,
                          decision.rule);
                 continue;
             }
+            if (decision.action == UM_TRAFFIC_POLICY_REJECT_QUIC) {
+                uint8_t response[UM_NETWORK_MAX_PACKET];
+                size_t response_length = 0u;
+                if (um_traffic_policy_build_port_unreachable(
+                        packet, packet_length, response, sizeof(response),
+                        &response_length) != 0) {
+                    return UM_ERR_HEADER;
+                }
+                status = um_network_write(context->network, response,
+                                          response_length, 1000u);
+                if (status != UM_OK) {
+                    return status;
+                }
+                ++state->quic_rejected;
+                live_log(context,
+                         "proxy transport local-unreachable protocol=QUIC "
+                         "destination-port=443 rule=%s",
+                         decision.rule);
+                continue;
+            }
         }
         status = enqueue_proxy_packet(state, packet, packet_length);
         if (status != UM_OK) {
@@ -3298,6 +3409,7 @@ static int drain_proxy_ingress(live_context *context,
         state->tcp_acks_coalesced != state->tcp_acks_logged_coalesced ||
         state->background_dns_rejected !=
             state->background_dns_logged_rejected ||
+        state->quic_rejected != state->quic_logged_rejected ||
         state->background_packets_dropped !=
             state->background_packets_logged_dropped ||
         state->queue_priority_evictions !=
@@ -3310,6 +3422,7 @@ static int drain_proxy_ingress(live_context *context,
                  "discovery-dns-deprioritized=%zu "
                  "discovery-dns-dropped=%zu tcp-acks-coalesced=%zu "
                  "background-dns-rejected=%zu "
+                 "quic-rejected=%zu "
                  "background-packets-dropped=%zu "
                  "priority-evictions=%zu",
                  state->queue_count, state->queue_dropped,
@@ -3322,6 +3435,7 @@ static int drain_proxy_ingress(live_context *context,
                  state->discovery_dns_dropped,
                  state->tcp_acks_coalesced,
                  state->background_dns_rejected,
+                 state->quic_rejected,
                  state->background_packets_dropped,
                  state->queue_priority_evictions);
         state->queue_logged_dropped = state->queue_dropped;
@@ -3339,6 +3453,7 @@ static int drain_proxy_ingress(live_context *context,
         state->tcp_acks_logged_coalesced = state->tcp_acks_coalesced;
         state->background_dns_logged_rejected =
             state->background_dns_rejected;
+        state->quic_logged_rejected = state->quic_rejected;
         state->background_packets_logged_dropped =
             state->background_packets_dropped;
         state->queue_logged_priority_evictions =

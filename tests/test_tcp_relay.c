@@ -21,6 +21,9 @@
 typedef struct {
     int listener;
     pthread_t thread;
+    pthread_mutex_t mutex;
+    pthread_cond_t accepted_condition;
+    int accepted;
     uint16_t port;
 } echo_server;
 
@@ -75,6 +78,10 @@ static void *echo_thread(void *argument)
     int client = accept(server->listener, NULL, NULL);
     if (client >= 0) {
         ssize_t count;
+        (void)pthread_mutex_lock(&server->mutex);
+        server->accepted = 1;
+        (void)pthread_cond_broadcast(&server->accepted_condition);
+        (void)pthread_mutex_unlock(&server->mutex);
         do {
             count = recv(client, buffer, sizeof(buffer), 0);
         } while (count < 0 && errno == EINTR);
@@ -87,12 +94,46 @@ static void *echo_thread(void *argument)
     return NULL;
 }
 
+static int echo_wait_for_accept(echo_server *server, unsigned timeout_ms)
+{
+    struct timespec deadline;
+    int accepted;
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0) {
+        fail("could not read clock");
+    }
+    deadline.tv_sec += (time_t)(timeout_ms / 1000u);
+    deadline.tv_nsec += (long)(timeout_ms % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        ++deadline.tv_sec;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    (void)pthread_mutex_lock(&server->mutex);
+    while (server->accepted == 0) {
+        int status = pthread_cond_timedwait(&server->accepted_condition,
+                                            &server->mutex, &deadline);
+        if (status == ETIMEDOUT) {
+            break;
+        }
+        if (status != 0) {
+            (void)pthread_mutex_unlock(&server->mutex);
+            fail("could not wait for echo accept");
+        }
+    }
+    accepted = server->accepted;
+    (void)pthread_mutex_unlock(&server->mutex);
+    return accepted;
+}
+
 static void echo_open(echo_server *server)
 {
     struct sockaddr_in address;
     socklen_t length = sizeof(address);
     int reuse = 1;
     memset(server, 0, sizeof(*server));
+    if (pthread_mutex_init(&server->mutex, NULL) != 0 ||
+        pthread_cond_init(&server->accepted_condition, NULL) != 0) {
+        fail("could not initialize echo synchronization");
+    }
     server->listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (server->listener < 0 ||
         setsockopt(server->listener, SOL_SOCKET, SO_REUSEADDR, &reuse,
@@ -119,6 +160,8 @@ static void echo_close(echo_server *server)
 {
     (void)pthread_join(server->thread, NULL);
     (void)close(server->listener);
+    (void)pthread_cond_destroy(&server->accepted_condition);
+    (void)pthread_mutex_destroy(&server->mutex);
 }
 
 static void test_local_relay(void)
@@ -136,7 +179,14 @@ static void test_local_relay(void)
         fail("could not start fixed relay");
     }
     client = connect_loopback(relay_port);
-    if (client < 0 || !send_all(client, request, sizeof(request))) {
+    if (client < 0) {
+        fail("could not connect to relay");
+    }
+    if (echo_wait_for_accept(&echo, 200u) != 0) {
+        fail("relay opened upstream before receiving client data");
+    }
+    if (!send_all(client, request, sizeof(request)) ||
+        echo_wait_for_accept(&echo, 2000u) == 0) {
         fail("could not send through relay");
     }
     (void)shutdown(client, SHUT_WR);

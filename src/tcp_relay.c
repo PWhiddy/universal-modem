@@ -30,6 +30,7 @@
 #define TCP_RELAY_MAX_CONNECTIONS 64u
 #define TCP_RELAY_BUFFER_BYTES 32768u
 #define TCP_RELAY_CONNECT_TIMEOUT_MS 15000u
+#define TCP_RELAY_FIRST_DATA_TIMEOUT_MS 30000u
 
 typedef struct tcp_relay_job tcp_relay_job;
 
@@ -44,6 +45,7 @@ struct um_tcp_relay {
     pthread_cond_t drained;
     tcp_relay_job *jobs;
     size_t active_jobs;
+    uint64_t next_job_id;
     um_log_callback logger;
     void *logger_context;
 };
@@ -56,14 +58,56 @@ struct tcp_relay_job {
     struct sockaddr_in destination;
     size_t uploaded;
     size_t downloaded;
+    uint64_t id;
+    uint64_t accepted_ms;
+    uint64_t first_client_ms;
+    uint64_t upstream_connected_ms;
 };
+
+typedef enum {
+    TCP_RELAY_STREAM_NOT_STARTED = 0,
+    TCP_RELAY_STREAM_EOF,
+    TCP_RELAY_STREAM_RECV_ERROR,
+    TCP_RELAY_STREAM_SEND_ERROR
+} tcp_relay_stream_outcome;
+
+typedef struct {
+    tcp_relay_stream_outcome outcome;
+    int error_number;
+    uint64_t first_byte_ms;
+} tcp_relay_stream_result;
 
 typedef struct {
     tcp_relay_job *job;
     int source;
     int destination;
     size_t *count;
+    tcp_relay_stream_result *result;
 } tcp_relay_copy;
+
+static uint64_t relay_milliseconds(void)
+{
+    struct timespec time_value;
+    if (clock_gettime(CLOCK_MONOTONIC, &time_value) != 0) {
+        return 0u;
+    }
+    return (uint64_t)time_value.tv_sec * UINT64_C(1000) +
+           (uint64_t)time_value.tv_nsec / UINT64_C(1000000);
+}
+
+static const char *relay_stream_outcome_name(tcp_relay_stream_outcome outcome)
+{
+    switch (outcome) {
+    case TCP_RELAY_STREAM_EOF:
+        return "eof";
+    case TCP_RELAY_STREAM_RECV_ERROR:
+        return "recv-error";
+    case TCP_RELAY_STREAM_SEND_ERROR:
+        return "send-error";
+    default:
+        return "not-started";
+    }
+}
 
 static void relay_log(um_tcp_relay *relay, const char *format, ...)
 {
@@ -122,13 +166,16 @@ static void *relay_copy_thread(void *argument)
 {
     tcp_relay_copy *copy = (tcp_relay_copy *)argument;
     uint8_t buffer[TCP_RELAY_BUFFER_BYTES];
-    int failed = 0;
     while (1) {
         ssize_t count = recv(copy->source, buffer, sizeof(buffer), 0);
         if (count > 0) {
+            if (copy->result->first_byte_ms == 0u) {
+                copy->result->first_byte_ms = relay_milliseconds();
+            }
             if (relay_send_all(copy->destination, buffer,
                                (size_t)count) != UM_OK) {
-                failed = 1;
+                copy->result->outcome = TCP_RELAY_STREAM_SEND_ERROR;
+                copy->result->error_number = errno;
                 break;
             }
             *copy->count += (size_t)count;
@@ -138,16 +185,79 @@ static void *relay_copy_thread(void *argument)
             continue;
         }
         if (count < 0) {
-            failed = 1;
+            copy->result->outcome = TCP_RELAY_STREAM_RECV_ERROR;
+            copy->result->error_number = errno;
+        } else {
+            copy->result->outcome = TCP_RELAY_STREAM_EOF;
         }
         break;
     }
-    if (failed != 0) {
+    if (copy->result->outcome == TCP_RELAY_STREAM_RECV_ERROR ||
+        copy->result->outcome == TCP_RELAY_STREAM_SEND_ERROR) {
         relay_abort_job(copy->job);
     } else {
         (void)shutdown(copy->destination, SHUT_WR);
     }
     return NULL;
+}
+
+/* Wait until the local TCP stack can deliver application bytes before
+ * opening the Internet-facing connection. This isolates remote servers from
+ * the acoustic link's potentially long packet-assembly delay. A bounded
+ * fallback preserves protocols in which the server speaks first. */
+static int relay_receive_first_client_data(
+    tcp_relay_job *job, uint8_t *buffer, size_t capacity, size_t *length,
+    int *timed_out, tcp_relay_stream_result *result)
+{
+    uint64_t started = relay_milliseconds();
+    *length = 0u;
+    *timed_out = 0;
+    while (relay_milliseconds() - started <
+           TCP_RELAY_FIRST_DATA_TIMEOUT_MS) {
+        struct pollfd item;
+        int poll_status;
+        item.fd = job->client;
+        item.events = POLLIN;
+        item.revents = 0;
+        poll_status = poll(&item, 1u, 250);
+        if (poll_status < 0 && errno == EINTR) {
+            continue;
+        }
+        if (poll_status < 0) {
+            result->outcome = TCP_RELAY_STREAM_RECV_ERROR;
+            result->error_number = errno;
+            return UM_ERR_NETWORK;
+        }
+        if (relay_is_stopping(job->relay) != 0) {
+            result->outcome = TCP_RELAY_STREAM_RECV_ERROR;
+            result->error_number = ECANCELED;
+            return UM_ERR_NETWORK;
+        }
+        if (poll_status == 0) {
+            continue;
+        }
+        while (1) {
+            ssize_t count = recv(job->client, buffer, capacity, 0);
+            if (count > 0) {
+                *length = (size_t)count;
+                result->first_byte_ms = relay_milliseconds();
+                job->first_client_ms = result->first_byte_ms;
+                return UM_OK;
+            }
+            if (count < 0 && errno == EINTR) {
+                continue;
+            }
+            if (count < 0) {
+                result->outcome = TCP_RELAY_STREAM_RECV_ERROR;
+                result->error_number = errno;
+                return UM_ERR_NETWORK;
+            }
+            result->outcome = TCP_RELAY_STREAM_EOF;
+            return UM_ERR_NETWORK;
+        }
+    }
+    *timed_out = 1;
+    return UM_OK;
 }
 
 static int relay_connect(tcp_relay_job *job)
@@ -156,7 +266,7 @@ static int relay_connect(tcp_relay_job *job)
     int upstream;
     int flags;
     int status;
-    uint64_t elapsed = 0u;
+    uint64_t started = relay_milliseconds();
     upstream = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
     if (upstream < 0) {
         return UM_ERR_NETWORK;
@@ -180,7 +290,8 @@ static int relay_connect(tcp_relay_job *job)
     if (status != 0 && errno != EINPROGRESS) {
         return UM_ERR_NETWORK;
     }
-    while (status != 0 && elapsed < TCP_RELAY_CONNECT_TIMEOUT_MS) {
+    while (status != 0 &&
+           relay_milliseconds() - started < TCP_RELAY_CONNECT_TIMEOUT_MS) {
         struct pollfd item;
         int poll_status;
         int error = 0;
@@ -195,7 +306,6 @@ static int relay_connect(tcp_relay_job *job)
         if (poll_status < 0 || relay_is_stopping(job->relay) != 0) {
             return UM_ERR_NETWORK;
         }
-        elapsed += 250u;
         if (poll_status == 0) {
             continue;
         }
@@ -239,11 +349,20 @@ static void *relay_connection_thread(void *argument)
     um_tcp_relay *relay = job->relay;
     tcp_relay_copy reverse;
     tcp_relay_copy forward;
+    tcp_relay_stream_result reverse_result;
+    tcp_relay_stream_result forward_result;
     pthread_t reverse_thread;
+    uint8_t first_client_data[TCP_RELAY_BUFFER_BYTES];
+    size_t first_client_length = 0u;
+    uint64_t connect_started = 0u;
+    uint64_t finished_ms;
+    int first_data_timed_out = 0;
     char address[INET_ADDRSTRLEN] = "unknown";
     int reverse_started = 0;
     socklen_t destination_length = sizeof(job->destination);
 
+    memset(&reverse_result, 0, sizeof(reverse_result));
+    memset(&forward_result, 0, sizeof(forward_result));
     if (relay->transparent != 0) {
         if (getsockopt(job->client, SOL_IP, SO_ORIGINAL_DST,
                        &job->destination, &destination_length) != 0 ||
@@ -258,28 +377,64 @@ static void *relay_connection_thread(void *argument)
     }
     (void)inet_ntop(AF_INET, &job->destination.sin_addr, address,
                     sizeof(address));
+    if (relay_receive_first_client_data(
+            job, first_client_data, sizeof(first_client_data),
+            &first_client_length, &first_data_timed_out,
+            &forward_result) != UM_OK) {
+        goto finished;
+    }
+    connect_started = relay_milliseconds();
     if (relay_connect(job) != UM_OK) {
         relay_log(relay, "TCP relay connection to %s:%u failed: %s",
                   address, (unsigned)ntohs(job->destination.sin_port),
                   strerror(errno));
         goto finished;
     }
+    job->upstream_connected_ms = relay_milliseconds();
+    relay_log(relay,
+              "TCP relay id=%llu upstream-open %s:%u trigger=%s "
+              "first-bytes=%zu client-wait=%llums connect=%llums",
+              (unsigned long long)job->id, address,
+              (unsigned)ntohs(job->destination.sin_port),
+              first_data_timed_out != 0 ? "server-first-timeout" :
+                                          "client-data",
+              first_client_length,
+              (unsigned long long)(
+                  (job->first_client_ms != 0u ? job->first_client_ms :
+                                                connect_started) -
+                  job->accepted_ms),
+              (unsigned long long)(job->upstream_connected_ms -
+                                   connect_started));
 
     reverse.job = job;
     reverse.source = job->upstream;
     reverse.destination = job->client;
     reverse.count = &job->downloaded;
+    reverse.result = &reverse_result;
     if (pthread_create(&reverse_thread, NULL, relay_copy_thread,
                        &reverse) != 0) {
         relay_log(relay, "TCP relay could not start reverse stream");
         goto finished;
     }
     reverse_started = 1;
+    if (first_client_length != 0u) {
+        if (relay_send_all(job->upstream, first_client_data,
+                           first_client_length) != UM_OK) {
+            forward_result.outcome = TCP_RELAY_STREAM_SEND_ERROR;
+            forward_result.error_number = errno;
+            relay_abort_job(job);
+        } else {
+            job->uploaded += first_client_length;
+        }
+    }
     forward.job = job;
     forward.source = job->client;
     forward.destination = job->upstream;
     forward.count = &job->uploaded;
-    (void)relay_copy_thread(&forward);
+    forward.result = &forward_result;
+    if (forward_result.outcome != TCP_RELAY_STREAM_SEND_ERROR) {
+        (void)relay_copy_thread(&forward);
+    }
     (void)pthread_join(reverse_thread, NULL);
 
 finished:
@@ -292,12 +447,29 @@ finished:
     if (job->client >= 0) {
         (void)close(job->client);
     }
-    if (job->uploaded != 0u || job->downloaded != 0u) {
-        relay_log(relay, "TCP relay closed %s:%u upload=%zuB "
-                         "download=%zuB",
-                  address, (unsigned)ntohs(job->destination.sin_port),
-                  job->uploaded, job->downloaded);
-    }
+    finished_ms = relay_milliseconds();
+    relay_log(relay,
+              "TCP relay closed %s:%u upload=%zuB download=%zuB id=%llu "
+              "lifetime=%llums upstream-open=%s client-end=%s "
+              "client-errno=%d upstream-end=%s upstream-errno=%d "
+              "first-client=%llums first-upstream=%llums",
+              address, (unsigned)ntohs(job->destination.sin_port),
+              job->uploaded, job->downloaded,
+              (unsigned long long)job->id,
+              (unsigned long long)(finished_ms - job->accepted_ms),
+              job->upstream_connected_ms != 0u ? "yes" : "no",
+              relay_stream_outcome_name(forward_result.outcome),
+              forward_result.error_number,
+              relay_stream_outcome_name(reverse_result.outcome),
+              reverse_result.error_number,
+              (unsigned long long)(
+                  forward_result.first_byte_ms != 0u
+                      ? forward_result.first_byte_ms - job->accepted_ms
+                      : 0u),
+              (unsigned long long)(
+                  reverse_result.first_byte_ms != 0u
+                      ? reverse_result.first_byte_ms - job->accepted_ms
+                      : 0u));
     relay_remove_job(job);
     free(job);
     return NULL;
@@ -344,6 +516,7 @@ static void *relay_accept_thread(void *argument)
         job->relay = relay;
         job->client = client;
         job->upstream = -1;
+        job->accepted_ms = relay_milliseconds();
         (void)pthread_mutex_lock(&relay->mutex);
         if (relay->stopping != 0 ||
             relay->active_jobs >= TCP_RELAY_MAX_CONNECTIONS) {
@@ -352,6 +525,7 @@ static void *relay_accept_thread(void *argument)
             free(job);
             continue;
         }
+        job->id = ++relay->next_job_id;
         job->next = relay->jobs;
         relay->jobs = job;
         ++relay->active_jobs;

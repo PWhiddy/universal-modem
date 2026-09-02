@@ -60,7 +60,6 @@ static const quiet_domain_rule quiet_block_rules[] = {
     {"metrics.icloud.com", "iCloud diagnostics"},
     {"time.apple.com", "background time synchronization"},
     {"time-macos.apple.com", "background time synchronization"},
-    
     // blocking these temp
     {"push.apple.com", "Apple Push Notification service"},
     {"push-apple.com.akadns.net", "APNs load-balancing alias"},
@@ -431,6 +430,13 @@ int um_traffic_policy_decide(const uint8_t *packet, size_t packet_length,
         decision->rule = "stale DNS UDP port-unreachable";
         return 0;
     }
+    if (client_outbound != 0 && (packet[0] >> 4u) == 4u &&
+        destination_port(packet, packet_length, &protocol, &port) != 0 &&
+        protocol == 17u && port == 443u) {
+        decision->action = UM_TRAFFIC_POLICY_REJECT_QUIC;
+        decision->rule = "QUIC bypasses the split-TCP relay";
+        return 0;
+    }
     if (client_outbound == 0 || quiet_background == 0) {
         return 0;
     }
@@ -476,6 +482,52 @@ static uint16_t checksum_finish(uint32_t sum)
         sum = (sum & UINT32_C(0xffff)) + (sum >> 16u);
     }
     return (uint16_t)~sum;
+}
+
+int um_traffic_policy_build_port_unreachable(
+    const uint8_t *packet, size_t packet_length, uint8_t *response,
+    size_t response_capacity, size_t *response_length)
+{
+    size_t header_length;
+    size_t quoted_length;
+    size_t total_length;
+    uint16_t checksum;
+    uint8_t address[4];
+    if (response == NULL || response_length == NULL ||
+        validate_ip_packet(packet, packet_length) == 0 ||
+        (packet[0] >> 4u) != 4u || packet[9] != 17u ||
+        (read_u16(&packet[6]) & UINT16_C(0x3fff)) != 0u) {
+        return -1;
+    }
+    header_length = (size_t)(packet[0] & 0x0fu) * 4u;
+    if (header_length + 8u > packet_length) {
+        return -1;
+    }
+    quoted_length = header_length + 8u;
+    total_length = 20u + 8u + quoted_length;
+    if (total_length > response_capacity || total_length > UINT16_MAX) {
+        return -1;
+    }
+
+    memset(response, 0, total_length);
+    response[0] = 0x45u;
+    write_u16(&response[2], (uint16_t)total_length);
+    response[8] = 64u;
+    response[9] = 1u;
+    memcpy(address, &packet[12], sizeof(address));
+    memcpy(&response[12], &packet[16], sizeof(address));
+    memcpy(&response[16], address, sizeof(address));
+    response[20] = 3u;
+    response[21] = 3u;
+    memcpy(&response[28], packet, quoted_length);
+
+    checksum = checksum_finish(checksum_add(0u, response, 20u));
+    write_u16(&response[10], checksum);
+    checksum = checksum_finish(
+        checksum_add(0u, &response[20], total_length - 20u));
+    write_u16(&response[22], checksum);
+    *response_length = total_length;
+    return 0;
 }
 
 int um_traffic_policy_build_dns_rejection(

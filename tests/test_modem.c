@@ -61,6 +61,25 @@ static void policy_write_u16(uint8_t *bytes, uint16_t value)
     bytes[1] = (uint8_t)value;
 }
 
+static void policy_finalize_ipv4_udp(uint8_t *packet, size_t packet_length)
+{
+    uint16_t checksum;
+    uint32_t sum;
+    packet[10] = 0u;
+    packet[11] = 0u;
+    packet[26] = 0u;
+    packet[27] = 0u;
+    checksum = policy_checksum_finish(policy_checksum_add(0u, packet, 20u));
+    policy_write_u16(&packet[10], checksum);
+    sum = policy_checksum_add(0u, &packet[12], 8u);
+    sum += 17u;
+    sum += (uint32_t)(packet_length - 20u);
+    sum = policy_checksum_add(sum, &packet[20], packet_length - 20u);
+    checksum = policy_checksum_finish(sum);
+    policy_write_u16(&packet[26],
+                     checksum == 0u ? UINT16_C(0xffff) : checksum);
+}
+
 static size_t make_policy_dns_query(uint8_t *packet, size_t capacity,
                                     const char *name, uint16_t type)
 {
@@ -70,8 +89,6 @@ static size_t make_policy_dns_query(uint8_t *packet, size_t capacity,
     const char *position = name;
     size_t dns_length;
     size_t packet_length;
-    uint16_t checksum;
-    uint32_t sum;
     memset(packet, 0, capacity);
     while (1) {
         if (*position == '.' || *position == '\0') {
@@ -116,15 +133,7 @@ static size_t make_policy_dns_query(uint8_t *packet, size_t capacity,
     policy_write_u16(dns, UINT16_C(0x4d2a));
     policy_write_u16(&dns[2], UINT16_C(0x0100));
     policy_write_u16(&dns[4], 1u);
-    checksum = policy_checksum_finish(policy_checksum_add(0u, packet, 20u));
-    policy_write_u16(&packet[10], checksum);
-    sum = policy_checksum_add(0u, &packet[12], 8u);
-    sum += 17u;
-    sum += (uint32_t)(packet_length - 20u);
-    sum = policy_checksum_add(sum, &packet[20], packet_length - 20u);
-    checksum = policy_checksum_finish(sum);
-    policy_write_u16(&packet[26],
-                     checksum == 0u ? UINT16_C(0xffff) : checksum);
+    policy_finalize_ipv4_udp(packet, packet_length);
     return packet_length;
 }
 
@@ -135,6 +144,11 @@ static void test_quiet_traffic_policy(void)
         "google.com",
         "ocsp.apple.com",
         "valid.apple.com",
+        "1-courier.push.apple.com",
+        "gateway.push-apple.com.akadns.net",
+        "identity.ess.apple.com",
+        "service.ess-apple.com.akadns.net",
+        "identity.ess.g.aaplimg.com",
         "notapple.com"
     };
     static const char *blocked[] = {
@@ -201,6 +215,27 @@ static void test_quiet_traffic_policy(void)
     sum += (uint32_t)(response_length - 20u);
     sum = policy_checksum_add(sum, &response[20], response_length - 20u);
     CHECK(policy_checksum_finish(sum) == 0u);
+
+    query_length = make_policy_dns_query(query, sizeof(query),
+                                         "example.com", 1u);
+    policy_write_u16(&query[22], 443u);
+    policy_finalize_ipv4_udp(query, query_length);
+    CHECK(um_traffic_policy_decide(query, query_length, 1, 0, &decision) ==
+          0);
+    CHECK(decision.action == UM_TRAFFIC_POLICY_REJECT_QUIC);
+    CHECK(um_traffic_policy_build_port_unreachable(
+              query, query_length, response, sizeof(response),
+              &response_length) == 0);
+    CHECK(response_length == 56u);
+    CHECK(response[9] == 1u && response[20] == 3u && response[21] == 3u);
+    CHECK(memcmp(&response[12], &query[16], 4u) == 0);
+    CHECK(memcmp(&response[16], &query[12], 4u) == 0);
+    CHECK(memcmp(&response[28], query, 28u) == 0);
+    CHECK(policy_checksum_finish(policy_checksum_add(0u, response, 20u)) ==
+          0u);
+    CHECK(policy_checksum_finish(
+              policy_checksum_add(0u, &response[20], response_length - 20u)) ==
+          0u);
 
     query_length = make_policy_dns_query(
         query, sizeof(query), "b._dns-sd._udp.0.0.77.10.in-addr.arpa", 12u);
