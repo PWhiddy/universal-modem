@@ -23,7 +23,7 @@ static void usage(FILE *stream)
             "  --output-device ID   Playback device ID shown at startup\n"
             "  --link-test          Finite bidirectional data test; no TUN/routes\n"
             "  --test-bytes N       Link-test bytes each direction (default 1024)\n"
-            "  --chunk-bytes N      Maximum calibrated frame body (default 2048)\n"
+            "  --chunk-bytes N      Maximum calibrated frame body (default 6144)\n"
             "  --retries N          Attempts per acknowledged frame (default 4)\n"
             "  --calib-high         Use the extended real-audio calibration\n"
             "  --allow-background   Disable the default quiet-link firewall\n"

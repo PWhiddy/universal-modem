@@ -73,9 +73,11 @@ typedef struct {
     int network_opened[SIM_ENDPOINTS];
     int network_input_ready[SIM_ENDPOINTS];
     int network_dns_retry_ready[SIM_ENDPOINTS];
+    int network_tcp_retry_ready;
     unsigned network_background_remaining[SIM_ENDPOINTS];
     unsigned network_dns_retry_reads[SIM_ENDPOINTS];
     unsigned network_dns_retries_injected;
+    unsigned network_tcp_retry_reads;
     int client_tcp_before_dns_drained;
     int client_tcp_control_before_data;
     unsigned network_targets_read[SIM_ENDPOINTS];
@@ -147,6 +149,7 @@ typedef struct {
     unsigned tcp_retransmits_coalesced;
     unsigned tcp_syn_fallbacks_coalesced;
     unsigned tcp_stale_syns_dropped;
+    unsigned tcp_acked_retransmits_dropped;
     unsigned tcp_detail_logs;
     unsigned tcp_diagnostic_logs;
     unsigned tcp_capture_logs;
@@ -157,6 +160,8 @@ typedef struct {
     unsigned window_repairs;
     unsigned rate_breakdowns;
     unsigned internet_goodput_logs;
+    unsigned tls_budget_logs;
+    unsigned window_delivery_logs;
     unsigned domain_annotations;
     unsigned body_stepdowns;
     unsigned reconnecting;
@@ -333,8 +338,12 @@ static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
             packet, length,
             (uint8_t)((endpoint == SIM_CLIENT ? 0x50u : 0xb0u) +
                       target_index),
-            endpoint == SIM_CLIENT ? 50000u : 443u,
-            endpoint == SIM_CLIENT ? 443u : 50000u);
+            endpoint == SIM_CLIENT
+                ? (target_index == 1u ? 50001u : 50000u)
+                : 443u,
+            endpoint == SIM_CLIENT
+                ? 443u
+                : (target_index == 1u ? 50001u : 50000u));
         if (endpoint == SIM_CLIENT) {
             packet[16] = 93u;
             packet[17] = 184u;
@@ -369,6 +378,14 @@ static void make_proxy_target(uint8_t *packet, size_t length, int endpoint,
             packet[30] = (uint8_t)(acknowledgement >> 8u);
             packet[31] = (uint8_t)acknowledgement;
             packet[33] = endpoint == SIM_CLIENT ? 0x02u : 0x12u;
+        }
+        if (endpoint == SIM_GATEWAY && target_index == 1u) {
+            uint32_t acknowledgement =
+                (uint32_t)(SIM_LARGE_REQUEST_BYTES - 40u);
+            packet[28] = (uint8_t)(acknowledgement >> 24u);
+            packet[29] = (uint8_t)(acknowledgement >> 16u);
+            packet[30] = (uint8_t)(acknowledgement >> 8u);
+            packet[31] = (uint8_t)acknowledgement;
         }
         finalize_ipv4_checksums(packet, length);
     }
@@ -981,6 +998,17 @@ static void test_log(void *context, const char *message)
             run->tcp_stale_syns_dropped = count;
         }
     }
+    {
+        const char *dropped =
+            strstr(message, "tcp-acked-retransmits-dropped=");
+        unsigned count;
+        if (dropped != NULL &&
+            sscanf(dropped +
+                       strlen("tcp-acked-retransmits-dropped="),
+                   "%u", &count) == 1) {
+            run->tcp_acked_retransmits_dropped = count;
+        }
+    }
     if (strstr(message, "traffic=IPv4/TCP ") != NULL &&
         strstr(message, " flags=0x") != NULL &&
         strstr(message, " payload=") != NULL) {
@@ -1006,6 +1034,16 @@ static void test_log(void *context, const char *message)
         strstr(message, " recent-upload=") != NULL &&
         strstr(message, " recent-download=") != NULL) {
         ++run->internet_goodput_logs;
+    }
+    if (strstr(message, "proxy tls-budget ") != NULL &&
+        strstr(message, "acoustic-rtt-floor=") != NULL &&
+        strstr(message, "observed-server-deadline=") != NULL) {
+        ++run->tls_budget_logs;
+    }
+    if (strstr(message, " window=") != NULL &&
+        strstr(message, " delivered wall=") != NULL &&
+        strstr(message, "repair-cells=") != NULL) {
+        ++run->window_delivery_logs;
     }
     if (strstr(message, "93.184.216.34(dns.test)") != NULL) {
         ++run->domain_annotations;
@@ -1373,6 +1411,8 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
     (void)pthread_mutex_lock(&bus.mutex);
     while (bus.network_input_ready[network->endpoint] == 0 &&
            bus.network_dns_retry_ready[network->endpoint] == 0 &&
+           (network->endpoint != SIM_CLIENT ||
+            bus.network_tcp_retry_ready == 0) &&
            bus.network_background_remaining[network->endpoint] == 0u &&
            bus.network_opened[network->endpoint] != 0 &&
            wait_status != ETIMEDOUT && timeout_ms != 0u) {
@@ -1385,6 +1425,8 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
     }
     if (bus.network_input_ready[network->endpoint] == 0 &&
         bus.network_dns_retry_ready[network->endpoint] == 0 &&
+        (network->endpoint != SIM_CLIENT ||
+         bus.network_tcp_retry_ready == 0) &&
         bus.network_background_remaining[network->endpoint] == 0u) {
         (void)pthread_mutex_unlock(&bus.mutex);
         return UM_ERR_TIMEOUT;
@@ -1402,6 +1444,11 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
         ++bus.network_dns_retry_reads[network->endpoint];
         dns_retry = 1;
         target_index = 0u;
+    } else if (network->endpoint == SIM_CLIENT &&
+               bus.network_tcp_retry_ready != 0) {
+        bus.network_tcp_retry_ready = 0;
+        ++bus.network_tcp_retry_reads;
+        target_index = 1u;
     } else if (bus.network_input_ready[network->endpoint] != 0) {
         --bus.network_input_ready[network->endpoint];
         target_index = bus.network_targets_read[network->endpoint]++;
@@ -1511,6 +1558,13 @@ int um_network_write(um_network *network, const uint8_t *packet,
     }
     if (target_matches != 0) {
         ++bus.network_matches[network->endpoint];
+        if (network->endpoint == SIM_CLIENT && target_index == 1u &&
+            bus.network_tcp_retry_reads == 0u) {
+            /* The reverse packet cumulatively ACKs target 1. Inject one
+             * later kernel retransmission of those exact bytes; the live
+             * proxy must discard it before it crosses the acoustic link. */
+            bus.network_tcp_retry_ready = 1;
+        }
         if (network->endpoint == SIM_GATEWAY) {
             if (target_index == 0u) {
                 unsigned targets_read =
@@ -1680,11 +1734,13 @@ static int run_pair(const char *label,
     memset(bus.network_input_ready, 0, sizeof(bus.network_input_ready));
     memset(bus.network_dns_retry_ready, 0,
            sizeof(bus.network_dns_retry_ready));
+    bus.network_tcp_retry_ready = 0;
     memset(bus.network_background_remaining, 0,
            sizeof(bus.network_background_remaining));
     memset(bus.network_dns_retry_reads, 0,
            sizeof(bus.network_dns_retry_reads));
     bus.network_dns_retries_injected = 0u;
+    bus.network_tcp_retry_reads = 0u;
     bus.client_tcp_before_dns_drained = 0;
     bus.client_tcp_control_before_data = 0;
     memset(bus.network_targets_read, 0, sizeof(bus.network_targets_read));
@@ -1770,7 +1826,7 @@ static int run_pair(const char *label,
           bus.network_opened[SIM_GATEWAY] != 0 ||
           bus.network_reads[SIM_CLIENT] !=
               SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS +
-                  bus.network_dns_retry_reads[SIM_CLIENT] ||
+                  bus.network_dns_retry_reads[SIM_CLIENT] + 1u ||
           bus.network_reads[SIM_GATEWAY] !=
               SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS ||
           bus.network_writes[SIM_CLIENT] != SIM_FORWARDED_PACKETS ||
@@ -1783,6 +1839,7 @@ static int run_pair(const char *label,
               SIM_FORWARDED_BACKGROUND_PACKETS ||
           bus.network_dns_retries_injected != 3u ||
           bus.network_dns_retry_reads[SIM_CLIENT] != 3u ||
+          bus.network_tcp_retry_reads != 1u ||
           client.dns_retries_suppressed != 3u ||
           bus.client_tcp_before_dns_drained == 0 ||
           bus.client_tcp_control_before_data == 0 ||
@@ -1802,6 +1859,8 @@ static int run_pair(const char *label,
           gateway.tcp_syn_fallbacks_coalesced != 1u ||
           client.tcp_stale_syns_dropped != 1u ||
           gateway.tcp_stale_syns_dropped != 1u ||
+          client.tcp_acked_retransmits_dropped != 1u ||
+          gateway.tcp_acked_retransmits_dropped != 0u ||
           client.tcp_detail_logs == 0u ||
           gateway.tcp_detail_logs == 0u ||
           client.tcp_diagnostic_logs == 0u ||
@@ -1814,6 +1873,10 @@ static int run_pair(const char *label,
           gateway.rate_breakdowns == 0u ||
           client.internet_goodput_logs == 0u ||
           gateway.internet_goodput_logs == 0u ||
+          client.tls_budget_logs != 1u ||
+          gateway.tls_budget_logs != 1u ||
+          client.window_delivery_logs == 0u ||
+          gateway.window_delivery_logs == 0u ||
           client.domain_annotations + gateway.domain_annotations == 0u)) ||
         (inject_proxy_retry != 0 &&
          (bus.proxy_drops != 2u || bus.begin_ack_drops != 1u ||
@@ -1841,7 +1904,8 @@ static int run_pair(const char *label,
                 um_status_string(gateway.status));
         fprintf(stderr,
                 "  network reads=%u/%u writes=%u/%u matches=%u/%u "
-                "background=%u/%u dns-retries=%u/%u/%u order=%d/%d\n",
+                "background=%u/%u dns-retries=%u/%u/%u "
+                "tcp-retry=%u order=%d/%d\n",
                 bus.network_reads[SIM_CLIENT],
                 bus.network_reads[SIM_GATEWAY],
                 bus.network_writes[SIM_CLIENT],
@@ -1853,12 +1917,13 @@ static int run_pair(const char *label,
                 bus.network_dns_retries_injected,
                 bus.network_dns_retry_reads[SIM_CLIENT],
                 client.dns_retries_suppressed,
+                bus.network_tcp_retry_reads,
                 bus.client_tcp_before_dns_drained,
                 bus.client_tcp_control_before_data);
         fprintf(stderr,
                 "  filters multicast=%u/%u broadcast=%u/%u stale-icmp=%u/%u "
                 "discovery=%u/%u ack-coalesce=%u/%u retransmit=%u/%u "
-                "syn-fallback=%u/%u stale-syn=%u/%u\n",
+                "syn-fallback=%u/%u stale-syn=%u/%u acked-retry=%u/%u\n",
                 client.multicast_dropped, gateway.multicast_dropped,
                 client.broadcast_dropped, gateway.broadcast_dropped,
                 client.stale_dns_icmp_dropped,
@@ -1871,7 +1936,9 @@ static int run_pair(const char *label,
                 client.tcp_syn_fallbacks_coalesced,
                 gateway.tcp_syn_fallbacks_coalesced,
                 client.tcp_stale_syns_dropped,
-                gateway.tcp_stale_syns_dropped);
+                gateway.tcp_stale_syns_dropped,
+                client.tcp_acked_retransmits_dropped,
+                gateway.tcp_acked_retransmits_dropped);
         fprintf(stderr,
                 "  telemetry tcp=%u/%u capture=%u/%u bad-check=%u/%u "
                 "rates=%u/%u goodput=%u/%u domains=%u/%u windows=%u/%u "

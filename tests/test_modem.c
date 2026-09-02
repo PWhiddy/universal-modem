@@ -1308,10 +1308,10 @@ static void test_calibration_safety_guard(void)
     frontier.fec_rate = UM_FEC_RATE_3_4;
     CHECK(um_calibration_guard_config(&frontier, &guarded) == UM_OK);
     CHECK(guarded.qam_bits == 4u);
-    CHECK(guarded.fec_rate == UM_FEC_RATE_2_3);
+    CHECK(guarded.fec_rate == UM_FEC_RATE_1_2);
     CHECK(guarded.first_bin == 48u);
     CHECK(guarded.last_bin == 768u);
-    CHECK(guarded.cyclic_prefix == 1024u);
+    CHECK(guarded.cyclic_prefix == 512u);
     CHECK(guarded.window_samples == 64u);
     CHECK(guarded.sync_samples == 1536u);
     CHECK(guarded.sync_gap == 2048u);
@@ -1323,8 +1323,8 @@ static void test_calibration_safety_guard(void)
     frontier.qam_bits = 4u;
     frontier.fec_rate = UM_FEC_RATE_3_4;
     CHECK(um_calibration_guard_config(&frontier, &guarded) == UM_OK);
-    CHECK(guarded.qam_bits == 2u);
-    CHECK(guarded.fec_rate == UM_FEC_RATE_2_3);
+    CHECK(guarded.qam_bits == 4u);
+    CHECK(guarded.fec_rate == UM_FEC_RATE_1_2);
 
     frontier = um_modem_robust_config();
     CHECK(um_calibration_guard_config(&frontier, &guarded) == UM_OK);

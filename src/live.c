@@ -46,6 +46,8 @@
 #define LIVE_PROXY_INFLIGHT_DNS 64u
 #define LIVE_PROXY_DNS_ADDRESS_CACHE 128u
 #define LIVE_PROXY_DNS_NAME_BYTES 96u
+#define LIVE_PROXY_TCP_ACK_FLOWS 64u
+#define LIVE_PROXY_TCP_ACK_MAX_AGE_MS 120000u
 #define LIVE_PROXY_DNS_RETRY_SUPPRESS_MS 30000u
 #define LIVE_PROXY_DNS_INFLIGHT_SUPPRESS_MS 15000u
 #define LIVE_PROXY_DNS_QUEUE_LIMIT 48u
@@ -65,6 +67,9 @@
 #define LIVE_PROXY_WINDOW_ACK_YIELD 0x02u
 #define LIVE_PROXY_WINDOW_ROUNDS_PER_RETRY 2u
 #define LIVE_CALIB_BODY_MAX_SECONDS 5.5f
+#define LIVE_PROXY_TLS_SERVER_FLIGHT_BYTES 6030u
+#define LIVE_PROXY_TLS_CLIENT_REPLY_BYTES 384u
+#define LIVE_PROXY_TLS_SERVER_DEADLINE_SECONDS 10.0f
 
 enum {
     LIVE_PROXY_PRIORITY_BULK = 0,
@@ -131,6 +136,16 @@ typedef struct {
 } live_proxy_dns_address;
 
 typedef struct {
+    uint32_t local_address;
+    uint32_t remote_address;
+    uint32_t acknowledgement;
+    uint64_t updated_ms;
+    uint16_t local_port;
+    uint16_t remote_port;
+    int valid;
+} live_proxy_tcp_ack_flow;
+
+typedef struct {
     um_live_audio_options options;
     um_audio *audio;
     um_network *network;
@@ -176,6 +191,7 @@ typedef struct {
     live_proxy_recent_dns recent_dns[LIVE_PROXY_RECENT_DNS];
     live_proxy_inflight_dns inflight_dns[LIVE_PROXY_INFLIGHT_DNS];
     live_proxy_dns_address dns_addresses[LIVE_PROXY_DNS_ADDRESS_CACHE];
+    live_proxy_tcp_ack_flow peer_tcp_acks[LIVE_PROXY_TCP_ACK_FLOWS];
     size_t next_dns_address;
     size_t queue_count;
     size_t queue_dropped;
@@ -190,6 +206,7 @@ typedef struct {
     size_t tcp_retransmits_coalesced;
     size_t tcp_syn_fallbacks_coalesced;
     size_t tcp_stale_syns_dropped;
+    size_t tcp_acked_retransmits_dropped;
     size_t background_dns_rejected;
     size_t background_packets_dropped;
     size_t queue_priority_evictions;
@@ -205,6 +222,7 @@ typedef struct {
     size_t tcp_retransmits_logged_coalesced;
     size_t tcp_syn_fallbacks_logged_coalesced;
     size_t tcp_stale_syns_logged_dropped;
+    size_t tcp_acked_retransmits_logged_dropped;
     size_t background_dns_logged_rejected;
     size_t background_packets_logged_dropped;
     size_t queue_logged_priority_evictions;
@@ -363,7 +381,7 @@ static unsigned live_body_verification_trials(int high_quality)
 }
 
 static const size_t live_body_candidates[] = {
-    256u, 384u, 512u, 768u, 1024u, 1536u, 2048u
+    256u, 384u, 512u, 768u, 1024u, 1536u, 2048u, 3072u, 4096u, 6144u
 };
 
 static float live_frame_seconds(const um_modem_config *config,
@@ -374,6 +392,31 @@ static float live_frame_seconds(const um_modem_config *config,
     float guards = (float)(LIVE_TX_PRE_SAMPLES + LIVE_TX_POST_SAMPLES) /
                    (float)UM_SAMPLE_RATE;
     return rate > 0.0f ? (float)(wire_bytes * 8u) / rate + guards : 0.0f;
+}
+
+static float live_proxy_window_data_seconds(
+    const um_modem_config *config, size_t frame_body_bytes,
+    size_t serialized_bytes, size_t *cell_count)
+{
+    size_t cell_payload;
+    size_t remaining = serialized_bytes;
+    size_t cells = 0u;
+    float seconds = 0.0f;
+    if (frame_body_bytes <= LIVE_PROXY_WINDOW_HEADER_BYTES) {
+        return 0.0f;
+    }
+    cell_payload = frame_body_bytes - LIVE_PROXY_WINDOW_HEADER_BYTES;
+    while (remaining != 0u) {
+        size_t payload = remaining < cell_payload ? remaining : cell_payload;
+        seconds += live_frame_seconds(
+            config, LIVE_PROXY_WINDOW_HEADER_BYTES + payload);
+        remaining -= payload;
+        ++cells;
+    }
+    if (cell_count != NULL) {
+        *cell_count = cells;
+    }
+    return seconds;
 }
 
 static int live_body_candidate_fits_capture(
@@ -2389,6 +2432,120 @@ static int parse_ipv4_tcp_segment(const uint8_t *packet, size_t length,
     return 1;
 }
 
+static int tcp_sequence_after(uint32_t first, uint32_t second)
+{
+    uint32_t distance = first - second;
+    return distance != 0u && distance < UINT32_C(0x80000000);
+}
+
+static live_proxy_tcp_ack_flow *find_peer_tcp_ack(
+    live_proxy_state *state, uint32_t local_address,
+    uint32_t remote_address, uint16_t local_port,
+    uint16_t remote_port, int create)
+{
+    live_proxy_tcp_ack_flow *available = NULL;
+    live_proxy_tcp_ack_flow *oldest = NULL;
+    uint64_t now = monotonic_milliseconds();
+    size_t index;
+    for (index = 0u; index < LIVE_PROXY_TCP_ACK_FLOWS; ++index) {
+        live_proxy_tcp_ack_flow *flow = &state->peer_tcp_acks[index];
+        if (flow->valid != 0 &&
+            now - flow->updated_ms > LIVE_PROXY_TCP_ACK_MAX_AGE_MS) {
+            flow->valid = 0;
+        }
+        if (flow->valid != 0 && flow->local_address == local_address &&
+            flow->remote_address == remote_address &&
+            flow->local_port == local_port &&
+            flow->remote_port == remote_port) {
+            return flow;
+        }
+        if (flow->valid == 0 && available == NULL) {
+            available = flow;
+        } else if (flow->valid != 0 &&
+                   (oldest == NULL ||
+                    flow->updated_ms < oldest->updated_ms)) {
+            oldest = flow;
+        }
+    }
+    if (create == 0) {
+        return NULL;
+    }
+    available = available != NULL ? available : oldest;
+    memset(available, 0, sizeof(*available));
+    available->local_address = local_address;
+    available->remote_address = remote_address;
+    available->local_port = local_port;
+    available->remote_port = remote_port;
+    return available;
+}
+
+/* Remember cumulative ACKs arriving from the peer.  The operating system
+ * may emit a retransmission while a multi-second acoustic response is in
+ * flight; once that response proves the original bytes were accepted,
+ * forwarding the queued retry only consumes the next scarce transmit turn. */
+static void remember_peer_tcp_ack(live_proxy_state *state,
+                                  const uint8_t *packet,
+                                  size_t packet_length)
+{
+    live_proxy_tcp_segment segment;
+    live_proxy_tcp_ack_flow *flow;
+    uint64_t now;
+    if (parse_ipv4_tcp_segment(packet, packet_length, &segment) == 0 ||
+        (segment.flags & 0x10u) == 0u) {
+        return;
+    }
+    flow = find_peer_tcp_ack(
+        state, read_u32(&packet[16]), read_u32(&packet[12]),
+        segment.destination_port, segment.source_port, 1);
+    now = monotonic_milliseconds();
+    if (flow->valid == 0 ||
+        tcp_sequence_after(segment.acknowledgement,
+                           flow->acknowledgement) != 0) {
+        flow->acknowledgement = segment.acknowledgement;
+    }
+    flow->updated_ms = now;
+    flow->valid = 1;
+}
+
+static int tcp_payload_was_peer_acked(live_proxy_state *state,
+                                      const uint8_t *packet,
+                                      size_t packet_length,
+                                      uint32_t *segment_end,
+                                      uint32_t *peer_ack)
+{
+    live_proxy_tcp_segment segment;
+    live_proxy_tcp_ack_flow *flow;
+    uint32_t end;
+    if (parse_ipv4_tcp_segment(packet, packet_length, &segment) == 0) {
+        return 0;
+    }
+    flow = find_peer_tcp_ack(
+        state, read_u32(&packet[12]), read_u32(&packet[16]),
+        segment.source_port, segment.destination_port, 0);
+    if ((segment.flags & 0x02u) != 0u) {
+        /* A new SYN starts a new incarnation of this four-tuple. */
+        if (flow != NULL) {
+            flow->valid = 0;
+        }
+        return 0;
+    }
+    if (segment.payload_length == 0u || flow == NULL) {
+        return 0;
+    }
+    end = segment.sequence + (uint32_t)segment.payload_length;
+    if (flow->acknowledgement == end ||
+        tcp_sequence_after(flow->acknowledgement, end) != 0) {
+        if (segment_end != NULL) {
+            *segment_end = end;
+        }
+        if (peer_ack != NULL) {
+            *peer_ack = flow->acknowledgement;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static int tcp_handshake_is_obsolete_for_followup(
     const uint8_t *handshake_packet, size_t handshake_length,
     const uint8_t *followup_packet, size_t followup_length)
@@ -3628,10 +3785,33 @@ static int drain_proxy_ingress(live_context *context,
             live_proxy_tcp_segment captured_tcp;
             if (parse_ipv4_tcp_segment(packet, packet_length,
                                        &captured_tcp) != 0) {
+                uint32_t segment_end = 0u;
+                uint32_t peer_ack = 0u;
                 ++state->tcp_packets_captured;
                 log_proxy_tcp_diagnostics(
                     context, state, "capture", state->tcp_packets_captured,
                     packet, packet_length);
+                if (tcp_payload_was_peer_acked(
+                        state, packet, packet_length, &segment_end,
+                        &peer_ack) != 0) {
+                    ++state->tcp_acked_retransmits_dropped;
+                    live_log(
+                        context,
+                        "proxy tcp ACK-prune local=%u.%u.%u.%u:%u "
+                        "remote=%u.%u.%u.%u:%u seq=%lu end=%lu "
+                        "peer-ack=%lu payload=%zu",
+                        (unsigned)packet[12], (unsigned)packet[13],
+                        (unsigned)packet[14], (unsigned)packet[15],
+                        (unsigned)captured_tcp.source_port,
+                        (unsigned)packet[16], (unsigned)packet[17],
+                        (unsigned)packet[18], (unsigned)packet[19],
+                        (unsigned)captured_tcp.destination_port,
+                        (unsigned long)captured_tcp.sequence,
+                        (unsigned long)segment_end,
+                        (unsigned long)peer_ack,
+                        captured_tcp.payload_length);
+                    continue;
+                }
             }
         }
         status = enqueue_proxy_packet(state, packet, packet_length);
@@ -3658,6 +3838,8 @@ static int drain_proxy_ingress(live_context *context,
             state->tcp_syn_fallbacks_logged_coalesced ||
         state->tcp_stale_syns_dropped !=
             state->tcp_stale_syns_logged_dropped ||
+        state->tcp_acked_retransmits_dropped !=
+            state->tcp_acked_retransmits_logged_dropped ||
         state->background_dns_rejected !=
             state->background_dns_logged_rejected ||
         state->background_packets_dropped !=
@@ -3674,6 +3856,7 @@ static int drain_proxy_ingress(live_context *context,
                  "tcp-retransmits-coalesced=%zu "
                  "tcp-syn-fallbacks-coalesced=%zu "
                  "stale-tcp-syns-dropped=%zu "
+                 "tcp-acked-retransmits-dropped=%zu "
                  "background-dns-rejected=%zu "
                  "background-packets-dropped=%zu "
                  "priority-evictions=%zu",
@@ -3689,6 +3872,7 @@ static int drain_proxy_ingress(live_context *context,
                  state->tcp_retransmits_coalesced,
                  state->tcp_syn_fallbacks_coalesced,
                  state->tcp_stale_syns_dropped,
+                 state->tcp_acked_retransmits_dropped,
                  state->background_dns_rejected,
                  state->background_packets_dropped,
                  state->queue_priority_evictions);
@@ -3711,6 +3895,8 @@ static int drain_proxy_ingress(live_context *context,
             state->tcp_syn_fallbacks_coalesced;
         state->tcp_stale_syns_logged_dropped =
             state->tcp_stale_syns_dropped;
+        state->tcp_acked_retransmits_logged_dropped =
+            state->tcp_acked_retransmits_dropped;
         state->background_dns_logged_rejected =
             state->background_dns_rejected;
         state->background_packets_logged_dropped =
@@ -4089,6 +4275,7 @@ static void account_proxy_batch(live_context *context,
                              (uint32_t)state->packets_sent, packet_length,
                              1u, &body[offset]);
         } else {
+            remember_peer_tcp_ack(state, &body[offset], packet_length);
             account_proxy_packet_bytes(state, 0, &body[offset],
                                        packet_length);
             log_proxy_packet(context, state, 0,
@@ -4139,6 +4326,8 @@ static int send_proxy_window(live_context *context,
     uint8_t pending_bitmap;
     uint32_t window_id = ++state->transmit_batch_id;
     uint16_t sequence = state->transmit_sequence;
+    uint64_t started_ms = monotonic_milliseconds();
+    size_t transmitted_cells = 0u;
     unsigned round_limit = context->options.retry_limit *
                            LIVE_PROXY_WINDOW_ROUNDS_PER_RETRY;
     unsigned attempt;
@@ -4227,6 +4416,7 @@ static int send_proxy_window(live_context *context,
                 if (status != UM_OK) {
                     return status;
                 }
+                ++transmitted_cells;
             }
         }
         status = receive_expected(context, receive, UM_WIRE_IP_ACK,
@@ -4253,6 +4443,17 @@ static int send_proxy_window(live_context *context,
                 ++state->transmit_sequence;
                 account_proxy_batch(context, state, 1, batch,
                                     batch_length, cell_count);
+                live_log(
+                    context,
+                    "proxy %s window=%u delivered wall=%.3fs "
+                    "data-cells=%zu repair-cells=%zu ack-rounds=%u",
+                    proxy_transmit_label(context), window_id,
+                    (double)(monotonic_milliseconds() - started_ms) /
+                        1000.0,
+                    cell_count, transmitted_cells > cell_count
+                                    ? transmitted_cells - cell_count
+                                    : 0u,
+                    attempt + 1u);
                 if (yield_accepted != 0) {
                     return commit_proxy_packet_token(
                         context, state, sequence, window_id, token_yielded);
@@ -4762,6 +4963,33 @@ static int run_proxy_loop(live_context *context)
         proxy_transmit_config(context), frame_body_limit);
     float receive_frame_seconds = live_frame_seconds(
         proxy_receive_config(context), receive_frame_body_limit);
+    size_t tls_down_cells = 0u;
+    size_t tls_up_cells = 0u;
+    float tls_down_seconds = live_proxy_window_data_seconds(
+        &context->gateway_to_client,
+        context->gateway_to_client_body_bytes,
+        LIVE_PROXY_TLS_SERVER_FLIGHT_BYTES, &tls_down_cells);
+    float tls_up_seconds = live_proxy_window_data_seconds(
+        &context->client_to_gateway,
+        context->client_to_gateway_body_bytes,
+        LIVE_PROXY_TLS_CLIENT_REPLY_BYTES, &tls_up_cells);
+    float tls_control_seconds =
+        live_frame_seconds(&context->client_to_gateway,
+                           LIVE_PROXY_WINDOW_ACK_BYTES) +
+        live_frame_seconds(&context->gateway_to_client, 0u);
+    float tls_floor_seconds = tls_down_seconds + tls_up_seconds +
+                              tls_control_seconds +
+                              4.0f * (float)LIVE_TURNAROUND_MS / 1000.0f;
+    float tls_headroom_seconds =
+        LIVE_PROXY_TLS_SERVER_DEADLINE_SECONDS - tls_floor_seconds;
+    const char *tls_status =
+        tls_down_cells > LIVE_PROXY_WINDOW_MAX_CELLS ||
+                tls_up_cells > LIVE_PROXY_WINDOW_MAX_CELLS
+            ? "multi-window-too-slow"
+            : tls_headroom_seconds >= 2.0f
+                  ? "healthy-margin"
+                  : tls_headroom_seconds >= 0.0f ? "tight-margin"
+                                                 : "misses-deadline";
     int have_token = context->options.role == UM_LIVE_CLIENT;
     memset(&state, 0, sizeof(state));
     state.started_ms = monotonic_milliseconds();
@@ -4789,6 +5017,15 @@ static int run_proxy_loop(live_context *context)
                  ? (double)(receive_frame_body_limit * 8u) /
                        receive_frame_seconds
                  : 0.0);
+    live_log(context,
+             "proxy tls-budget representative-server-flight=%uB/%zu-cells "
+             "client-reply=%uB/%zu-cells acoustic-rtt-floor=%.3fs "
+             "observed-server-deadline=%.1fs headroom=%.3fs status=%s",
+             LIVE_PROXY_TLS_SERVER_FLIGHT_BYTES, tls_down_cells,
+             LIVE_PROXY_TLS_CLIENT_REPLY_BYTES, tls_up_cells,
+             tls_floor_seconds,
+             (double)LIVE_PROXY_TLS_SERVER_DEADLINE_SECONDS,
+             tls_headroom_seconds, tls_status);
     while (!live_interrupted) {
         int status;
         if (have_token != 0) {
@@ -5367,9 +5604,9 @@ int um_run_live_audio(const um_live_audio_options *options,
              (double)UM_SAMPLE_RATE / UM_FFT_SIZE,
              UM_MAX_SYMBOL_REPETITIONS);
     live_log(&context,
-             "Calibration operating guard qam>4=one-tier-lower "
-             "fec>1/2=one-tier-stronger robust-floor=repeats2 "
-             "cp>=21.3ms window>=64 "
+             "Calibration operating guard qam64->qam16 "
+             "fec=1/2 qpsk-floor=repeats2 "
+             "cp=one-tier-longer/min10.7ms window>=64 "
              "training>=3 sync>=32.0ms gap>=42.7ms "
              "band-edges=one-tier-inward high<=18000Hz "
              "body=one-tier-below-confirmed");
