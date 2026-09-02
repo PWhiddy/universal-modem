@@ -61,11 +61,13 @@ static const quiet_domain_rule quiet_block_rules[] = {
     {"time.apple.com", "background time synchronization"},
     {"time-macos.apple.com", "background time synchronization"},
     // blocking these temp
+ 
     {"push.apple.com", "Apple Push Notification service"},
     {"push-apple.com.akadns.net", "APNs load-balancing alias"},
     {"ess.apple.com", "observed iMessage identity/query service"},
     {"ess-apple.com.akadns.net", "observed iMessage service alias"},
     {"ess.g.aaplimg.com", "observed iMessage service CDN alias"},
+    {"ocsp2.apple.com", "something we saw show up"},
 
     /* Apple services outside the requested APNs/iMessage text path. */
     {"news-edge.apple.com", "Apple News"},
@@ -123,6 +125,8 @@ static const quiet_domain_rule quiet_block_rules[] = {
     {"safebrowsing.google.com", "Firefox Safe Browsing refresh"},
     {"safebrowsing.googleapis.com", "Firefox Safe Browsing refresh"},
     {"webservices.mozgcp.net", "firefox nonsense"},
+    
+    {"update.googleapis.com", "something we saw"},
 
     /* Catch all remaining Apple-controlled service zones.  The APNs, ESS,
      * and certificate-validation exceptions above are checked first.  This
