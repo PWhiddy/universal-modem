@@ -76,11 +76,15 @@ typedef struct {
     unsigned network_dns_retry_reads[SIM_ENDPOINTS];
     unsigned network_dns_retries_injected;
     int network_dns_response_delayed;
-    int client_tcp_before_dns_drained;
+    int tcp_data_before_control[SIM_ENDPOINTS];
+    int reply_affinity_triggered;
+    int reply_affinity_delivered;
+    int unrelated_tcp_overtook_reply;
     unsigned network_targets_read[SIM_ENDPOINTS];
     unsigned network_reads[SIM_ENDPOINTS];
     unsigned network_writes[SIM_ENDPOINTS];
     unsigned network_matches[SIM_ENDPOINTS];
+    unsigned network_tcp_ack_matches[SIM_ENDPOINTS];
     unsigned network_background_matches[SIM_ENDPOINTS];
     uint32_t network_target_seen[SIM_ENDPOINTS];
     unsigned network_target_order[SIM_ENDPOINTS][SIM_PROXY_PACKETS];
@@ -138,7 +142,6 @@ typedef struct {
     unsigned packet_token_commits;
     unsigned packet_token_accepts;
     unsigned token_offers_declined;
-    unsigned tcp_ack_turns_deferred;
     unsigned dns_query_logs;
     unsigned dns_response_logs;
     unsigned dns_retries_suppressed;
@@ -149,10 +152,17 @@ typedef struct {
     unsigned tcp_acks_coalesced;
     unsigned multi_packet_batches;
     unsigned multi_packet_windows;
+    unsigned batch_has_background_tcp;
+    unsigned batch_has_target_tcp;
+    unsigned mixed_tcp_flow_batches;
     unsigned window_starts;
     unsigned window_repairs;
     unsigned rate_breakdowns;
     unsigned internet_goodput_logs;
+    unsigned reply_flows_prioritized;
+    unsigned reply_flows_armed;
+    unsigned reply_flow_waits;
+    unsigned reply_flow_wait_misses;
     unsigned body_stepdowns;
     unsigned reconnecting;
 } runner;
@@ -524,6 +534,47 @@ static void make_proxy_background(uint8_t *packet, int endpoint,
         make_coalescible_tcp_ack(packet, endpoint, background_number);
         return;
     }
+    if (background_number == 10u) {
+        make_ipv4_tcp_packet(
+            packet, length, 0x6au,
+            endpoint == SIM_CLIENT ? 53001u : 443u,
+            endpoint == SIM_CLIENT ? 443u : 52001u);
+        if (endpoint == SIM_CLIENT) {
+            packet[16] = 3u;
+            packet[17] = 3u;
+            packet[18] = 3u;
+            packet[19] = 3u;
+        } else {
+            packet[12] = 2u;
+            packet[13] = 2u;
+            packet[14] = 2u;
+            packet[15] = 2u;
+            packet[16] = 10u;
+            packet[17] = 0u;
+            packet[18] = 0u;
+            packet[19] = 2u;
+        }
+        finalize_ipv4_checksums(packet, length);
+        return;
+    }
+    if ((background_number == 9u || background_number == 8u) &&
+        endpoint == SIM_CLIENT) {
+        make_ipv4_tcp_packet(packet, length,
+                             (uint8_t)(0x60u + background_number),
+                             52001u, 443u);
+        packet[16] = 2u;
+        packet[17] = 2u;
+        packet[18] = 2u;
+        packet[19] = 2u;
+        if (background_number == 9u) {
+            /* The kernel ACK is queued before the application payload. */
+            packet[32] = 0xb0u;
+            packet[33] = 0x10u;
+            memset(&packet[40], 1, length - 40u);
+        }
+        finalize_ipv4_checksums(packet, length);
+        return;
+    }
     if (background_number == 11u) {
         make_tunnel_discovery_dns(packet, endpoint);
         return;
@@ -567,6 +618,14 @@ static void make_proxy_background(uint8_t *packet, int endpoint,
         packet[19] = 251u;
         finalize_ipv4_checksums(packet, length);
     }
+}
+
+static int simulated_background_available(int endpoint)
+{
+    return bus.network_background_remaining[endpoint] != 0u &&
+           !(endpoint == SIM_CLIENT &&
+             bus.network_background_remaining[endpoint] == 10u &&
+             bus.reply_affinity_triggered == 0);
 }
 
 static void add_milliseconds(struct timespec *time, unsigned milliseconds)
@@ -711,6 +770,25 @@ static void test_log(void *context, const char *message)
         strstr(message, " bitmap-ack retry=") != NULL) {
         ++run->proxy_retries;
     }
+    if (strstr(message, "proxy ") != NULL &&
+        strstr(message, " batch=") != NULL &&
+        strstr(message, " packets=") != NULL) {
+        run->batch_has_background_tcp = 0u;
+        run->batch_has_target_tcp = 0u;
+    }
+    if (strstr(message, " traffic=IPv4/TCP ") != NULL &&
+        strstr(message, " payload=0 ") == NULL) {
+        if (strstr(message, ":51001") != NULL) {
+            run->batch_has_background_tcp = 1u;
+        }
+        if (strstr(message, ":50000") != NULL) {
+            run->batch_has_target_tcp = 1u;
+        }
+        if (run->batch_has_background_tcp != 0u &&
+            run->batch_has_target_tcp != 0u) {
+            run->mixed_tcp_flow_batches = 1u;
+        }
+    }
     if (strstr(message, " window=") != NULL &&
         strstr(message, " start cells=") != NULL) {
         int endpoint = run->options.role == UM_LIVE_CLIENT
@@ -754,10 +832,6 @@ static void test_log(void *context, const char *message)
     if (strstr(message, "proxy token offer window=") != NULL &&
         strstr(message, " declined reason=") != NULL) {
         ++run->token_offers_declined;
-    }
-    if (strstr(message,
-               "declined reason=defer-replaceable-tcp-acks") != NULL) {
-        ++run->tcp_ack_turns_deferred;
     }
     if (strstr(message, "DNS query dns.test A") != NULL) {
         ++run->dns_query_logs;
@@ -861,7 +935,17 @@ static void test_log(void *context, const char *message)
     if (strstr(message, "proxy internet-goodput wall=") != NULL &&
         strstr(message, " upload=") != NULL &&
         strstr(message, " download=") != NULL) {
+        const char *reply = strstr(message, "reply-flow=");
         ++run->internet_goodput_logs;
+        if (reply != NULL) {
+            (void)sscanf(reply,
+                         "reply-flow=%u/%u reply-waits=%u "
+                         "reply-wait-misses=%u",
+                         &run->reply_flows_prioritized,
+                         &run->reply_flows_armed,
+                         &run->reply_flow_waits,
+                         &run->reply_flow_wait_misses);
+        }
     }
     if (run->options.role == UM_LIVE_CLIENT &&
         (strstr(message, "proxy token commit sequence=") != NULL ||
@@ -1223,7 +1307,7 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
     (void)pthread_mutex_lock(&bus.mutex);
     while (bus.network_input_ready[network->endpoint] == 0 &&
            bus.network_dns_retry_ready[network->endpoint] == 0 &&
-           bus.network_background_remaining[network->endpoint] == 0u &&
+           simulated_background_available(network->endpoint) == 0 &&
            bus.network_opened[network->endpoint] != 0 &&
            wait_status != ETIMEDOUT && timeout_ms != 0u) {
         wait_status = pthread_cond_timedwait(&bus.changed, &bus.mutex,
@@ -1235,7 +1319,7 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
     }
     if (bus.network_input_ready[network->endpoint] == 0 &&
         bus.network_dns_retry_ready[network->endpoint] == 0 &&
-        bus.network_background_remaining[network->endpoint] == 0u) {
+        simulated_background_available(network->endpoint) == 0) {
         (void)pthread_mutex_unlock(&bus.mutex);
         return UM_ERR_TIMEOUT;
     }
@@ -1255,7 +1339,7 @@ int um_network_read(um_network *network, uint8_t *packet, size_t capacity,
     } else if (bus.network_input_ready[network->endpoint] != 0) {
         --bus.network_input_ready[network->endpoint];
         target_index = bus.network_targets_read[network->endpoint]++;
-    } else if (bus.network_background_remaining[network->endpoint] != 0u) {
+    } else if (simulated_background_available(network->endpoint) != 0) {
         background = 1;
         background_number =
             bus.network_background_remaining[network->endpoint];
@@ -1298,6 +1382,7 @@ int um_network_write(um_network *network, const uint8_t *packet,
     unsigned background_number;
     int source_endpoint;
     int target_matches;
+    int tcp_ack_matches = 0;
     int background_matches = 0;
     (void)timeout_ms;
     if (network == NULL || packet == NULL) {
@@ -1336,6 +1421,18 @@ int um_network_write(um_network *network, const uint8_t *packet,
         }
     }
     if (target_matches == 0) {
+        expected_length = proxy_target_length(
+            source_endpoint, SIM_TCP_ACK_PACKET_INDEX);
+        make_proxy_target(expected, expected_length, source_endpoint,
+                          SIM_TCP_ACK_PACKET_INDEX);
+        if (packet_length == expected_length &&
+            memcmp(packet, expected, expected_length) == 0 &&
+            bus.network_tcp_ack_matches[network->endpoint] == 0u) {
+            ++bus.network_tcp_ack_matches[network->endpoint];
+            tcp_ack_matches = 1;
+        }
+    }
+    if (target_matches == 0 && tcp_ack_matches == 0) {
         for (background_number = 1u;
              background_number < SIM_BACKGROUND_PACKETS;
              ++background_number) {
@@ -1352,6 +1449,26 @@ int um_network_write(um_network *network, const uint8_t *packet,
                 memcmp(packet, expected, background_length) == 0) {
                 bus.network_background_seen[network->endpoint] |= bit;
                 ++bus.network_background_matches[network->endpoint];
+                if (background_number == 10u &&
+                    (bus.network_background_seen[network->endpoint] &
+                     (UINT32_C(1) << 1u)) == 0u) {
+                    bus.tcp_data_before_control[network->endpoint] = 1;
+                }
+                if (network->endpoint == SIM_CLIENT &&
+                    background_number == 10u) {
+                    /* Receiving flow A unblocks an older flow B followed by
+                     * A's immediate local reply.  The reply must go first. */
+                    bus.reply_affinity_triggered = 1;
+                }
+                if (network->endpoint == SIM_GATEWAY &&
+                    bus.reply_affinity_triggered != 0 &&
+                    bus.reply_affinity_delivered == 0) {
+                    if (background_number == 8u) {
+                        bus.reply_affinity_delivered = 1;
+                    } else if (background_number == 10u) {
+                        bus.unrelated_tcp_overtook_reply = 1;
+                    }
+                }
                 background_matches = 1;
                 break;
             }
@@ -1369,11 +1486,6 @@ int um_network_write(um_network *network, const uint8_t *packet,
             } else {
                 ++bus.network_input_ready[SIM_GATEWAY];
             }
-            if (target_index != 0u &&
-                bus.network_background_matches[SIM_GATEWAY] <
-                    SIM_FORWARDED_BACKGROUND_PACKETS) {
-                bus.client_tcp_before_dns_drained = 1;
-            }
         }
         if (network->endpoint == SIM_CLIENT &&
             target_index == SIM_PROXY_PACKETS - 1u) {
@@ -1388,12 +1500,15 @@ int um_network_write(um_network *network, const uint8_t *packet,
         bus.network_dns_response_delayed = 0;
         ++bus.network_input_ready[SIM_GATEWAY];
     }
-    if (target_matches != 0 || background_matches != 0) {
+    if (target_matches != 0 || tcp_ack_matches != 0 ||
+        background_matches != 0) {
         (void)pthread_cond_broadcast(&bus.changed);
     }
     (void)pthread_mutex_unlock(&bus.mutex);
-    return target_matches != 0 || background_matches != 0 ? UM_OK
-                                                           : UM_ERR_NETWORK;
+    return target_matches != 0 || tcp_ack_matches != 0 ||
+                   background_matches != 0
+               ? UM_OK
+               : UM_ERR_NETWORK;
 }
 
 const char *um_network_interface_name(const um_network *network)
@@ -1560,11 +1675,17 @@ static int run_pair(const char *label,
            sizeof(bus.network_dns_retry_reads));
     bus.network_dns_retries_injected = 0u;
     bus.network_dns_response_delayed = 0;
-    bus.client_tcp_before_dns_drained = 0;
+    bus.reply_affinity_triggered = 0;
+    bus.reply_affinity_delivered = 0;
+    bus.unrelated_tcp_overtook_reply = 0;
+    memset(bus.tcp_data_before_control, 0,
+           sizeof(bus.tcp_data_before_control));
     memset(bus.network_targets_read, 0, sizeof(bus.network_targets_read));
     memset(bus.network_reads, 0, sizeof(bus.network_reads));
     memset(bus.network_writes, 0, sizeof(bus.network_writes));
     memset(bus.network_matches, 0, sizeof(bus.network_matches));
+    memset(bus.network_tcp_ack_matches, 0,
+           sizeof(bus.network_tcp_ack_matches));
     memset(bus.network_background_matches, 0,
            sizeof(bus.network_background_matches));
     memset(bus.network_target_seen, 0,
@@ -1650,8 +1771,14 @@ static int run_pair(const char *label,
               SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS + 4u ||
           bus.network_reads[SIM_GATEWAY] !=
               SIM_BACKGROUND_PACKETS + SIM_PROXY_PACKETS ||
-          bus.network_writes[SIM_CLIENT] != SIM_FORWARDED_PACKETS ||
-          bus.network_writes[SIM_GATEWAY] != SIM_FORWARDED_PACKETS ||
+          bus.network_writes[SIM_CLIENT] !=
+              SIM_FORWARDED_PACKETS +
+                  bus.network_tcp_ack_matches[SIM_CLIENT] ||
+          bus.network_writes[SIM_GATEWAY] !=
+              SIM_FORWARDED_PACKETS +
+                  bus.network_tcp_ack_matches[SIM_GATEWAY] ||
+          bus.network_tcp_ack_matches[SIM_CLIENT] != 0u ||
+          bus.network_tcp_ack_matches[SIM_GATEWAY] > 1u ||
           bus.network_matches[SIM_CLIENT] != SIM_PROXY_PACKETS ||
           bus.network_matches[SIM_GATEWAY] != SIM_PROXY_PACKETS ||
           bus.network_target_order_count[SIM_CLIENT] !=
@@ -1667,7 +1794,11 @@ static int run_pair(const char *label,
           bus.network_dns_retries_injected != 3u ||
           bus.network_dns_retry_reads[SIM_CLIENT] != 3u ||
           client.dns_retries_suppressed != 3u ||
-          bus.client_tcp_before_dns_drained == 0 ||
+          bus.tcp_data_before_control[SIM_CLIENT] == 0 ||
+          bus.tcp_data_before_control[SIM_GATEWAY] == 0 ||
+          bus.reply_affinity_triggered == 0 ||
+          bus.reply_affinity_delivered == 0 ||
+          bus.unrelated_tcp_overtook_reply != 0 ||
           client.multicast_dropped != 1u ||
           gateway.multicast_dropped != 1u ||
           client.broadcast_dropped != 1u ||
@@ -1681,7 +1812,10 @@ static int run_pair(const char *label,
           client.rate_breakdowns == 0u ||
           gateway.rate_breakdowns == 0u ||
           client.internet_goodput_logs == 0u ||
-          gateway.internet_goodput_logs == 0u)) ||
+          gateway.internet_goodput_logs == 0u ||
+          client.reply_flows_prioritized == 0u ||
+          client.reply_flows_armed == 0u ||
+          client.reply_flow_waits == 0u)) ||
         (inject_proxy_retry != 0 &&
          (bus.proxy_drops != 2u || bus.begin_ack_drops != 1u ||
           bus.commit_drops != 1u ||
@@ -1695,6 +1829,8 @@ static int run_pair(const char *label,
           client.dns_response_logs + gateway.dns_response_logs < 2u ||
           client.multi_packet_batches == 0u ||
           gateway.multi_packet_batches == 0u ||
+          client.mixed_tcp_flow_batches != 0u ||
+          gateway.mixed_tcp_flow_batches != 0u ||
           client.multi_packet_windows + gateway.multi_packet_windows ==
               0u ||
           client.window_starts + gateway.window_starts == 0u ||
@@ -1714,8 +1850,7 @@ static int run_pair(const char *label,
            "delayed capture restart, %s; upgrades=%u/%u "
            "fallbacks=%u/%u verification-stepdowns=%u calibrations=%u "
            "cache-skips=%u recovery-probes=%u offer-refreshes=%u "
-           "bounded-window-repairs=%u declined-token-offers=%u "
-           "deferred-ack-turns=%u\n",
+           "bounded-window-repairs=%u declined-token-offers=%u\n",
            label,
            link_test != 0 ? "256+256-byte explicit link test"
                           : "queued/in-flight/completed DNS coalescing plus "
@@ -1727,9 +1862,7 @@ static int run_pair(const char *label,
            client.recovery_probes + gateway.recovery_probes,
            gateway.offer_refreshes,
            client.window_repairs + gateway.window_repairs,
-           client.token_offers_declined + gateway.token_offers_declined,
-           client.tcp_ack_turns_deferred +
-               gateway.tcp_ack_turns_deferred);
+           client.token_offers_declined + gateway.token_offers_declined);
     return 0;
 }
 

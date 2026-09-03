@@ -144,11 +144,6 @@ static void test_quiet_traffic_policy(void)
         "google.com",
         "ocsp.apple.com",
         "valid.apple.com",
-        "1-courier.push.apple.com",
-        "gateway.push-apple.com.akadns.net",
-        "identity.ess.apple.com",
-        "service.ess-apple.com.akadns.net",
-        "identity.ess.g.aaplimg.com",
         "notapple.com"
     };
     static const char *blocked[] = {

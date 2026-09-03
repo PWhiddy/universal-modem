@@ -75,6 +75,7 @@ typedef struct {
     tcp_relay_stream_outcome outcome;
     int error_number;
     uint64_t first_byte_ms;
+    uint64_t ended_ms;
 } tcp_relay_stream_result;
 
 typedef struct {
@@ -192,6 +193,7 @@ static void *relay_copy_thread(void *argument)
         }
         break;
     }
+    copy->result->ended_ms = relay_milliseconds();
     if (copy->result->outcome == TCP_RELAY_STREAM_RECV_ERROR ||
         copy->result->outcome == TCP_RELAY_STREAM_SEND_ERROR) {
         relay_abort_job(copy->job);
@@ -226,11 +228,13 @@ static int relay_receive_first_client_data(
         if (poll_status < 0) {
             result->outcome = TCP_RELAY_STREAM_RECV_ERROR;
             result->error_number = errno;
+            result->ended_ms = relay_milliseconds();
             return UM_ERR_NETWORK;
         }
         if (relay_is_stopping(job->relay) != 0) {
             result->outcome = TCP_RELAY_STREAM_RECV_ERROR;
             result->error_number = ECANCELED;
+            result->ended_ms = relay_milliseconds();
             return UM_ERR_NETWORK;
         }
         if (poll_status == 0) {
@@ -250,9 +254,11 @@ static int relay_receive_first_client_data(
             if (count < 0) {
                 result->outcome = TCP_RELAY_STREAM_RECV_ERROR;
                 result->error_number = errno;
+                result->ended_ms = relay_milliseconds();
                 return UM_ERR_NETWORK;
             }
             result->outcome = TCP_RELAY_STREAM_EOF;
+            result->ended_ms = relay_milliseconds();
             return UM_ERR_NETWORK;
         }
     }
@@ -422,6 +428,7 @@ static void *relay_connection_thread(void *argument)
                            first_client_length) != UM_OK) {
             forward_result.outcome = TCP_RELAY_STREAM_SEND_ERROR;
             forward_result.error_number = errno;
+            forward_result.ended_ms = relay_milliseconds();
             relay_abort_job(job);
         } else {
             job->uploaded += first_client_length;
@@ -451,7 +458,8 @@ finished:
     relay_log(relay,
               "TCP relay closed %s:%u upload=%zuB download=%zuB id=%llu "
               "lifetime=%llums upstream-open=%s client-end=%s "
-              "client-errno=%d upstream-end=%s upstream-errno=%d "
+              "client-errno=%d client-end-at=%llums upstream-end=%s "
+              "upstream-errno=%d upstream-end-at=%llums "
               "first-client=%llums first-upstream=%llums",
               address, (unsigned)ntohs(job->destination.sin_port),
               job->uploaded, job->downloaded,
@@ -460,8 +468,16 @@ finished:
               job->upstream_connected_ms != 0u ? "yes" : "no",
               relay_stream_outcome_name(forward_result.outcome),
               forward_result.error_number,
+              (unsigned long long)(
+                  forward_result.ended_ms != 0u
+                      ? forward_result.ended_ms - job->accepted_ms
+                      : 0u),
               relay_stream_outcome_name(reverse_result.outcome),
               reverse_result.error_number,
+              (unsigned long long)(
+                  reverse_result.ended_ms != 0u
+                      ? reverse_result.ended_ms - job->accepted_ms
+                      : 0u),
               (unsigned long long)(
                   forward_result.first_byte_ms != 0u
                       ? forward_result.first_byte_ms - job->accepted_ms
