@@ -124,6 +124,7 @@ static const quiet_domain_rule quiet_block_rules[] = {
     {"spocs.getpocket.com", "Firefox sponsored Pocket content"},
     {"safebrowsing.google.com", "Firefox Safe Browsing refresh"},
     {"safebrowsing.googleapis.com", "Firefox Safe Browsing refresh"},
+    {"mozilla-ohttp.fastly-edge.com", "firefox fastly cdn"},
     {"webservices.mozgcp.net", "firefox nonsense"},
     
     {"update.googleapis.com", "something we saw"},
