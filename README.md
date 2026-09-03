@@ -62,6 +62,14 @@ After all the basic incremental testing, a complete simulated test with an async
 
 To best understand real world encoding decoding & transmission distortions, we may want to record real audio from one machine to another to analze what real world distortion, noise, ect actually looks like.
 
+### Video System logic
+
+This mode can be launched just like audio but using --light to use this mode instead. Both gateway and client will open their default camera device as well as open a drawble window on their screen. They will use the same tun/utun interface as the audio interface to send bidirectional internet traffic. One key difference is that there will be no interference between transmitting and receiving, so both can always be transmitting and receiving simultaneously, which gives opportunities for massive efficiency improvements. you should use a qr-code inspired coding scheme, that should be able to track a code which is significantly persepective transform and degraded, targeting around 10-15 fps of encoding decoding. try to get max bandwidth while remaining highly reliable, and we must work under the assumption that the code can be taking up anywhere from 10% to 90% of the whole screen (it can vary widely in scale and perspective transform). you should check out https://github.com/bashalarmistalt/decimen-optical-transfer as a reference, but design and implement everything yourself for maximum efficiency. there will likely still need to be a handshake + reconnection process between gateway and client. you should build and test everything very incrementally, building up to full simulation of bi-directional video encoding and decoding in the presence of noise, distortion, and persepctive transformation. then there should be a simulation of actual internet traffic over the connection. once that is all built, tested, and working smoothing we can begin real testing.
+
+Where applicable, key considerations from audio section also apply to video.
+
+----------------------------
+
 Maintain (generally should append only) a log file Progress.md which tracks all key steps, tests, decisions ect.
 
 If you have any questions that are critical, please stop and ask early before making assumptions.
