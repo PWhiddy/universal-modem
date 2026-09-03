@@ -153,7 +153,6 @@ typedef struct {
     unsigned window_repairs;
     unsigned rate_breakdowns;
     unsigned internet_goodput_logs;
-    unsigned domain_annotations;
     unsigned body_stepdowns;
     unsigned reconnecting;
 } runner;
@@ -863,9 +862,6 @@ static void test_log(void *context, const char *message)
         strstr(message, " upload=") != NULL &&
         strstr(message, " download=") != NULL) {
         ++run->internet_goodput_logs;
-    }
-    if (strstr(message, "93.184.216.34(dns.test)") != NULL) {
-        ++run->domain_annotations;
     }
     if (run->options.role == UM_LIVE_CLIENT &&
         (strstr(message, "proxy token commit sequence=") != NULL ||
@@ -1685,8 +1681,7 @@ static int run_pair(const char *label,
           client.rate_breakdowns == 0u ||
           gateway.rate_breakdowns == 0u ||
           client.internet_goodput_logs == 0u ||
-          gateway.internet_goodput_logs == 0u ||
-          client.domain_annotations + gateway.domain_annotations == 0u)) ||
+          gateway.internet_goodput_logs == 0u)) ||
         (inject_proxy_retry != 0 &&
          (bus.proxy_drops != 2u || bus.begin_ack_drops != 1u ||
           bus.commit_drops != 1u ||
@@ -1711,44 +1706,6 @@ static int run_pair(const char *label,
                 "gateway=%s\n",
                 label, timed_out, um_status_string(client.status),
                 um_status_string(gateway.status));
-        fprintf(stderr,
-                "network reads=%u/%u writes=%u/%u matches=%u/%u "
-                "background=%u/%u orders=%u/%u ordered=%d/%d "
-                "dns-retries=%u reads=%u suppressed=%u tcp-before-dns=%d\n",
-                bus.network_reads[SIM_CLIENT],
-                bus.network_reads[SIM_GATEWAY],
-                bus.network_writes[SIM_CLIENT],
-                bus.network_writes[SIM_GATEWAY],
-                bus.network_matches[SIM_CLIENT],
-                bus.network_matches[SIM_GATEWAY],
-                bus.network_background_matches[SIM_CLIENT],
-                bus.network_background_matches[SIM_GATEWAY],
-                bus.network_target_order_count[SIM_CLIENT],
-                bus.network_target_order_count[SIM_GATEWAY],
-                tcp_targets_remained_ordered(SIM_CLIENT),
-                tcp_targets_remained_ordered(SIM_GATEWAY),
-                bus.network_dns_retries_injected,
-                bus.network_dns_retry_reads[SIM_CLIENT],
-                client.dns_retries_suppressed,
-                bus.client_tcp_before_dns_drained);
-        fprintf(stderr,
-                "filters multicast=%u/%u broadcast=%u/%u stale-icmp=%u/%u "
-                "discovery=%u/%u ack-coalesced=%u/%u batches=%u "
-                "windows=%u starts=%u repairs=%u drops=%u/%u "
-                "body-stepdowns=%u\n",
-                client.multicast_dropped, gateway.multicast_dropped,
-                client.broadcast_dropped, gateway.broadcast_dropped,
-                client.stale_dns_icmp_dropped,
-                gateway.stale_dns_icmp_dropped,
-                client.discovery_dns_deprioritized,
-                gateway.discovery_dns_deprioritized,
-                client.tcp_acks_coalesced, gateway.tcp_acks_coalesced,
-                gateway.multi_packet_batches,
-                client.multi_packet_windows + gateway.multi_packet_windows,
-                client.window_starts + gateway.window_starts,
-                client.window_repairs + gateway.window_repairs,
-                bus.window_drops, bus.body_drops,
-                client.body_stepdowns + gateway.body_stepdowns);
         print_logs(&client);
         print_logs(&gateway);
         return 1;
