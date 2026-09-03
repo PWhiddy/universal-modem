@@ -162,6 +162,13 @@ static void test_quiet_traffic_policy(void)
         "safebrowsing.googleapis.com",
         "one.one.one.one"
     };
+    static const char *messages_allowed[] = {
+        "1-courier.push.apple.com",
+        "us-ne-courier-4.push-apple.com.akadns.net",
+        "init.ess.apple.com",
+        "query.ess-apple.com.akadns.net",
+        "init.ess.g.aaplimg.com"
+    };
     uint8_t query[512];
     uint8_t response[512];
     size_t query_length;
@@ -174,7 +181,7 @@ static void test_quiet_traffic_policy(void)
         query_length = make_policy_dns_query(query, sizeof(query),
                                              allowed[index], 1u);
         CHECK(query_length != 0u);
-        CHECK(um_traffic_policy_decide(query, query_length, 1, 1,
+        CHECK(um_traffic_policy_decide(query, query_length, 1, 1, 0,
                                        &decision) == 0);
         CHECK(decision.action == UM_TRAFFIC_POLICY_PASS);
     }
@@ -182,7 +189,7 @@ static void test_quiet_traffic_policy(void)
         query_length = make_policy_dns_query(query, sizeof(query),
                                              blocked[index], 65u);
         CHECK(query_length != 0u);
-        CHECK(um_traffic_policy_decide(query, query_length, 1, 1,
+        CHECK(um_traffic_policy_decide(query, query_length, 1, 1, 0,
                                        &decision) == 0);
         CHECK(decision.action ==
               UM_TRAFFIC_POLICY_REJECT_BACKGROUND_DNS);
@@ -190,7 +197,25 @@ static void test_quiet_traffic_policy(void)
     }
     query_length = make_policy_dns_query(query, sizeof(query),
                                          "news-edge.apple.com", 1u);
-    CHECK(um_traffic_policy_decide(query, query_length, 1, 0, &decision) ==
+    for (index = 0u;
+         index < sizeof(messages_allowed) / sizeof(messages_allowed[0]);
+         ++index) {
+        query_length = make_policy_dns_query(query, sizeof(query),
+                                             messages_allowed[index], 1u);
+        CHECK(query_length != 0u);
+        CHECK(um_traffic_policy_decide(query, query_length, 1, 1, 1,
+                                       &decision) == 0);
+        CHECK(decision.action == UM_TRAFFIC_POLICY_PASS);
+    }
+    query_length = make_policy_dns_query(query, sizeof(query),
+                                         "news-edge.apple.com", 1u);
+    CHECK(um_traffic_policy_decide(query, query_length, 1, 1, 1,
+                                   &decision) == 0);
+    CHECK(decision.action == UM_TRAFFIC_POLICY_REJECT_BACKGROUND_DNS);
+
+    query_length = make_policy_dns_query(query, sizeof(query),
+                                         "news-edge.apple.com", 1u);
+    CHECK(um_traffic_policy_decide(query, query_length, 1, 0, 0, &decision) ==
           0);
     CHECK(decision.action == UM_TRAFFIC_POLICY_PASS);
     CHECK(um_traffic_policy_build_dns_rejection(
@@ -215,7 +240,7 @@ static void test_quiet_traffic_policy(void)
                                          "example.com", 1u);
     policy_write_u16(&query[22], 443u);
     policy_finalize_ipv4_udp(query, query_length);
-    CHECK(um_traffic_policy_decide(query, query_length, 1, 0, &decision) ==
+    CHECK(um_traffic_policy_decide(query, query_length, 1, 0, 0, &decision) ==
           0);
     CHECK(decision.action == UM_TRAFFIC_POLICY_REJECT_QUIC);
     CHECK(um_traffic_policy_build_port_unreachable(
@@ -236,7 +261,7 @@ static void test_quiet_traffic_policy(void)
         query, sizeof(query), "b._dns-sd._udp.0.0.77.10.in-addr.arpa", 12u);
     CHECK(um_traffic_policy_is_tunnel_discovery_dns(query, query_length) !=
           0);
-    CHECK(um_traffic_policy_decide(query, query_length, 1, 1, &decision) ==
+    CHECK(um_traffic_policy_decide(query, query_length, 1, 1, 0, &decision) ==
           0);
     CHECK(decision.action == UM_TRAFFIC_POLICY_REJECT_BACKGROUND_DNS);
 }

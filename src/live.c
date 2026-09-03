@@ -3460,6 +3460,7 @@ static int drain_proxy_ingress(live_context *context,
                     packet, packet_length,
                     context->options.role == UM_LIVE_CLIENT,
                     context->options.filter_background_traffic,
+                    context->options.allow_messages_traffic,
                     &decision) != 0) {
                 return UM_ERR_HEADER;
             }
@@ -5176,6 +5177,7 @@ um_live_audio_options um_live_audio_default_options(um_live_role role)
     options.calibration_path = "calibration.config";
     options.proxy_test_packets = 0u;
     options.filter_background_traffic = 1;
+    options.allow_messages_traffic = 0;
     return options;
 }
 
@@ -5255,9 +5257,11 @@ int um_run_live_audio(const um_live_audio_options *options,
              options->test_bytes, options->chunk_bytes,
              options->retry_limit, LIVE_TURNAROUND_MS);
     if (options->link_test == 0) {
-        live_log(&context, "Quiet-link firewall=%s",
+        live_log(&context, "Quiet-link firewall=%s messages=%s",
                  options->filter_background_traffic != 0 ? "enabled"
-                                                         : "disabled");
+                                                         : "disabled",
+                 options->allow_messages_traffic != 0 ? "allowed"
+                                                      : "blocked");
     }
     live_log(&context,
              "Bootstrap qam=%u fec=%s cp=%u window=%u repeats=%u training=%u "

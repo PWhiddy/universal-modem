@@ -10,7 +10,8 @@
  * --------------------------
  * This is the single list of service-specific traffic suppressed before it
  * reaches the acoustic queue. Rules match a domain itself and its subdomains.
- * An explicit iMessage/APNs allow list is checked first.
+ * Certificate-validation exceptions are always checked first.  The APNs and
+ * iMessage identity paths have a separate, explicit opt-in exception.
  *
  * Apple service descriptions and APNs requirements:
  *   https://support.apple.com/en-us/101555
@@ -47,6 +48,16 @@ static const quiet_domain_rule imessage_allow_rules[] = {
     {"ocsp.apple.com", "Apple certificate validation"},
     {"ocsp2.apple.com", "Apple certificate validation"},
     {"valid.apple.com", "Apple certificate validation"}
+};
+
+/* Opt-in exception to the temporary Apple deny rules below.  Keep this list
+ * limited to the APNs transport and ESS identity paths needed by Messages. */
+static const quiet_domain_rule messages_opt_in_rules[] = {
+    {"push.apple.com", "Apple Push Notification service"},
+    {"push-apple.com.akadns.net", "APNs load-balancing alias"},
+    {"ess.apple.com", "observed iMessage identity/query service"},
+    {"ess-apple.com.akadns.net", "observed iMessage service alias"},
+    {"ess.g.aaplimg.com", "observed iMessage service CDN alias"}
 };
 
 static const quiet_domain_rule quiet_block_rules[] = {
@@ -312,7 +323,8 @@ static int parse_dns(const uint8_t *packet, size_t length, int query_only,
     return 1;
 }
 
-static const quiet_domain_rule *blocked_dns_rule(const char *name)
+static const quiet_domain_rule *blocked_dns_rule(const char *name,
+                                                 int allow_messages)
 {
     size_t index;
     for (index = 0u;
@@ -320,6 +332,17 @@ static const quiet_domain_rule *blocked_dns_rule(const char *name)
          ++index) {
         if (domain_matches(name, imessage_allow_rules[index].domain) != 0) {
             return NULL;
+        }
+    }
+    if (allow_messages != 0) {
+        for (index = 0u;
+             index < sizeof(messages_opt_in_rules) /
+                         sizeof(messages_opt_in_rules[0]);
+             ++index) {
+            if (domain_matches(name,
+                               messages_opt_in_rules[index].domain) != 0) {
+                return NULL;
+            }
         }
     }
     if (domain_matches(name, "0.77.10.in-addr.arpa") != 0) {
@@ -411,6 +434,7 @@ static int destination_port(const uint8_t *packet, size_t length,
 
 int um_traffic_policy_decide(const uint8_t *packet, size_t packet_length,
                              int client_outbound, int quiet_background,
+                             int allow_messages,
                              um_traffic_policy_decision *decision)
 {
     const quiet_domain_rule *rule;
@@ -448,7 +472,7 @@ int um_traffic_policy_decide(const uint8_t *packet, size_t packet_length,
     if (parse_dns(packet, packet_length, 1, decision->dns_name,
                   sizeof(decision->dns_name), &decision->dns_type,
                   NULL) != 0) {
-        rule = blocked_dns_rule(decision->dns_name);
+        rule = blocked_dns_rule(decision->dns_name, allow_messages);
         if (rule != NULL) {
             decision->action = UM_TRAFFIC_POLICY_REJECT_BACKGROUND_DNS;
             decision->rule = rule->reason;

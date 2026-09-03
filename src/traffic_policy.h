@@ -25,6 +25,7 @@ typedef struct {
 
 int um_traffic_policy_decide(const uint8_t *packet, size_t packet_length,
                              int client_outbound, int quiet_background,
+                             int allow_messages,
                              um_traffic_policy_decision *decision);
 int um_traffic_policy_build_dns_rejection(
     const uint8_t *query, size_t query_length, uint8_t *response,
