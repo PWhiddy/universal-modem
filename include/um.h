@@ -10,6 +10,8 @@ extern "C" {
 
 #define UM_SAMPLE_RATE 48000u
 #define UM_FFT_SIZE 2048u
+#define UM_LIGHT_GRID_SIZE 48u
+#define UM_LIGHT_MAX_PAYLOAD 91u
 
 typedef struct {
     float re;
@@ -173,6 +175,37 @@ typedef struct {
     float simulated_seconds;
 } um_distortion_ladder_result;
 
+typedef struct {
+    float x;
+    float y;
+} um_light_point;
+
+/* Pixel levels and noise are normalized to [0, 1].  Corners are pixel
+ * coordinates in top-left, top-right, bottom-right, bottom-left order. */
+typedef struct {
+    size_t image_width;
+    size_t image_height;
+    um_light_point corners[4];
+    float black_level;
+    float white_level;
+    float noise_stddev;
+    unsigned blur_radius;
+    float occlusion_x;
+    float occlusion_y;
+    float occlusion_width;
+    float occlusion_height;
+    uint32_t random_seed;
+} um_light_channel_config;
+
+typedef struct {
+    um_light_point corners[4];
+    float threshold;
+    float contrast;
+    float image_coverage;
+    float corrected_bit_fraction;
+    unsigned orientation;
+} um_light_rx_metrics;
+
 typedef enum {
     UM_LIVE_GATEWAY = 1,
     UM_LIVE_CLIENT = 2
@@ -248,6 +281,21 @@ int um_run_calibration_distortion_ladder(
 int um_run_session_distortion_ladder(
     int high_quality, um_distortion_ladder_result *result,
     um_log_callback logger, void *logger_context);
+
+um_light_channel_config um_light_channel_default_config(void);
+int um_light_encode_frame(uint8_t frame_type, uint32_t session_id,
+                          uint32_t sequence, const uint8_t *payload,
+                          size_t payload_length, uint8_t *modules,
+                          size_t module_capacity);
+int um_light_render_frame(const uint8_t *modules, size_t module_count,
+                          const um_light_channel_config *config,
+                          uint8_t **pixels, size_t *pixel_count);
+int um_light_decode_frame(const uint8_t *pixels, size_t width, size_t height,
+                          size_t stride, uint8_t *frame_type,
+                          uint32_t *session_id, uint32_t *sequence,
+                          uint8_t *payload, size_t payload_capacity,
+                          size_t *payload_length,
+                          um_light_rx_metrics *metrics);
 
 int um_audio_list_devices(um_log_callback logger, void *logger_context);
 um_live_audio_options um_live_audio_default_options(um_live_role role);

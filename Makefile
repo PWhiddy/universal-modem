@@ -27,6 +27,7 @@ LIB_SOURCES := \
 	src/fec.c \
 	src/fft.c \
 	src/interleave.c \
+	src/light.c \
 	src/live.c \
 	src/live_wire.c \
 	src/modem.c \
@@ -55,8 +56,13 @@ test_live_audio: tests/test_live_audio.o $(SIM_LIB_OBJECTS)
 test_tcp_relay: tests/test_tcp_relay.o src/network.o src/tcp_relay.o
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
-test check: test_modem test_live_audio test_tcp_relay
+test_light: tests/test_light.o src/light.o src/crc.o src/fec.o \
+	src/interleave.o
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+test check: test_modem test_light test_live_audio test_tcp_relay
 	./test_modem
+	./test_light
 	./test_live_audio
 	./test_tcp_relay
 
@@ -73,5 +79,5 @@ tests/test_live_audio.o: src/audio.h
 
 clean:
 	rm -f $(LIB_OBJECTS) src/main.o tests/test_modem.o tests/test_live_audio.o \
-		tests/test_tcp_relay.o universal-modem test_modem test_live_audio \
-		test_tcp_relay
+		tests/test_light.o tests/test_tcp_relay.o universal-modem test_modem \
+		test_light test_live_audio test_tcp_relay

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static void usage(FILE *stream)
 {
@@ -12,6 +13,7 @@ static void usage(FILE *stream)
             "Usage:\n"
             "  universal-modem --simulate [--qam 4|16|64] "
             "[--fec 1/2|2/3|3/4] [--noise LEVEL]\n"
+            "  universal-modem --light --simulate [--noise LEVEL]\n"
             "  universal-modem --calibrate [--calib-high]\n"
             "  universal-modem --session-sim [--calib-high]\n"
             "  universal-modem --list-audio\n"
@@ -28,7 +30,12 @@ static void usage(FILE *stream)
             "  --calib-high         Use the extended real-audio calibration\n"
             "  --allow-background   Disable the default quiet-link firewall\n"
             "  --allow-messages     Allow Messages/APNs through that firewall\n"
-            "  calibration.config  Auto-loaded/saved; delete it to recalibrate\n");
+            "  calibration.config  Auto-loaded/saved; delete it to recalibrate\n"
+            "\nLight options:\n"
+            "  --light              Select the optical medium\n"
+            "  --simulate           Exercise perspective/noise encode/decode\n"
+            "  --noise LEVEL        Normalized camera noise (0.0 to 1.0)\n"
+            "  live camera/window mode is not implemented yet\n");
 }
 
 static void print_log(void *context, const char *message)
@@ -169,6 +176,79 @@ done:
     return status == UM_OK ? 0 : 1;
 }
 
+static int run_light_simulation(float noise, int noise_was_set)
+{
+    static const uint8_t message[] =
+        "Universal Modem: perspective optical loopback is operational.";
+    uint8_t modules[UM_LIGHT_GRID_SIZE * UM_LIGHT_GRID_SIZE];
+    uint8_t decoded[UM_LIGHT_MAX_PAYLOAD];
+    uint8_t *pixels = NULL;
+    size_t pixel_count = 0u;
+    size_t decoded_length = 0u;
+    uint8_t frame_type = 0u;
+    uint32_t session_id = 0u;
+    uint32_t sequence = 0u;
+    um_light_channel_config channel = um_light_channel_default_config();
+    um_light_rx_metrics metrics;
+    clock_t decode_start;
+    clock_t decode_end;
+    double decode_ms;
+    int status;
+
+    if (noise_was_set != 0) {
+        channel.noise_stddev = noise;
+    }
+    status = um_light_encode_frame(
+        1u, UINT32_C(0x4c494748), UINT32_C(1), message,
+        sizeof(message) - 1u, modules, sizeof(modules));
+    if (status != UM_OK) {
+        fprintf(stderr, "light encoding failed: %s\n",
+                um_status_string(status));
+        return 1;
+    }
+    status = um_light_render_frame(
+        modules, sizeof(modules), &channel, &pixels, &pixel_count);
+    if (status != UM_OK) {
+        fprintf(stderr, "light channel simulation failed: %s\n",
+                um_status_string(status));
+        return 1;
+    }
+    decode_start = clock();
+    status = um_light_decode_frame(
+        pixels, channel.image_width, channel.image_height,
+        channel.image_width, &frame_type, &session_id, &sequence, decoded,
+        sizeof(decoded), &decoded_length, &metrics);
+    decode_end = clock();
+    free(pixels);
+    if (status != UM_OK) {
+        fprintf(stderr, "light decoding failed: %s\n",
+                um_status_string(status));
+        return 1;
+    }
+    if (decoded_length != sizeof(message) - 1u ||
+        memcmp(decoded, message, decoded_length) != 0) {
+        fprintf(stderr, "light simulation decoded the wrong payload\n");
+        return 1;
+    }
+
+    decode_ms = 1000.0 * (double)(decode_end - decode_start) /
+                (double)CLOCKS_PER_SEC;
+    printf("light decoded type=%u session=%08x sequence=%u bytes=%zu\n",
+           (unsigned)frame_type, session_id, sequence, decoded_length);
+    printf("grid=%ux%u image=%zux%zu coverage=%.1f%% contrast=%.1f%% "
+           "corrected=%.2f%% orientation=%u decode=%.1fms\n",
+           UM_LIGHT_GRID_SIZE, UM_LIGHT_GRID_SIZE, channel.image_width,
+           channel.image_height, 100.0f * metrics.image_coverage,
+           100.0f * metrics.contrast,
+           100.0f * metrics.corrected_bit_fraction, metrics.orientation,
+           decode_ms);
+    printf("rate-1/2 payload-capacity=%uB nominal@15fps=%.1fkbps\n",
+           UM_LIGHT_MAX_PAYLOAD,
+           (double)UM_LIGHT_MAX_PAYLOAD * 8.0 * 15.0 / 1000.0);
+    printf("payload: %.*s\n", (int)decoded_length, (const char *)decoded);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     um_modem_config config = um_modem_default_config();
@@ -178,12 +258,14 @@ int main(int argc, char **argv)
     int session_simulation = 0;
     int high_quality = 0;
     int audio = 0;
+    int light = 0;
     int link_test = 0;
     int allow_background = 0;
     int allow_messages = 0;
     int endpoint = 0;
     int list_audio = 0;
     int noise_was_set = 0;
+    int modem_option_was_set = 0;
     const char *input_device = "default";
     const char *output_device = "default";
     size_t test_bytes = 1024u;
@@ -201,7 +283,17 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--calib-high") == 0) {
             high_quality = 1;
         } else if (strcmp(argv[i], "--audio") == 0) {
+            if (light != 0) {
+                fprintf(stderr, "choose exactly one of --audio or --light\n");
+                return 2;
+            }
             audio = 1;
+        } else if (strcmp(argv[i], "--light") == 0) {
+            if (audio != 0) {
+                fprintf(stderr, "choose exactly one of --audio or --light\n");
+                return 2;
+            }
+            light = 1;
         } else if (strcmp(argv[i], "--link-test") == 0) {
             link_test = 1;
         } else if (strcmp(argv[i], "--allow-background") == 0) {
@@ -260,11 +352,13 @@ int main(int argc, char **argv)
                 fprintf(stderr, "invalid QAM order\n");
                 return 2;
             }
+            modem_option_was_set = 1;
         } else if (strcmp(argv[i], "--fec") == 0 && i + 1 < argc) {
             if (!parse_fec(argv[++i], &config.fec_rate)) {
                 fprintf(stderr, "invalid FEC rate\n");
                 return 2;
             }
+            modem_option_was_set = 1;
         } else if (strcmp(argv[i], "--noise") == 0 && i + 1 < argc) {
             char *end = NULL;
             noise = strtof(argv[++i], &end);
@@ -285,6 +379,10 @@ int main(int argc, char **argv)
     }
 
     if (list_audio != 0) {
+        if (light != 0) {
+            fprintf(stderr, "--list-audio cannot be combined with --light\n");
+            return 2;
+        }
         int status = um_network_prepare_audio_user(print_log, stdout);
         if (status != UM_OK) {
             fprintf(stderr, "could not select the invoking user for audio\n");
@@ -294,10 +392,19 @@ int main(int argc, char **argv)
         return status == UM_OK ? 0 : 1;
     }
 
-    if (simulate != 0 && audio == 0 && endpoint == 0) {
+    if (simulate != 0 && calibrate == 0 && session_simulation == 0 &&
+        endpoint == 0 && light != 0) {
+        if (modem_option_was_set != 0 || high_quality != 0) {
+            fprintf(stderr,
+                    "--qam, --fec, and --calib-high are audio-only\n");
+            return 2;
+        }
+        return run_light_simulation(noise, noise_was_set);
+    }
+    if (simulate != 0 && endpoint == 0 && light == 0) {
         return run_simulation(config, noise);
     }
-    if (calibrate != 0 && simulate == 0 && audio == 0 && endpoint == 0) {
+    if (calibrate != 0 && simulate == 0 && light == 0 && endpoint == 0) {
         if (noise_was_set != 0) {
             fprintf(stderr,
                     "--noise applies to --simulate; calibration uses the "
@@ -307,7 +414,7 @@ int main(int argc, char **argv)
         return run_calibration(high_quality);
     }
     if (session_simulation != 0 && simulate == 0 && calibrate == 0 &&
-        audio == 0 && endpoint == 0) {
+        light == 0 && endpoint == 0) {
         if (noise_was_set != 0) {
             fprintf(stderr,
                     "--noise applies to --simulate; session simulation uses "
@@ -320,7 +427,14 @@ int main(int argc, char **argv)
         session_simulation == 0) {
         um_live_audio_options options = um_live_audio_default_options(
             endpoint == 1 ? UM_LIVE_GATEWAY : UM_LIVE_CLIENT);
-        int status = um_network_prepare_audio_user(print_log, stdout);
+        int status;
+        if (light != 0) {
+            fprintf(stderr,
+                    "live light camera/window mode is not implemented yet; "
+                    "use --light --simulate\n");
+            return 1;
+        }
+        status = um_network_prepare_audio_user(print_log, stdout);
         if (status != UM_OK) {
             fprintf(stderr, "could not select the invoking user for audio\n");
             return 1;

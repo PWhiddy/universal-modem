@@ -2,6 +2,7 @@
 *.wav
 test_modem
 test_live_audio
+test_light
 test_tcp_relay
 universal-modem
 calibration.config
