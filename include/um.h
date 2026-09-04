@@ -12,6 +12,7 @@ extern "C" {
 #define UM_FFT_SIZE 2048u
 #define UM_LIGHT_GRID_SIZE 48u
 #define UM_LIGHT_MAX_PAYLOAD 91u
+#define UM_LIGHT_MAX_PACKET 2048u
 
 typedef struct {
     float re;
@@ -295,6 +296,12 @@ typedef struct {
 } um_light_peer_config;
 
 typedef struct {
+    um_light_peer_config link;
+    unsigned max_packet_bytes;
+    size_t queue_packets;
+} um_light_packet_peer_config;
+
+typedef struct {
     int present;
     uint8_t type;
     uint32_t session_id;
@@ -314,15 +321,23 @@ typedef struct {
     size_t link_timeouts;
     size_t outgoing_bytes_acked;
     size_t incoming_bytes_received;
+    size_t outgoing_packets_accepted;
+    size_t outgoing_packets_queued;
+    size_t incoming_packets_received;
+    size_t incoming_packets_queued;
+    size_t outgoing_cells_in_flight;
     int connected;
 } um_light_peer_status;
 
 typedef struct {
     um_live_role role;
     const char *camera_device;
+    int link_test;
     size_t test_bytes;
     unsigned window_size;
     unsigned completion_linger_frames;
+    int filter_background_traffic;
+    int allow_messages_traffic;
 } um_live_light_options;
 
 typedef struct {
@@ -419,6 +434,7 @@ int um_simulate_light_session(
     void *logger_context);
 
 um_light_peer_config um_light_peer_default_config(void);
+um_light_packet_peer_config um_light_packet_peer_default_config(void);
 int um_light_peer_create(um_light_peer **peer, um_live_role role,
                          const um_light_peer_config *config,
                          const uint8_t *outgoing, size_t outgoing_length,
@@ -432,6 +448,15 @@ int um_light_peer_process(um_light_peer *peer, size_t local_frame,
 int um_light_peer_complete(const um_light_peer *peer);
 void um_light_peer_get_status(const um_light_peer *peer,
                               um_light_peer_status *status);
+int um_light_packet_peer_create(
+    um_light_peer **peer, um_live_role role,
+    const um_light_packet_peer_config *config, um_log_callback logger,
+    void *logger_context);
+int um_light_peer_enqueue_packet(um_light_peer *peer,
+                                 const uint8_t *packet,
+                                 size_t packet_length);
+int um_light_peer_dequeue_packet(um_light_peer *peer, uint8_t *packet,
+                                 size_t capacity, size_t *packet_length);
 
 um_light_network_simulation_config
 um_light_network_simulation_default_config(void);

@@ -1,4 +1,5 @@
 #include "um_internal.h"
+#include "light_packet.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -88,6 +89,7 @@ typedef struct {
     double gateway_to_client_correction_sum;
     light_stream client_to_gateway;
     light_stream gateway_to_client;
+    light_packet_transport *packet_transport;
 } light_session;
 
 struct um_light_peer {
@@ -403,7 +405,8 @@ static int light_stream_select(light_session *session, light_stream *stream,
     return 0;
 }
 
-static void light_build_control(light_outbound_frame *frame, uint8_t type,
+static void light_build_control(const light_session *session,
+                                light_outbound_frame *frame, uint8_t type,
                                 uint32_t session_id, uint32_t sequence)
 {
     memset(frame, 0, sizeof(*frame));
@@ -411,7 +414,16 @@ static void light_build_control(light_outbound_frame *frame, uint8_t type,
     frame->session_id = session_id;
     frame->sequence = sequence;
     frame->payload[0] = LIGHT_SESSION_VERSION;
-    frame->payload_length = 1u;
+    if (session->packet_transport != NULL) {
+        frame->payload[1] = LIGHT_PACKET_MODE;
+        light_session_write_u16(
+            &frame->payload[2],
+            (uint16_t)light_packet_transport_max_packet(
+                session->packet_transport));
+        frame->payload_length = 4u;
+    } else {
+        frame->payload_length = 1u;
+    }
 }
 
 static void light_build_stream_frame(light_session *session,
@@ -424,6 +436,26 @@ static void light_build_stream_frame(light_session *session,
     size_t sequence = 0u;
     int retransmission = 0;
     memset(frame, 0, sizeof(*frame));
+    if (session->packet_transport != NULL) {
+        int has_data = 0;
+        light_packet_transport_build(
+            session->packet_transport, session->frame, &frame->sequence,
+            frame->payload, &frame->payload_length, &has_data,
+            &retransmission);
+        frame->session_id = session_id;
+        frame->type = has_data != 0 ? LIGHT_FRAME_DATA : LIGHT_FRAME_ACK;
+        if (has_data != 0) {
+            ++session->result->data_frames;
+        } else {
+            ++session->result->acknowledgement_frames;
+        }
+        if (retransmission != 0) {
+            ++session->result->retransmissions;
+            light_session_log(session, "%s retransmit DATA seq=%u",
+                              sender_name, frame->sequence);
+        }
+        return;
+    }
     light_stream_write_ack(receive, frame->payload);
     frame->session_id = session_id;
     if (light_stream_select(session, transmit, &sequence,
@@ -461,12 +493,12 @@ static void light_build_client_frame(light_session *session,
                                      light_outbound_frame *frame)
 {
     if (session->client_phase == LIGHT_CLIENT_DISCOVER) {
-        light_build_control(frame, LIGHT_FRAME_DISCOVER,
+        light_build_control(session, frame, LIGHT_FRAME_DISCOVER,
                             session->client_session_id,
                             (uint32_t)session->frame);
         ++session->result->handshake_frames;
     } else if (session->client_phase == LIGHT_CLIENT_CONFIRM) {
-        light_build_control(frame, LIGHT_FRAME_CONFIRM,
+        light_build_control(session, frame, LIGHT_FRAME_CONFIRM,
                             session->client_session_id,
                             (uint32_t)session->frame);
         ++session->result->handshake_frames;
@@ -482,15 +514,15 @@ static void light_build_gateway_frame(light_session *session,
                                       light_outbound_frame *frame)
 {
     if (session->gateway_phase == LIGHT_GATEWAY_LISTENING) {
-        light_build_control(frame, LIGHT_FRAME_IDLE, 0u,
+        light_build_control(session, frame, LIGHT_FRAME_IDLE, 0u,
                             (uint32_t)session->frame);
     } else if (session->gateway_phase == LIGHT_GATEWAY_OFFER) {
-        light_build_control(frame, LIGHT_FRAME_OFFER,
+        light_build_control(session, frame, LIGHT_FRAME_OFFER,
                             session->gateway_session_id,
                             (uint32_t)session->frame);
         ++session->result->handshake_frames;
     } else if (session->gateway_phase == LIGHT_GATEWAY_READY) {
-        light_build_control(frame, LIGHT_FRAME_READY,
+        light_build_control(session, frame, LIGHT_FRAME_READY,
                             session->gateway_session_id,
                             (uint32_t)session->frame);
         ++session->result->handshake_frames;
@@ -615,10 +647,21 @@ static int light_deliver_frame(light_session *session,
     return UM_OK;
 }
 
-static int light_control_valid(const light_received_frame *frame)
+static int light_control_valid(const light_session *session,
+                               const light_received_frame *frame)
 {
-    return frame->payload_length == 1u &&
-           frame->payload[0] == LIGHT_SESSION_VERSION;
+    if (frame->payload_length == 0u ||
+        frame->payload[0] != LIGHT_SESSION_VERSION) {
+        return 0;
+    }
+    if (session->packet_transport == NULL) {
+        return frame->payload_length == 1u;
+    }
+    return frame->payload_length == 4u &&
+           frame->payload[1] == LIGHT_PACKET_MODE &&
+           light_session_read_u16(&frame->payload[2]) ==
+               light_packet_transport_max_packet(
+                   session->packet_transport);
 }
 
 static int light_process_stream_frame(light_session *session,
@@ -626,6 +669,22 @@ static int light_process_stream_frame(light_session *session,
                                       light_stream *received_stream,
                                       light_stream *acknowledged_stream)
 {
+    if (session->packet_transport != NULL) {
+        light_packet_transport_status packet_status;
+        int packet_result;
+        if (frame->type != LIGHT_FRAME_DATA &&
+            frame->type != LIGHT_FRAME_ACK) {
+            return UM_ERR_HEADER;
+        }
+        packet_result = light_packet_transport_process(
+            session->packet_transport, frame->sequence, frame->payload,
+            frame->payload_length, frame->type == LIGHT_FRAME_DATA);
+        light_packet_transport_get_status(session->packet_transport,
+                                          &packet_status);
+        session->result->duplicate_data_frames =
+            packet_status.duplicate_cells;
+        return packet_result;
+    }
     int status = light_stream_apply_ack(acknowledged_stream,
                                         frame->payload,
                                         frame->payload_length);
@@ -672,7 +731,8 @@ static void light_process_gateway_receive(light_session *session,
         return;
     }
     if (frame->type == LIGHT_FRAME_DISCOVER &&
-        frame->session_id != 0u && light_control_valid(frame) != 0) {
+        frame->session_id != 0u &&
+        light_control_valid(session, frame) != 0) {
         /*
          * A client starts a new session after its own receive timeout.  Do
          * not let that unilaterally replace a session that the gateway still
@@ -703,7 +763,7 @@ static void light_process_gateway_receive(light_session *session,
     }
     if (session->gateway_phase == LIGHT_GATEWAY_OFFER &&
         frame->type == LIGHT_FRAME_CONFIRM &&
-        light_control_valid(frame) != 0) {
+        light_control_valid(session, frame) != 0) {
         session->gateway_phase = LIGHT_GATEWAY_READY;
         session->gateway_last_receive = session->frame;
         session->gateway_has_received = 1;
@@ -732,7 +792,7 @@ static void light_process_gateway_receive(light_session *session,
     }
     if (session->gateway_phase == LIGHT_GATEWAY_READY &&
         frame->type == LIGHT_FRAME_CONFIRM &&
-        light_control_valid(frame) != 0) {
+        light_control_valid(session, frame) != 0) {
         session->gateway_last_receive = session->frame;
         session->gateway_has_received = 1;
     }
@@ -749,7 +809,7 @@ static void light_process_client_receive(light_session *session,
     if ((session->client_phase == LIGHT_CLIENT_DISCOVER ||
          session->client_phase == LIGHT_CLIENT_CONFIRM) &&
         frame->type == LIGHT_FRAME_OFFER &&
-        light_control_valid(frame) != 0) {
+        light_control_valid(session, frame) != 0) {
         if (session->client_phase != LIGHT_CLIENT_CONFIRM) {
             light_session_log(session, "client accepted OFFER");
         }
@@ -760,7 +820,7 @@ static void light_process_client_receive(light_session *session,
     }
     if (session->client_phase == LIGHT_CLIENT_CONFIRM &&
         frame->type == LIGHT_FRAME_READY &&
-        light_control_valid(frame) != 0) {
+        light_control_valid(session, frame) != 0) {
         session->client_phase = LIGHT_CLIENT_CONNECTED;
         session->client_last_receive = session->frame;
         session->client_has_received = 1;
@@ -789,7 +849,7 @@ static void light_process_client_receive(light_session *session,
     }
     if (session->client_phase == LIGHT_CLIENT_CONNECTED &&
         frame->type == LIGHT_FRAME_READY &&
-        light_control_valid(frame) != 0) {
+        light_control_valid(session, frame) != 0) {
         session->client_last_receive = session->frame;
         session->client_has_received = 1;
     }
@@ -983,6 +1043,7 @@ void um_light_peer_destroy(um_light_peer *peer)
     if (peer == NULL) {
         return;
     }
+    light_packet_transport_destroy(peer->session.packet_transport);
     light_stream_destroy(&peer->session.gateway_to_client);
     light_stream_destroy(&peer->session.client_to_gateway);
     free(peer);
@@ -1063,6 +1124,9 @@ int um_light_peer_complete(const um_light_peer *peer)
     if (peer == NULL) {
         return 0;
     }
+    if (peer->session.packet_transport != NULL) {
+        return 0;
+    }
     if (peer->role == UM_LIVE_CLIENT) {
         return peer->session.client_phase == LIGHT_CLIENT_CONNECTED &&
                light_stream_sender_done(
@@ -1087,6 +1151,39 @@ void um_light_peer_get_status(const um_light_peer *peer,
     if (peer == NULL) {
         return;
     }
+    if (peer->session.packet_transport != NULL) {
+        light_packet_transport_status packet_status;
+        light_packet_transport_get_status(peer->session.packet_transport,
+                                          &packet_status);
+        status->handshake_frames = peer->result.handshake_frames;
+        status->data_frames = peer->result.data_frames;
+        status->acknowledgement_frames =
+            peer->result.acknowledgement_frames;
+        status->retransmissions = packet_status.retransmissions;
+        status->duplicate_data_frames = packet_status.duplicate_cells;
+        status->protocol_rejections = peer->result.protocol_rejections;
+        status->reconnects = peer->result.reconnects;
+        status->link_timeouts = peer->result.link_timeouts;
+        status->outgoing_bytes_acked =
+            packet_status.packet_bytes_acked;
+        status->incoming_bytes_received =
+            packet_status.packet_bytes_received;
+        status->outgoing_packets_accepted =
+            packet_status.outgoing_packets_accepted;
+        status->outgoing_packets_queued =
+            packet_status.outgoing_packets_queued;
+        status->incoming_packets_received =
+            packet_status.incoming_packets_received;
+        status->incoming_packets_queued =
+            packet_status.incoming_packets_queued;
+        status->outgoing_cells_in_flight =
+            packet_status.outgoing_cells_in_flight;
+        status->connected =
+            peer->role == UM_LIVE_CLIENT
+                ? peer->session.client_phase == LIGHT_CLIENT_CONNECTED
+                : peer->session.gateway_phase == LIGHT_GATEWAY_CONNECTED;
+        return;
+    }
     outgoing = peer->role == UM_LIVE_CLIENT
                    ? &peer->session.client_to_gateway
                    : &peer->session.gateway_to_client;
@@ -1107,6 +1204,68 @@ void um_light_peer_get_status(const um_light_peer *peer,
         peer->role == UM_LIVE_CLIENT
             ? peer->session.client_phase == LIGHT_CLIENT_CONNECTED
             : peer->session.gateway_phase == LIGHT_GATEWAY_CONNECTED;
+}
+
+um_light_packet_peer_config um_light_packet_peer_default_config(void)
+{
+    um_light_packet_peer_config config;
+    config.link = um_light_peer_default_config();
+    config.max_packet_bytes = 1500u;
+    config.queue_packets = 64u;
+    return config;
+}
+
+int um_light_packet_peer_create(
+    um_light_peer **peer, um_live_role role,
+    const um_light_packet_peer_config *config, um_log_callback logger,
+    void *logger_context)
+{
+    um_light_peer *created = NULL;
+    int status;
+    if (peer == NULL || config == NULL ||
+        config->max_packet_bytes == 0u ||
+        config->max_packet_bytes > UM_LIGHT_MAX_PACKET) {
+        return UM_ERR_ARGUMENT;
+    }
+    *peer = NULL;
+    status = um_light_peer_create(&created, role, &config->link, NULL, 0u,
+                                  NULL, 0u, logger, logger_context);
+    if (status != UM_OK) {
+        return status;
+    }
+    status = light_packet_transport_create(
+        &created->session.packet_transport, config->max_packet_bytes,
+        config->queue_packets, config->link.transmit_window,
+        config->link.retransmit_after_frames,
+        config->link.random_seed ^ (uint32_t)role);
+    if (status != UM_OK) {
+        um_light_peer_destroy(created);
+        return status;
+    }
+    *peer = created;
+    return UM_OK;
+}
+
+int um_light_peer_enqueue_packet(um_light_peer *peer,
+                                 const uint8_t *packet,
+                                 size_t packet_length)
+{
+    if (peer == NULL || peer->session.packet_transport == NULL) {
+        return UM_ERR_ARGUMENT;
+    }
+    return light_packet_transport_enqueue(peer->session.packet_transport,
+                                          packet, packet_length);
+}
+
+int um_light_peer_dequeue_packet(um_light_peer *peer, uint8_t *packet,
+                                 size_t capacity, size_t *packet_length)
+{
+    if (peer == NULL || peer->session.packet_transport == NULL) {
+        return UM_ERR_ARGUMENT;
+    }
+    return light_packet_transport_dequeue(peer->session.packet_transport,
+                                          packet, capacity,
+                                          packet_length);
 }
 
 int um_light_simulate_payloads(

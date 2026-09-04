@@ -61,7 +61,7 @@ static struct {
     uid_t uid;
     gid_t gid;
     int active;
-} linux_audio_user;
+} linux_worker_user;
 #endif
 
 struct um_network {
@@ -139,7 +139,7 @@ static int parse_sudo_id(const char *text, unsigned long *value)
 
 static int linux_enter_network_privilege(void)
 {
-    if (linux_audio_user.active == 0) {
+    if (linux_worker_user.active == 0) {
         return UM_OK;
     }
     if (setresuid(0, 0, 0) != 0 || setresgid(0, 0, 0) != 0) {
@@ -150,19 +150,19 @@ static int linux_enter_network_privilege(void)
 
 static int linux_leave_network_privilege(void)
 {
-    if (linux_audio_user.active == 0) {
+    if (linux_worker_user.active == 0) {
         return UM_OK;
     }
-    if (setresgid(linux_audio_user.gid, linux_audio_user.gid, 0) != 0 ||
-        setresuid(linux_audio_user.uid, linux_audio_user.uid, 0) != 0) {
+    if (setresgid(linux_worker_user.gid, linux_worker_user.gid, 0) != 0 ||
+        setresuid(linux_worker_user.uid, linux_worker_user.uid, 0) != 0) {
         return UM_ERR_NETWORK;
     }
     return UM_OK;
 }
 #endif
 
-int um_network_prepare_audio_user(um_log_callback logger,
-                                  void *logger_context)
+int um_network_prepare_worker_user(um_log_callback logger,
+                                   void *logger_context)
 {
 #if defined(__linux__)
     const char *uid_text;
@@ -217,18 +217,18 @@ int um_network_prepare_audio_user(um_log_callback logger,
         return UM_ERR_NETWORK;
     }
     (void)snprintf(line, sizeof(line),
-                   "Audio/modem running as %s uid=%lu; root is used only "
+                   "Modem worker running as %s uid=%lu; root is used only "
                    "for network setup and cleanup",
                    username, uid_value);
     if (initgroups(username, (gid_t)gid_value) != 0) {
         return UM_ERR_NETWORK;
     }
 
-    linux_audio_user.uid = (uid_t)uid_value;
-    linux_audio_user.gid = (gid_t)gid_value;
-    linux_audio_user.active = 1;
+    linux_worker_user.uid = (uid_t)uid_value;
+    linux_worker_user.gid = (gid_t)gid_value;
+    linux_worker_user.active = 1;
     if (linux_leave_network_privilege() != UM_OK) {
-        linux_audio_user.active = 0;
+        linux_worker_user.active = 0;
         return UM_ERR_NETWORK;
     }
     if (logger != NULL) {

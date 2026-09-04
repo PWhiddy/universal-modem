@@ -20,6 +20,8 @@ static void usage(FILE *stream)
             "[light options]\n"
             "  universal-modem --light --client --link-test "
             "[light options]\n"
+            "  sudo ./universal-modem --light --gateway [light options]\n"
+            "  sudo ./universal-modem --light --client [light options]\n"
             "  universal-modem --calibrate [--calib-high]\n"
             "  universal-modem --session-sim [--calib-high]\n"
             "  universal-modem --list-audio\n"
@@ -47,6 +49,8 @@ static void usage(FILE *stream)
             "  --camera-device ID   V4L2 path or AVFoundation ID/name\n"
             "  --frames N           Frames to display (default 300)\n"
             "  --window-size N      Square output size (default 720 pixels)\n"
+            "  --allow-background   Disable the default quiet-link firewall\n"
+            "  --allow-messages     Allow Messages/APNs through that firewall\n"
             "  peers may start at any time; close the window or press q/Esc "
             "to stop\n");
 }
@@ -583,7 +587,7 @@ int main(int argc, char **argv)
                     "--list-audio cannot be combined with light options\n");
             return 2;
         }
-        int status = um_network_prepare_audio_user(print_log, stdout);
+        int status = um_network_prepare_worker_user(print_log, stdout);
         if (status != UM_OK) {
             fprintf(stderr, "could not select the invoking user for audio\n");
             return 1;
@@ -653,24 +657,26 @@ int main(int argc, char **argv)
         um_live_role role =
             endpoint == 1 ? UM_LIVE_GATEWAY : UM_LIVE_CLIENT;
         int status;
+        status = um_network_prepare_worker_user(print_log, stdout);
+        if (status != UM_OK) {
+            fprintf(stderr,
+                    "could not select the invoking user for modem I/O\n");
+            return 1;
+        }
         if (light != 0) {
             um_live_light_options options =
                 um_live_light_default_options(role);
-            if (link_test == 0) {
-                fprintf(stderr,
-                        "live light currently requires --link-test; "
-                        "optical TUN/network mode is the next stage\n");
-                return 2;
-            }
             if (frames_was_set != 0 || noise_was_set != 0 ||
                 modem_option_was_set != 0 || high_quality != 0 ||
                 audio_device_option_was_set != 0 ||
-                audio_link_option_was_set != 0 || allow_background != 0 ||
-                allow_messages != 0) {
+                audio_link_option_was_set != 0 ||
+                (link_test != 0 &&
+                 (allow_background != 0 || allow_messages != 0))) {
                 fprintf(stderr,
                         "--frames is for --io-test; audio device, modem, "
-                        "calibration, firewall, and noise options do not "
-                        "apply to a light link test\n");
+                        "calibration, and noise options do not apply to "
+                        "live light; firewall options require network "
+                        "mode\n");
                 return 2;
             }
             if (test_bytes > 16u * 1024u * 1024u) {
@@ -679,14 +685,17 @@ int main(int argc, char **argv)
                 return 2;
             }
             options.camera_device = camera_device;
+            options.link_test = link_test;
             options.test_bytes = test_bytes;
             options.window_size = light_window_size;
+            options.filter_background_traffic = allow_background == 0;
+            options.allow_messages_traffic = allow_messages;
             status = um_run_live_light(&options, print_log, stdout);
             if (status == UM_ERR_INTERRUPTED) {
                 return 130;
             }
             if (status != UM_OK) {
-                fprintf(stderr, "real-light link test failed: %s\n",
+                fprintf(stderr, "real-light session failed: %s\n",
                         um_status_string(status));
                 return 1;
             }
@@ -700,12 +709,6 @@ int main(int argc, char **argv)
         {
             um_live_audio_options options =
                 um_live_audio_default_options(role);
-            status = um_network_prepare_audio_user(print_log, stdout);
-            if (status != UM_OK) {
-                fprintf(stderr,
-                        "could not select the invoking user for audio\n");
-                return 1;
-            }
             if (noise_was_set != 0) {
                 fprintf(stderr, "--noise only applies to --simulate\n");
                 return 2;

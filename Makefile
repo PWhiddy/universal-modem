@@ -39,6 +39,7 @@ LIB_SOURCES := \
 	src/light.c \
 	src/light_live.c \
 	src/light_network.c \
+	src/light_packet.c \
 	src/light_session.c \
 	src/light_video.c \
 	src/live.c \
@@ -75,22 +76,29 @@ test_light: tests/test_light.o src/light.o src/crc.o src/fec.o \
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 test_light_session: tests/test_light_session.o src/light_session.o \
-	src/light.o src/crc.o src/fec.o src/interleave.o
+	src/light_packet.o src/light.o src/crc.o src/fec.o src/interleave.o
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+test_light_packet: tests/test_light_packet.o src/light_session.o \
+	src/light_packet.o src/light.o src/crc.o src/fec.o src/interleave.o
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 test_light_network: tests/test_light_network.o src/light_network.o \
-	src/light_session.o src/light.o src/crc.o src/fec.o src/interleave.o
+	src/light_session.o src/light_packet.o src/light.o src/crc.o src/fec.o \
+	src/interleave.o
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 test_light_video: tests/test_light_video.o src/light_video.o \
 	$(LIGHT_VIDEO_PLATFORM_OBJECTS)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
-test check: test_modem test_light test_light_session test_light_network \
+test check: test_modem test_light test_light_session test_light_packet \
+	test_light_network \
 	test_light_video test_live_audio test_tcp_relay
 	./test_modem
 	./test_light
 	./test_light_session
+	./test_light_packet
 	./test_light_network
 	./test_light_video
 	./test_live_audio
@@ -112,12 +120,17 @@ src/live.o src/traffic_policy.o tests/test_modem.o: src/traffic_policy.h
 tests/test_live_audio.o: src/audio.h
 src/main.o src/light_live.o src/light_video.o tests/test_light_video.o: \
 	src/light_video.h
+src/light_live.o: src/network.h src/traffic_policy.h
+src/light_packet.o src/light_session.o tests/test_light_packet.o: \
+	src/light_packet.h
 
 clean:
 	rm -f $(LIB_OBJECTS) src/main.o tests/test_modem.o tests/test_live_audio.o \
 		tests/test_light.o tests/test_light_session.o \
+		tests/test_light_packet.o \
 		tests/test_light_network.o tests/test_light_video.o \
 		tests/test_tcp_relay.o $(LIGHT_VIDEO_PLATFORM_OBJECTS) universal-modem \
-		test_modem test_light test_light_session test_light_network \
+		test_modem test_light test_light_session test_light_packet \
+		test_light_network \
 		test_light_video \
 		test_live_audio test_tcp_relay
