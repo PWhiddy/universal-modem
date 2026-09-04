@@ -100,6 +100,8 @@ const char *um_status_string(int status)
         return "insufficient reliability margin";
     case UM_ERR_NETWORK:
         return "network interface or routing error";
+    case UM_ERR_VIDEO:
+        return "video device or window error";
     default:
         return "unknown error";
     }

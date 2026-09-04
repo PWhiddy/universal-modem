@@ -163,4 +163,11 @@ float um_calibration_payload_rate(const um_modem_config *config,
 int um_calibration_guard_config(const um_modem_config *measured,
                                 um_modem_config *guarded);
 
+int um_light_simulate_payloads(
+    const um_light_session_simulation_config *config,
+    um_light_session_simulation_result *result,
+    const uint8_t *client_payload, uint8_t *gateway_received,
+    const uint8_t *gateway_payload, uint8_t *client_received,
+    um_log_callback logger, void *logger_context);
+
 #endif

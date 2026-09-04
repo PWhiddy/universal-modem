@@ -33,7 +33,8 @@ typedef enum {
     UM_ERR_UNSUPPORTED = -11,
     UM_ERR_INTERRUPTED = -12,
     UM_ERR_RELIABILITY = -13,
-    UM_ERR_NETWORK = -14
+    UM_ERR_NETWORK = -14,
+    UM_ERR_VIDEO = -15
 } um_status;
 
 typedef enum {
@@ -206,6 +207,77 @@ typedef struct {
     unsigned orientation;
 } um_light_rx_metrics;
 
+typedef struct {
+    um_light_channel_config client_to_gateway;
+    um_light_channel_config gateway_to_client;
+    size_t client_payload_bytes;
+    size_t gateway_payload_bytes;
+    size_t max_frames;
+    unsigned frames_per_second;
+    unsigned transmit_window;
+    unsigned retransmit_after_frames;
+    unsigned link_timeout_frames;
+    unsigned client_to_gateway_drop_period;
+    unsigned gateway_to_client_drop_period;
+    size_t blackout_start_frame;
+    size_t blackout_frame_count;
+    float corner_jitter_pixels;
+    uint32_t random_seed;
+} um_light_session_simulation_config;
+
+typedef struct {
+    size_t frames_elapsed;
+    size_t handshake_frames;
+    size_t data_frames;
+    size_t acknowledgement_frames;
+    size_t simultaneous_data_frames;
+    size_t client_to_gateway_decoded_frames;
+    size_t gateway_to_client_decoded_frames;
+    size_t scheduled_frame_drops;
+    size_t decode_failures;
+    size_t protocol_rejections;
+    size_t retransmissions;
+    size_t duplicate_data_frames;
+    size_t reconnects;
+    size_t link_timeouts;
+    size_t gateway_received_bytes;
+    size_t client_received_bytes;
+    float client_to_gateway_average_correction;
+    float gateway_to_client_average_correction;
+    float elapsed_seconds;
+    float payload_goodput_bps;
+    int final_connected;
+} um_light_session_simulation_result;
+
+typedef struct {
+    um_light_session_simulation_config session;
+    unsigned mtu;
+    size_t client_packet_count;
+    size_t gateway_packet_count;
+    uint32_t random_seed;
+} um_light_network_simulation_config;
+
+typedef struct {
+    um_light_session_simulation_result session;
+    size_t client_packets_sent;
+    size_t gateway_packets_sent;
+    size_t gateway_packets_received;
+    size_t client_packets_received;
+    size_t client_ip_bytes_sent;
+    size_t gateway_ip_bytes_sent;
+    size_t gateway_ip_bytes_received;
+    size_t client_ip_bytes_received;
+    size_t udp_packets;
+    size_t tcp_packets;
+    size_t packets_spanning_optical_frames;
+    size_t framing_overhead_bytes;
+    size_t framing_errors;
+    size_t checksum_errors;
+    uint32_t client_stream_crc32;
+    uint32_t gateway_stream_crc32;
+    float ip_goodput_bps;
+} um_light_network_simulation_result;
+
 typedef enum {
     UM_LIVE_GATEWAY = 1,
     UM_LIVE_CLIENT = 2
@@ -296,6 +368,20 @@ int um_light_decode_frame(const uint8_t *pixels, size_t width, size_t height,
                           uint8_t *payload, size_t payload_capacity,
                           size_t *payload_length,
                           um_light_rx_metrics *metrics);
+
+um_light_session_simulation_config
+um_light_session_simulation_default_config(void);
+int um_simulate_light_session(
+    const um_light_session_simulation_config *config,
+    um_light_session_simulation_result *result, um_log_callback logger,
+    void *logger_context);
+
+um_light_network_simulation_config
+um_light_network_simulation_default_config(void);
+int um_simulate_light_network(
+    const um_light_network_simulation_config *config,
+    um_light_network_simulation_result *result, um_log_callback logger,
+    void *logger_context);
 
 int um_audio_list_devices(um_log_callback logger, void *logger_context);
 um_live_audio_options um_live_audio_default_options(um_live_role role);

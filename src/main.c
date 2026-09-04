@@ -1,4 +1,5 @@
 #include "um.h"
+#include "light_video.h"
 #include "live_wire.h"
 #include "network.h"
 
@@ -14,9 +15,11 @@ static void usage(FILE *stream)
             "  universal-modem --simulate [--qam 4|16|64] "
             "[--fec 1/2|2/3|3/4] [--noise LEVEL]\n"
             "  universal-modem --light --simulate [--noise LEVEL]\n"
+            "  universal-modem --light --io-test [video options]\n"
             "  universal-modem --calibrate [--calib-high]\n"
             "  universal-modem --session-sim [--calib-high]\n"
             "  universal-modem --list-audio\n"
+            "  universal-modem --list-video\n"
             "  universal-modem --gateway [audio options]\n"
             "  universal-modem --client [audio options]\n"
             "\nAudio options:\n"
@@ -33,9 +36,13 @@ static void usage(FILE *stream)
             "  calibration.config  Auto-loaded/saved; delete it to recalibrate\n"
             "\nLight options:\n"
             "  --light              Select the optical medium\n"
-            "  --simulate           Exercise perspective/noise encode/decode\n"
+            "  --simulate           Run impaired full-duplex IPv4 simulation\n"
             "  --noise LEVEL        Normalized camera noise (0.0 to 1.0)\n"
-            "  live camera/window mode is not implemented yet\n");
+            "  --io-test            Finite native camera/window beacon test\n"
+            "  --camera-device ID   V4L2 path or AVFoundation ID/name\n"
+            "  --frames N           Frames to display (default 300)\n"
+            "  --window-size N      Square output size (default 720 pixels)\n"
+            "  close the window or press q/Esc to stop the I/O test\n");
 }
 
 static void print_log(void *context, const char *message)
@@ -178,74 +185,200 @@ done:
 
 static int run_light_simulation(float noise, int noise_was_set)
 {
-    static const uint8_t message[] =
-        "Universal Modem: perspective optical loopback is operational.";
-    uint8_t modules[UM_LIGHT_GRID_SIZE * UM_LIGHT_GRID_SIZE];
-    uint8_t decoded[UM_LIGHT_MAX_PAYLOAD];
-    uint8_t *pixels = NULL;
-    size_t pixel_count = 0u;
-    size_t decoded_length = 0u;
-    uint8_t frame_type = 0u;
-    uint32_t session_id = 0u;
-    uint32_t sequence = 0u;
-    um_light_channel_config channel = um_light_channel_default_config();
-    um_light_rx_metrics metrics;
-    clock_t decode_start;
-    clock_t decode_end;
-    double decode_ms;
+    um_light_network_simulation_config config =
+        um_light_network_simulation_default_config();
+    um_light_network_simulation_result result;
+    clock_t started;
+    double cpu_seconds;
     int status;
 
     if (noise_was_set != 0) {
-        channel.noise_stddev = noise;
+        if (noise > 1.0f) {
+            fprintf(stderr, "light noise level must be at most 1.0\n");
+            return 2;
+        }
+        config.session.client_to_gateway.noise_stddev = noise;
+        config.session.gateway_to_client.noise_stddev = noise;
     }
-    status = um_light_encode_frame(
-        1u, UINT32_C(0x4c494748), UINT32_C(1), message,
-        sizeof(message) - 1u, modules, sizeof(modules));
+    started = clock();
+    status = um_simulate_light_network(&config, &result, print_log, stdout);
+    cpu_seconds = (double)(clock() - started) / (double)CLOCKS_PER_SEC;
     if (status != UM_OK) {
-        fprintf(stderr, "light encoding failed: %s\n",
-                um_status_string(status));
-        return 1;
-    }
-    status = um_light_render_frame(
-        modules, sizeof(modules), &channel, &pixels, &pixel_count);
-    if (status != UM_OK) {
-        fprintf(stderr, "light channel simulation failed: %s\n",
-                um_status_string(status));
-        return 1;
-    }
-    decode_start = clock();
-    status = um_light_decode_frame(
-        pixels, channel.image_width, channel.image_height,
-        channel.image_width, &frame_type, &session_id, &sequence, decoded,
-        sizeof(decoded), &decoded_length, &metrics);
-    decode_end = clock();
-    free(pixels);
-    if (status != UM_OK) {
-        fprintf(stderr, "light decoding failed: %s\n",
-                um_status_string(status));
-        return 1;
-    }
-    if (decoded_length != sizeof(message) - 1u ||
-        memcmp(decoded, message, decoded_length) != 0) {
-        fprintf(stderr, "light simulation decoded the wrong payload\n");
+        fprintf(stderr,
+                "light IPv4 simulation failed after %zu frames: %s\n",
+                result.session.frames_elapsed, um_status_string(status));
         return 1;
     }
 
-    decode_ms = 1000.0 * (double)(decode_end - decode_start) /
-                (double)CLOCKS_PER_SEC;
-    printf("light decoded type=%u session=%08x sequence=%u bytes=%zu\n",
-           (unsigned)frame_type, session_id, sequence, decoded_length);
-    printf("grid=%ux%u image=%zux%zu coverage=%.1f%% contrast=%.1f%% "
-           "corrected=%.2f%% orientation=%u decode=%.1fms\n",
-           UM_LIGHT_GRID_SIZE, UM_LIGHT_GRID_SIZE, channel.image_width,
-           channel.image_height, 100.0f * metrics.image_coverage,
-           100.0f * metrics.contrast,
-           100.0f * metrics.corrected_bit_fraction, metrics.orientation,
-           decode_ms);
-    printf("rate-1/2 payload-capacity=%uB nominal@15fps=%.1fkbps\n",
-           UM_LIGHT_MAX_PAYLOAD,
-           (double)UM_LIGHT_MAX_PAYLOAD * 8.0 * 15.0 / 1000.0);
-    printf("payload: %.*s\n", (int)decoded_length, (const char *)decoded);
+    printf("light full-duplex IPv4 simulation complete frames=%zu "
+           "simulated=%.2fs cpu=%.2fs\n",
+           result.session.frames_elapsed, result.session.elapsed_seconds,
+           cpu_seconds);
+    printf("packets upload=%zu/%zu download=%zu/%zu ip-bytes=%zu/%zu "
+           "goodput=%.1fkbps\n",
+           result.gateway_packets_received, result.client_packets_sent,
+           result.client_packets_received, result.gateway_packets_sent,
+           result.gateway_ip_bytes_received,
+           result.client_ip_bytes_received, result.ip_goodput_bps / 1000.0f);
+    printf("transport stream-bytes upload=%zu download=%zu "
+           "goodput=%.1fkbps "
+           "simultaneous-data-frames=%zu\n",
+           result.session.gateway_received_bytes,
+           result.session.client_received_bytes,
+           result.session.payload_goodput_bps / 1000.0f,
+           result.session.simultaneous_data_frames);
+    printf("channel drops=%zu decode-failures=%zu retransmissions=%zu "
+           "duplicates=%zu reconnects=%zu\n",
+           result.session.scheduled_frame_drops,
+           result.session.decode_failures,
+           result.session.retransmissions,
+           result.session.duplicate_data_frames,
+           result.session.reconnects);
+    printf("packet mix udp=%zu tcp=%zu spanning-frames=%zu "
+           "framing-errors=%zu checksum-errors=%zu "
+           "stream-crc=%08x/%08x\n",
+           result.udp_packets, result.tcp_packets,
+           result.packets_spanning_optical_frames,
+           result.framing_errors, result.checksum_errors,
+           (unsigned)result.client_stream_crc32,
+           (unsigned)result.gateway_stream_crc32);
+    printf("average corrected coded bits client->gateway=%.2f%% "
+           "gateway->client=%.2f%%\n",
+           100.0f *
+               result.session.client_to_gateway_average_correction,
+           100.0f *
+               result.session.gateway_to_client_average_correction);
+    return 0;
+}
+
+static int run_light_io_test(const char *camera_device, size_t frame_limit,
+                             unsigned window_size)
+{
+    static const uint8_t beacon[] = "Universal Modem optical I/O beacon";
+    const size_t maximum_pixels = (size_t)4096u * 4096u;
+    um_light_video_config config = um_light_video_default_config();
+    um_light_video *video = NULL;
+    uint8_t modules[UM_LIGHT_GRID_SIZE * UM_LIGHT_GRID_SIZE];
+    uint8_t decoded[UM_LIGHT_MAX_PAYLOAD];
+    uint8_t *pixels = NULL;
+    size_t displayed = 0u;
+    size_t captured = 0u;
+    size_t decoded_frames = 0u;
+    size_t unique_frames = 0u;
+    size_t misses = 0u;
+    size_t foreign_frames = 0u;
+    uint32_t last_sequence = 0u;
+    int have_sequence = 0;
+    int status;
+
+    config.camera_device = camera_device;
+    config.window_size = window_size;
+    pixels = (uint8_t *)malloc(maximum_pixels);
+    if (pixels == NULL) {
+        fprintf(stderr, "cannot allocate the camera frame buffer\n");
+        return 1;
+    }
+    status = um_light_video_open(&video, &config, print_log, stdout);
+    if (status != UM_OK) {
+        fprintf(stderr, "cannot start native light video I/O: %s\n",
+                um_status_string(status));
+        free(pixels);
+        return 1;
+    }
+    printf("Light I/O beacon running for at most %zu frames; point the "
+           "camera at the peer window\n",
+           frame_limit);
+
+    while (displayed < frame_limit &&
+           um_light_video_should_close(video) == 0) {
+        uint8_t frame_type = 0u;
+        uint32_t session_id = 0u;
+        uint32_t sequence = 0u;
+        size_t decoded_length = 0u;
+        size_t width = 0u;
+        size_t height = 0u;
+        um_light_rx_metrics metrics;
+
+        status = um_light_encode_frame(
+            UINT8_C(0x70), UINT32_C(0x554d5649), (uint32_t)displayed,
+            beacon, sizeof(beacon) - 1u, modules, sizeof(modules));
+        if (status != UM_OK) {
+            break;
+        }
+        status = um_light_video_present(video, modules, sizeof(modules));
+        if (status == UM_ERR_INTERRUPTED) {
+            status = UM_OK;
+            break;
+        }
+        if (status != UM_OK) {
+            break;
+        }
+        ++displayed;
+
+        status = um_light_video_capture(
+            video, pixels, maximum_pixels, 250u, &width, &height);
+        if (status == UM_ERR_TIMEOUT) {
+            ++misses;
+            status = UM_OK;
+            continue;
+        }
+        if (status == UM_ERR_INTERRUPTED) {
+            status = UM_OK;
+            break;
+        }
+        if (status != UM_OK) {
+            break;
+        }
+        ++captured;
+        memset(&metrics, 0, sizeof(metrics));
+        status = um_light_decode_frame(
+            pixels, width, height, width, &frame_type, &session_id,
+            &sequence, decoded, sizeof(decoded), &decoded_length, &metrics);
+        if (status != UM_OK) {
+            ++misses;
+            status = UM_OK;
+            continue;
+        }
+        if (frame_type != UINT8_C(0x70) ||
+            session_id != UINT32_C(0x554d5649) ||
+            decoded_length != sizeof(beacon) - 1u ||
+            memcmp(decoded, beacon, sizeof(beacon) - 1u) != 0) {
+            ++foreign_frames;
+            continue;
+        }
+        ++decoded_frames;
+        if (have_sequence == 0 || sequence != last_sequence) {
+            ++unique_frames;
+            last_sequence = sequence;
+            have_sequence = 1;
+        }
+        if (decoded_frames == 1u ||
+            decoded_frames % config.frames_per_second == 0u) {
+            printf("light camera rx sequence=%u image=%zux%zu "
+                   "coverage=%.1f%% contrast=%.3f corrected=%.2f%%\n",
+                   (unsigned)sequence, width, height,
+                   100.0f * metrics.image_coverage, metrics.contrast,
+                   100.0f * metrics.corrected_bit_fraction);
+        }
+    }
+
+    um_light_video_close(video);
+    free(pixels);
+    if (status != UM_OK) {
+        fprintf(stderr, "light video I/O failed: %s\n",
+                um_status_string(status));
+        return 1;
+    }
+    printf("light I/O complete displayed=%zu captured=%zu decoded=%zu "
+           "unique=%zu misses=%zu foreign=%zu\n",
+           displayed, captured, decoded_frames, unique_frames, misses,
+           foreign_frames);
+    if (decoded_frames == 0u) {
+        fprintf(stderr,
+                "no valid peer beacon was decoded; check camera aim, focus, "
+                "exposure, and screen coverage\n");
+        return 1;
+    }
     return 0;
 }
 
@@ -264,12 +397,18 @@ int main(int argc, char **argv)
     int allow_messages = 0;
     int endpoint = 0;
     int list_audio = 0;
+    int list_video = 0;
+    int light_io_test = 0;
     int noise_was_set = 0;
     int modem_option_was_set = 0;
+    int video_option_was_set = 0;
     const char *input_device = "default";
     const char *output_device = "default";
+    const char *camera_device = "default";
     size_t test_bytes = 1024u;
     size_t chunk_bytes = UM_LIVE_MAX_BODY;
+    size_t light_io_frames = 300u;
+    unsigned light_window_size = 720u;
     unsigned retries = 4u;
     int i;
 
@@ -302,6 +441,10 @@ int main(int argc, char **argv)
             allow_messages = 1;
         } else if (strcmp(argv[i], "--list-audio") == 0) {
             list_audio = 1;
+        } else if (strcmp(argv[i], "--list-video") == 0) {
+            list_video = 1;
+        } else if (strcmp(argv[i], "--io-test") == 0) {
+            light_io_test = 1;
         } else if (strcmp(argv[i], "--gateway") == 0) {
             if (endpoint != 0) {
                 fprintf(stderr, "choose exactly one of --gateway or --client\n");
@@ -318,6 +461,33 @@ int main(int argc, char **argv)
             input_device = argv[++i];
         } else if (strcmp(argv[i], "--output-device") == 0 && i + 1 < argc) {
             output_device = argv[++i];
+        } else if (strcmp(argv[i], "--camera-device") == 0 &&
+                   i + 1 < argc) {
+            camera_device = argv[++i];
+            video_option_was_set = 1;
+        } else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) {
+            char *end = NULL;
+            unsigned long value = strtoul(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value == 0ul ||
+                value > UINT32_MAX) {
+                fprintf(stderr, "frames must be between 1 and %u\n",
+                        UINT32_MAX);
+                return 2;
+            }
+            light_io_frames = (size_t)value;
+            video_option_was_set = 1;
+        } else if (strcmp(argv[i], "--window-size") == 0 &&
+                   i + 1 < argc) {
+            char *end = NULL;
+            unsigned long value = strtoul(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || value < 256ul ||
+                value > 4096ul) {
+                fprintf(stderr,
+                        "window size must be between 256 and 4096 pixels\n");
+                return 2;
+            }
+            light_window_size = (unsigned)value;
+            video_option_was_set = 1;
         } else if (strcmp(argv[i], "--test-bytes") == 0 && i + 1 < argc) {
             char *end = NULL;
             unsigned long value = strtoul(argv[++i], &end, 10);
@@ -379,8 +549,9 @@ int main(int argc, char **argv)
     }
 
     if (list_audio != 0) {
-        if (light != 0) {
-            fprintf(stderr, "--list-audio cannot be combined with --light\n");
+        if (light != 0 || list_video != 0) {
+            fprintf(stderr,
+                    "--list-audio cannot be combined with light options\n");
             return 2;
         }
         int status = um_network_prepare_audio_user(print_log, stdout);
@@ -391,12 +562,37 @@ int main(int argc, char **argv)
         status = um_audio_list_devices(print_log, stdout);
         return status == UM_OK ? 0 : 1;
     }
+    if (list_video != 0) {
+        int status;
+        if (simulate != 0 || calibrate != 0 || session_simulation != 0 ||
+            endpoint != 0 || light_io_test != 0) {
+            fprintf(stderr, "--list-video must be used by itself\n");
+            return 2;
+        }
+        status = um_light_video_list_devices(print_log, stdout);
+        return status == UM_OK ? 0 : 1;
+    }
+    if (light_io_test != 0) {
+        if (light == 0 || simulate != 0 || calibrate != 0 ||
+            session_simulation != 0 || endpoint != 0 ||
+            modem_option_was_set != 0 || high_quality != 0 ||
+            noise_was_set != 0) {
+            fprintf(stderr,
+                    "--io-test requires --light and cannot be combined with "
+                    "simulation, endpoint, or audio modem options\n");
+            return 2;
+        }
+        return run_light_io_test(camera_device, light_io_frames,
+                                 light_window_size);
+    }
 
     if (simulate != 0 && calibrate == 0 && session_simulation == 0 &&
         endpoint == 0 && light != 0) {
-        if (modem_option_was_set != 0 || high_quality != 0) {
+        if (modem_option_was_set != 0 || high_quality != 0 ||
+            video_option_was_set != 0) {
             fprintf(stderr,
-                    "--qam, --fec, and --calib-high are audio-only\n");
+                    "camera options apply to --light --io-test only; --qam, "
+                    "--fec, and --calib-high are audio-only\n");
             return 2;
         }
         return run_light_simulation(noise, noise_was_set);
@@ -433,6 +629,11 @@ int main(int argc, char **argv)
                     "live light camera/window mode is not implemented yet; "
                     "use --light --simulate\n");
             return 1;
+        }
+        if (video_option_was_set != 0) {
+            fprintf(stderr,
+                    "camera options apply to --light --io-test only\n");
+            return 2;
         }
         status = um_network_prepare_audio_user(print_log, stdout);
         if (status != UM_OK) {
