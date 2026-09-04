@@ -8,6 +8,8 @@
 
 #define LIGHT_LIVE_MAX_TEST_BYTES (16u * 1024u * 1024u)
 #define LIGHT_LIVE_MAX_PIXELS ((size_t)4096u * 4096u)
+#define LIGHT_LIVE_CAPTURE_FPS 30u
+#define LIGHT_LIVE_SYMBOL_FPS 10u
 
 static void light_live_log(um_log_callback logger, void *context,
                            const char *format, ...)
@@ -33,6 +35,15 @@ static uint32_t light_live_seed(um_live_role role)
         seed ^= (uint32_t)now.tv_nsec;
     }
     return seed != 0u ? seed : UINT32_C(1);
+}
+
+static double light_live_now_seconds(void)
+{
+    struct timespec now;
+    if (timespec_get(&now, TIME_UTC) != TIME_UTC) {
+        return (double)time(NULL);
+    }
+    return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
 }
 
 static void light_live_fill(uint8_t *bytes, size_t length, uint32_t seed)
@@ -71,6 +82,8 @@ int um_run_live_light(const um_live_light_options *options,
     uint8_t *incoming = NULL;
     uint8_t *expected = NULL;
     size_t local_frame = 0u;
+    size_t displayed_frames = 0u;
+    size_t captured_frames = 0u;
     size_t decoded_frames = 0u;
     size_t decode_misses = 0u;
     size_t sync_misses = 0u;
@@ -78,7 +91,9 @@ int um_run_live_light(const um_live_light_options *options,
     size_t crc_misses = 0u;
     size_t completion_frame = SIZE_MAX;
     um_light_rx_metrics last_metrics;
-    time_t started_at;
+    double started_at = 0.0;
+    double next_symbol_at = 0.0;
+    double next_report_at = 0.0;
     int status = UM_OK;
 
     if (options == NULL ||
@@ -119,6 +134,7 @@ int um_run_live_light(const um_live_light_options *options,
 
     video_config.camera_device = options->camera_device;
     video_config.window_size = options->window_size;
+    video_config.frames_per_second = LIGHT_LIVE_CAPTURE_FPS;
     status = um_light_video_open(&video, &video_config, logger,
                                  logger_context);
     if (status != UM_OK) {
@@ -126,43 +142,55 @@ int um_run_live_light(const um_live_light_options *options,
     }
     light_live_log(
         logger, logger_context,
-        "Light link test role=%s bytes=%zu; discovery waits indefinitely "
-        "for the peer",
+        "Light link test role=%s bytes=%zu capture=%ufps symbols=%ufps; "
+        "discovery waits indefinitely for the peer",
         options->role == UM_LIVE_CLIENT ? "client" : "gateway",
-        options->test_bytes);
-    started_at = time(NULL);
+        options->test_bytes, LIGHT_LIVE_CAPTURE_FPS,
+        LIGHT_LIVE_SYMBOL_FPS);
+    started_at = light_live_now_seconds();
+    next_symbol_at = started_at;
+    next_report_at = started_at;
 
     while (um_light_video_should_close(video) == 0) {
-        um_light_peer_frame outbound;
         um_light_peer_frame received;
         um_light_peer_status peer_status;
         um_light_rx_metrics metrics;
         size_t width = 0u;
         size_t height = 0u;
         size_t payload_length = 0u;
+        double now = light_live_now_seconds();
         int capture_status;
         int decode_status;
 
-        status = um_light_peer_build(peer, local_frame, &outbound);
-        if (status != UM_OK) {
-            break;
-        }
-        status = um_light_encode_frame(
-            outbound.type, outbound.session_id, outbound.sequence,
-            outbound.payload, outbound.payload_length, modules,
-            sizeof(modules));
-        if (status != UM_OK) {
-            break;
-        }
-        status = um_light_video_present(video, modules, sizeof(modules));
-        if (status != UM_OK) {
-            break;
+        if (displayed_frames == 0u || now >= next_symbol_at) {
+            um_light_peer_frame outbound;
+            local_frame = displayed_frames;
+            status = um_light_peer_build(peer, local_frame, &outbound);
+            if (status != UM_OK) {
+                break;
+            }
+            status = um_light_encode_frame(
+                outbound.type, outbound.session_id, outbound.sequence,
+                outbound.payload, outbound.payload_length, modules,
+                sizeof(modules));
+            if (status != UM_OK) {
+                break;
+            }
+            status =
+                um_light_video_present(video, modules, sizeof(modules));
+            if (status != UM_OK) {
+                break;
+            }
+            ++displayed_frames;
+            next_symbol_at =
+                now + 1.0 / (double)LIGHT_LIVE_SYMBOL_FPS;
         }
 
         memset(&received, 0, sizeof(received));
         capture_status = um_light_video_capture(
             video, pixels, LIGHT_LIVE_MAX_PIXELS, 250u, &width, &height);
         if (capture_status == UM_OK) {
+            ++captured_frames;
             memset(&metrics, 0, sizeof(metrics));
             decode_status = um_light_decode_frame(
                 pixels, width, height, width, &received.type,
@@ -199,15 +227,16 @@ int um_run_live_light(const um_live_light_options *options,
             break;
         }
         um_light_peer_get_status(peer, &peer_status);
-        if (local_frame == 0u ||
-            local_frame % (5u * video_config.frames_per_second) == 0u) {
+        now = light_live_now_seconds();
+        if (now >= next_report_at) {
             light_live_log(
                 logger, logger_context,
-                "light link frame=%zu state=%s decoded=%zu misses=%zu "
+                "light link symbol=%zu captured=%zu state=%s decoded=%zu "
+                "misses=%zu "
                 "(sync=%zu header=%zu crc=%zu) "
                 "upload-acked=%zu/%zu download=%zu/%zu retries=%zu "
                 "timeouts=%zu quality=%.1f%%/%.3f/%.2f%%",
-                local_frame,
+                local_frame, captured_frames,
                 peer_status.connected != 0 ? "CONNECTED" : "DISCOVERY",
                 decoded_frames, decode_misses, sync_misses, header_misses,
                 crc_misses,
@@ -217,6 +246,7 @@ int um_run_live_light(const um_live_light_options *options,
                 100.0f * last_metrics.image_coverage,
                 last_metrics.contrast,
                 100.0f * last_metrics.corrected_bit_fraction);
+            next_report_at = now + 5.0;
         }
 
         if (um_light_peer_complete(peer) != 0) {
@@ -236,7 +266,6 @@ int um_run_live_light(const um_live_light_options *options,
         } else {
             completion_frame = SIZE_MAX;
         }
-        ++local_frame;
     }
 
     if (status == UM_OK && um_light_peer_complete(peer) == 0) {
@@ -248,25 +277,25 @@ int um_run_live_light(const um_live_light_options *options,
     }
     if (status == UM_OK) {
         um_light_peer_status peer_status;
-        time_t elapsed;
+        double elapsed;
         um_light_peer_get_status(peer, &peer_status);
-        elapsed = time(NULL) - started_at;
+        elapsed = light_live_now_seconds() - started_at;
         light_live_log(
             logger, logger_context,
-            "Light link test complete role=%s frames=%zu "
+            "Light link test complete role=%s symbols=%zu captured=%zu "
             "upload-acked=%zu/%zu download=%zu/%zu decoded=%zu "
-            "misses=%zu retries=%zu reconnects=%zu elapsed=%lds "
+            "misses=%zu retries=%zu reconnects=%zu elapsed=%.1fs "
             "combined-goodput=%.0fbps",
             options->role == UM_LIVE_CLIENT ? "client" : "gateway",
-            local_frame + 1u, peer_status.outgoing_bytes_acked,
-            options->test_bytes, peer_status.incoming_bytes_received,
-            options->test_bytes, decoded_frames, decode_misses,
-            peer_status.retransmissions, peer_status.reconnects,
-            (long)elapsed,
-            elapsed > 0
+            displayed_frames, captured_frames,
+            peer_status.outgoing_bytes_acked, options->test_bytes,
+            peer_status.incoming_bytes_received, options->test_bytes,
+            decoded_frames, decode_misses, peer_status.retransmissions,
+            peer_status.reconnects, elapsed,
+            elapsed > 0.0
                 ? 8.0 * (double)(peer_status.outgoing_bytes_acked +
                                  peer_status.incoming_bytes_received) /
-                      (double)elapsed
+                      elapsed
                 : 0.0);
     }
 
