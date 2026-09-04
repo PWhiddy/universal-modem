@@ -11,6 +11,7 @@
 #define LIGHT_VIDEO_MAX_CAMERA_SIDE 4096u
 #define LIGHT_VIDEO_BUFFER_COUNT 4u
 
+#if !defined(__APPLE__)
 static void light_video_log(um_log_callback logger, void *context,
                             const char *format, ...)
 {
@@ -24,6 +25,7 @@ static void light_video_log(um_log_callback logger, void *context,
     va_end(arguments);
     logger(context, message);
 }
+#endif
 
 static int light_video_image_fits(size_t width, size_t height, size_t stride,
                                   size_t capacity)
@@ -675,7 +677,7 @@ int um_light_video_should_close(um_light_video *video)
     return video->close_requested;
 }
 
-#else
+#elif !defined(__APPLE__)
 
 struct um_light_video {
     int unused;
