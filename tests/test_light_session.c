@@ -308,6 +308,89 @@ static void test_role_local_peer_arguments(void)
     um_light_peer_destroy(peer);
 }
 
+static void test_foreign_discovery_waits_for_gateway_timeout(void)
+{
+    uint8_t client_outgoing[256];
+    uint8_t gateway_outgoing[256];
+    uint8_t intruder_outgoing[1] = {0u};
+    uint8_t client_incoming[256] = {0u};
+    uint8_t gateway_incoming[256] = {0u};
+    uint8_t intruder_incoming[1] = {0u};
+    um_light_peer_config config = um_light_peer_default_config();
+    um_light_peer *client = NULL;
+    um_light_peer *gateway = NULL;
+    um_light_peer *intruder = NULL;
+    um_light_peer_frame client_frame = {0};
+    um_light_peer_frame gateway_frame = {0};
+    um_light_peer_frame intruder_frame = {0};
+    um_light_peer_status gateway_status;
+    uint32_t connected_session;
+    size_t frame;
+    ++tests_run;
+
+    fill_bytes(client_outgoing, sizeof(client_outgoing),
+               UINT32_C(0x636c6965));
+    fill_bytes(gateway_outgoing, sizeof(gateway_outgoing),
+               UINT32_C(0x67617465));
+    config.link_timeout_frames = 5u;
+    CHECK(um_light_peer_create(
+              &client, UM_LIVE_CLIENT, &config, client_outgoing,
+              sizeof(client_outgoing), client_incoming,
+              sizeof(client_incoming), NULL, NULL) == UM_OK);
+    config.random_seed ^= UINT32_C(0x12345678);
+    CHECK(um_light_peer_create(
+              &gateway, UM_LIVE_GATEWAY, &config, gateway_outgoing,
+              sizeof(gateway_outgoing), gateway_incoming,
+              sizeof(gateway_incoming), NULL, NULL) == UM_OK);
+    config.random_seed ^= UINT32_C(0x87654321);
+    CHECK(um_light_peer_create(
+              &intruder, UM_LIVE_CLIENT, &config, intruder_outgoing,
+              sizeof(intruder_outgoing), intruder_incoming,
+              sizeof(intruder_incoming), NULL, NULL) == UM_OK);
+
+    for (frame = 0u; frame < 20u; ++frame) {
+        CHECK(um_light_peer_build(client, frame, &client_frame) == UM_OK);
+        CHECK(um_light_peer_build(gateway, frame, &gateway_frame) == UM_OK);
+        CHECK(um_light_peer_process(client, frame, &gateway_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_process(gateway, frame, &client_frame) ==
+              UM_OK);
+        um_light_peer_get_status(gateway, &gateway_status);
+        if (gateway_status.connected != 0) {
+            break;
+        }
+    }
+    CHECK(frame < 20u);
+    CHECK(um_light_peer_build(gateway, frame, &gateway_frame) == UM_OK);
+    connected_session = gateway_frame.session_id;
+    CHECK(connected_session != 0u);
+
+    CHECK(um_light_peer_build(intruder, 0u, &intruder_frame) == UM_OK);
+    CHECK(intruder_frame.session_id != connected_session);
+    ++frame;
+    CHECK(um_light_peer_process(gateway, frame, &intruder_frame) == UM_OK);
+    um_light_peer_get_status(gateway, &gateway_status);
+    CHECK(gateway_status.connected != 0);
+    CHECK(um_light_peer_build(gateway, frame, &gateway_frame) == UM_OK);
+    CHECK(gateway_frame.session_id == connected_session);
+
+    do {
+        ++frame;
+        CHECK(um_light_peer_process(gateway, frame, NULL) == UM_OK);
+        um_light_peer_get_status(gateway, &gateway_status);
+    } while (gateway_status.connected != 0 && frame < 40u);
+    CHECK(gateway_status.connected == 0);
+
+    ++frame;
+    CHECK(um_light_peer_process(gateway, frame, &intruder_frame) == UM_OK);
+    CHECK(um_light_peer_build(gateway, frame, &gateway_frame) == UM_OK);
+    CHECK(gateway_frame.session_id == intruder_frame.session_id);
+
+    um_light_peer_destroy(intruder);
+    um_light_peer_destroy(gateway);
+    um_light_peer_destroy(client);
+}
+
 static void test_role_local_peers_through_optical_codec(void)
 {
     uint8_t client_outgoing[3600];
@@ -488,6 +571,7 @@ int main(void)
     test_long_late_and_intermittent_peer();
     test_role_local_peers_with_independent_clocks();
     test_role_local_peer_arguments();
+    test_foreign_discovery_waits_for_gateway_timeout();
     test_role_local_peers_through_optical_codec();
     test_decoder_erasures_are_recovered();
     test_terminal_one_way_blackout_fails_closed();

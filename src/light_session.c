@@ -673,6 +673,18 @@ static void light_process_gateway_receive(light_session *session,
     }
     if (frame->type == LIGHT_FRAME_DISCOVER &&
         frame->session_id != 0u && light_control_valid(frame) != 0) {
+        /*
+         * A client starts a new session after its own receive timeout.  Do
+         * not let that unilaterally replace a session that the gateway still
+         * considers connected: the two peers may simply have different
+         * symbol clocks or a short one-way camera outage.  The gateway will
+         * accept the new session after its own timeout returns it to
+         * LISTENING.
+         */
+        if (session->gateway_phase == LIGHT_GATEWAY_CONNECTED &&
+            session->gateway_session_id != frame->session_id) {
+            return;
+        }
         if (session->gateway_session_id != frame->session_id ||
             session->gateway_phase == LIGHT_GATEWAY_LISTENING) {
             session->gateway_session_id = frame->session_id;
