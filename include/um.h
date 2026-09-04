@@ -319,6 +319,7 @@ typedef struct {
     size_t protocol_rejections;
     size_t reconnects;
     size_t link_timeouts;
+    size_t packet_generation_resets;
     size_t outgoing_bytes_acked;
     size_t incoming_bytes_received;
     size_t outgoing_packets_accepted;

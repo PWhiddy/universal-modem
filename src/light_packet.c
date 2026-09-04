@@ -48,6 +48,7 @@ struct light_packet_transport {
     uint32_t transmit_next;
     uint32_t remote_receive_base;
     uint32_t receive_base;
+    uint32_t instance_id;
     uint32_t random_state;
     unsigned max_packet;
     unsigned transmit_window;
@@ -469,6 +470,10 @@ int light_packet_transport_create(light_packet_transport **transport,
     created->transmit_window = transmit_window;
     created->retransmit_after_frames = retransmit_after_frames;
     created->random_state = random_seed;
+    created->instance_id = light_packet_random(&created->random_state);
+    if (created->instance_id == 0u) {
+        created->instance_id = UINT32_C(1);
+    }
     *transport = created;
     return UM_OK;
 }
@@ -610,6 +615,30 @@ unsigned light_packet_transport_max_packet(
     const light_packet_transport *transport)
 {
     return transport != NULL ? transport->max_packet : 0u;
+}
+
+uint32_t light_packet_transport_instance_id(
+    const light_packet_transport *transport)
+{
+    return transport != NULL ? transport->instance_id : 0u;
+}
+
+void light_packet_transport_reset_generation(
+    light_packet_transport *transport)
+{
+    if (transport == NULL) {
+        return;
+    }
+    memset(transport->transmit, 0, sizeof(transport->transmit));
+    memset(transport->receive, 0, sizeof(transport->receive));
+    transport->outgoing_record_offset = 0u;
+    transport->receive_header_length = 0u;
+    transport->receive_packet_length = 0u;
+    transport->receive_packet_expected = 0u;
+    transport->transmit_next = 0u;
+    transport->remote_receive_base = 0u;
+    transport->receive_base = 0u;
+    ++transport->status.generation_resets;
 }
 
 void light_packet_transport_get_status(

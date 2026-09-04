@@ -127,6 +127,210 @@ static void test_packet_mode_does_not_mix_with_finite_mode(void)
     um_light_peer_destroy(client);
 }
 
+static void test_recovers_when_peer_vanishes_during_handshake(void)
+{
+    um_light_packet_peer_config config =
+        um_light_packet_peer_default_config();
+    um_light_peer *client = NULL;
+    um_light_peer *gateway = NULL;
+    um_light_peer_frame client_frame;
+    um_light_peer_frame gateway_frame;
+    um_light_peer_status client_status;
+    um_light_peer_status gateway_status;
+    size_t client_clock = 0u;
+    size_t gateway_clock = 0u;
+    size_t step;
+    ++tests_run;
+
+    config.link.link_timeout_frames = 5u;
+    CHECK(um_light_packet_peer_create(&client, UM_LIVE_CLIENT, &config,
+                                      NULL, NULL) == UM_OK);
+    config.link.random_seed ^= UINT32_C(0x12589abc);
+    CHECK(um_light_packet_peer_create(&gateway, UM_LIVE_GATEWAY, &config,
+                                      NULL, NULL) == UM_OK);
+
+    /* Advance exactly far enough for the client to accept an OFFER, then
+     * replace the gateway before it can receive the CONFIRM. */
+    CHECK(um_light_peer_build(client, client_clock, &client_frame) ==
+          UM_OK);
+    CHECK(um_light_peer_process(gateway, gateway_clock, &client_frame) ==
+          UM_OK);
+    CHECK(um_light_peer_build(gateway, gateway_clock, &gateway_frame) ==
+          UM_OK);
+    CHECK(um_light_peer_process(client, client_clock, &gateway_frame) ==
+          UM_OK);
+    ++client_clock;
+    um_light_peer_destroy(gateway);
+
+    config.link.random_seed ^= UINT32_C(0xa6c3017d);
+    CHECK(um_light_packet_peer_create(&gateway, UM_LIVE_GATEWAY, &config,
+                                      NULL, NULL) == UM_OK);
+    for (step = 0u; step < 40u; ++step) {
+        CHECK(um_light_peer_build(client, client_clock, &client_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_build(gateway, gateway_clock, &gateway_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_process(client, client_clock, &gateway_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_process(gateway, gateway_clock, &client_frame) ==
+              UM_OK);
+        ++client_clock;
+        ++gateway_clock;
+        um_light_peer_get_status(client, &client_status);
+        um_light_peer_get_status(gateway, &gateway_status);
+        if (client_status.connected != 0 &&
+            gateway_status.connected != 0) {
+            break;
+        }
+    }
+    CHECK(step < 40u);
+    CHECK(client_status.link_timeouts > 0u);
+    CHECK(client_status.connected != 0);
+    CHECK(gateway_status.connected != 0);
+    um_light_peer_destroy(gateway);
+    um_light_peer_destroy(client);
+}
+
+static void test_recovers_when_packet_peer_restarts(void)
+{
+    test_packet warm_client;
+    test_packet warm_gateway;
+    test_packet next_client;
+    test_packet next_gateway;
+    um_light_packet_peer_config config =
+        um_light_packet_peer_default_config();
+    um_light_peer *client = NULL;
+    um_light_peer *gateway = NULL;
+    um_light_peer_frame client_frame;
+    um_light_peer_frame gateway_frame;
+    um_light_peer_status client_status;
+    um_light_peer_status gateway_status;
+    size_t client_clock = 0u;
+    size_t gateway_clock = 0u;
+    size_t client_received = 0u;
+    size_t gateway_received = 0u;
+    size_t step;
+    ++tests_run;
+
+    fill_packet(&warm_client, 333u, UINT32_C(0xc11e0001));
+    fill_packet(&warm_gateway, 271u, UINT32_C(0x6a7e0001));
+    fill_packet(&next_client, 417u, UINT32_C(0xc11e0002));
+    fill_packet(&next_gateway, 509u, UINT32_C(0x6a7e0002));
+    config.link.link_timeout_frames = 6u;
+    config.link.retransmit_after_frames = 2u;
+    config.queue_packets = 8u;
+    CHECK(um_light_packet_peer_create(&client, UM_LIVE_CLIENT, &config,
+                                      NULL, NULL) == UM_OK);
+    config.link.random_seed ^= UINT32_C(0x73d9a421);
+    CHECK(um_light_packet_peer_create(&gateway, UM_LIVE_GATEWAY, &config,
+                                      NULL, NULL) == UM_OK);
+
+    for (step = 0u; step < 40u; ++step) {
+        CHECK(um_light_peer_build(client, client_clock, &client_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_build(gateway, gateway_clock, &gateway_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_process(client, client_clock, &gateway_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_process(gateway, gateway_clock, &client_frame) ==
+              UM_OK);
+        ++client_clock;
+        ++gateway_clock;
+        um_light_peer_get_status(client, &client_status);
+        um_light_peer_get_status(gateway, &gateway_status);
+        if (client_status.connected != 0 && gateway_status.connected != 0) {
+            break;
+        }
+    }
+    CHECK(step < 40u);
+    CHECK(um_light_peer_enqueue_packet(client, warm_client.bytes,
+                                       warm_client.length) == UM_OK);
+    CHECK(um_light_peer_enqueue_packet(gateway, warm_gateway.bytes,
+                                       warm_gateway.length) == UM_OK);
+    for (step = 0u; step < 120u; ++step) {
+        CHECK(um_light_peer_build(client, client_clock, &client_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_build(gateway, gateway_clock, &gateway_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_process(client, client_clock, &gateway_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_process(gateway, gateway_clock, &client_frame) ==
+              UM_OK);
+        CHECK(dequeue_expected(client, &warm_gateway, 1u,
+                               &client_received) == UM_OK);
+        CHECK(dequeue_expected(gateway, &warm_client, 1u,
+                               &gateway_received) == UM_OK);
+        ++client_clock;
+        ++gateway_clock;
+        um_light_peer_get_status(client, &client_status);
+        um_light_peer_get_status(gateway, &gateway_status);
+        if (client_received == 1u && gateway_received == 1u &&
+            client_status.outgoing_cells_in_flight == 0u &&
+            gateway_status.outgoing_cells_in_flight == 0u) {
+            break;
+        }
+    }
+    CHECK(step < 120u);
+
+    /* A new process has fresh packet sequence state and a fresh local frame
+     * clock.  The surviving client must recognize that this is not merely a
+     * camera outage and synchronize a new packet generation. */
+    um_light_peer_destroy(gateway);
+    config.link.random_seed ^= UINT32_C(0xd8510f36);
+    CHECK(um_light_packet_peer_create(&gateway, UM_LIVE_GATEWAY, &config,
+                                      NULL, NULL) == UM_OK);
+    gateway_clock = 0u;
+    for (step = 0u; step < 80u; ++step) {
+        CHECK(um_light_peer_build(client, client_clock, &client_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_build(gateway, gateway_clock, &gateway_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_process(client, client_clock, &gateway_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_process(gateway, gateway_clock, &client_frame) ==
+              UM_OK);
+        ++client_clock;
+        ++gateway_clock;
+        um_light_peer_get_status(client, &client_status);
+        um_light_peer_get_status(gateway, &gateway_status);
+        if (client_status.connected != 0 && gateway_status.connected != 0) {
+            break;
+        }
+    }
+    CHECK(step < 80u);
+    CHECK(client_status.packet_generation_resets == 1u);
+    client_received = 0u;
+    gateway_received = 0u;
+    CHECK(um_light_peer_enqueue_packet(client, next_client.bytes,
+                                       next_client.length) == UM_OK);
+    CHECK(um_light_peer_enqueue_packet(gateway, next_gateway.bytes,
+                                       next_gateway.length) == UM_OK);
+    for (step = 0u; step < 240u; ++step) {
+        CHECK(um_light_peer_build(client, client_clock, &client_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_build(gateway, gateway_clock, &gateway_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_process(client, client_clock, &gateway_frame) ==
+              UM_OK);
+        CHECK(um_light_peer_process(gateway, gateway_clock, &client_frame) ==
+              UM_OK);
+        CHECK(dequeue_expected(client, &next_gateway, 1u,
+                               &client_received) == UM_OK);
+        CHECK(dequeue_expected(gateway, &next_client, 1u,
+                               &gateway_received) == UM_OK);
+        ++client_clock;
+        ++gateway_clock;
+        if (client_received == 1u && gateway_received == 1u) {
+            break;
+        }
+    }
+    CHECK(step < 240u);
+    CHECK(client_received == 1u);
+    CHECK(gateway_received == 1u);
+    um_light_peer_destroy(gateway);
+    um_light_peer_destroy(client);
+}
+
 static void test_receive_backpressure_is_lossless(void)
 {
     enum { packet_count = 10 };
@@ -342,6 +546,8 @@ int main(void)
 {
     test_packet_arguments_and_capacity();
     test_packet_mode_does_not_mix_with_finite_mode();
+    test_recovers_when_peer_vanishes_during_handshake();
+    test_recovers_when_packet_peer_restarts();
     test_receive_backpressure_is_lossless();
     test_persistent_packets_with_outage_and_independent_clocks();
     if (failures != 0) {

@@ -1,5 +1,6 @@
 #include "light_video.h"
 #include "network.h"
+#include "network_trace.h"
 #include "traffic_policy.h"
 
 #include <stdarg.h>
@@ -78,7 +79,41 @@ typedef struct {
     size_t background_dropped;
     size_t background_dns_rejected;
     size_t quic_rejected;
+    um_network_trace trace;
 } light_live_network_stats;
+
+static const char *light_live_packet_direction(
+    const um_live_light_options *options, int from_local_network)
+{
+    if ((options->role == UM_LIVE_CLIENT) ==
+        (from_local_network != 0)) {
+        return "client->gateway";
+    }
+    return "gateway->client";
+}
+
+static void light_live_log_packet(
+    const um_live_light_options *options,
+    light_live_network_stats *stats, const uint8_t *packet,
+    size_t packet_length, int from_local_network,
+    um_log_callback logger, void *logger_context)
+{
+    char description[512];
+    size_t packet_number =
+        from_local_network != 0 ? stats->tun_packets_read
+                                : stats->tun_packets_written;
+    int activity;
+    um_network_trace_observe(&stats->trace, packet, packet_length);
+    activity = um_network_trace_describe(
+        &stats->trace, packet, packet_length, description,
+        sizeof(description));
+    if (activity != 0) {
+        light_live_log(
+            logger, logger_context, "light %s packet=%zu traffic=%s bytes=%zu",
+            light_live_packet_direction(options, from_local_network),
+            packet_number, description, packet_length);
+    }
+}
 
 static int light_live_filter_packet(
     const um_live_light_options *options, um_network *network,
@@ -143,7 +178,8 @@ static int light_live_filter_packet(
 
 static int light_live_collect_packets(
     const um_live_light_options *options, um_network *network,
-    um_light_peer *peer, light_live_network_stats *stats)
+    um_light_peer *peer, light_live_network_stats *stats,
+    um_log_callback logger, void *logger_context)
 {
     unsigned read_count;
     for (read_count = 0u; read_count < LIGHT_LIVE_INGRESS_BURST;
@@ -181,13 +217,16 @@ static int light_live_collect_packets(
         }
         ++stats->tun_packets_read;
         stats->tun_bytes_read += packet_length;
+        light_live_log_packet(options, stats, packet, packet_length, 1,
+                              logger, logger_context);
     }
     return UM_OK;
 }
 
-static int light_live_deliver_packets(um_network *network,
-                                      um_light_peer *peer,
-                                      light_live_network_stats *stats)
+static int light_live_deliver_packets(
+    const um_live_light_options *options, um_network *network,
+    um_light_peer *peer, light_live_network_stats *stats,
+    um_log_callback logger, void *logger_context)
 {
     for (;;) {
         uint8_t packet[UM_NETWORK_MAX_PACKET];
@@ -206,6 +245,8 @@ static int light_live_deliver_packets(um_network *network,
         }
         ++stats->tun_packets_written;
         stats->tun_bytes_written += packet_length;
+        light_live_log_packet(options, stats, packet, packet_length, 0,
+                              logger, logger_context);
     }
 }
 
@@ -268,6 +309,7 @@ int um_run_live_light(const um_live_light_options *options,
     }
     memset(&last_metrics, 0, sizeof(last_metrics));
     memset(&network_stats, 0, sizeof(network_stats));
+    um_network_trace_init(&network_stats.trace);
 
     pixels = (uint8_t *)malloc(LIGHT_LIVE_MAX_PIXELS);
     if (options->link_test != 0) {
@@ -431,11 +473,13 @@ int um_run_live_light(const um_live_light_options *options,
                     um_network_interface_name(network),
                     um_network_mtu(network));
             }
-            status = light_live_deliver_packets(network, peer,
-                                                &network_stats);
+            status = light_live_deliver_packets(
+                options, network, peer, &network_stats, logger,
+                logger_context);
             if (status == UM_OK) {
                 status = light_live_collect_packets(
-                    options, network, peer, &network_stats);
+                    options, network, peer, &network_stats, logger,
+                    logger_context);
             }
             if (status != UM_OK) {
                 break;
@@ -482,6 +526,7 @@ int um_run_live_light(const um_live_light_options *options,
                     logger, logger_context,
                     "light network symbol=%zu state=%s decoded=%zu "
                     "misses=%zu retries=%zu reconnects=%zu "
+                    "packet-resets=%zu "
                     "queue=%zu+%zu received=%zu delivered=%zu "
                     "internet-goodput wall=%.1fs upload=%.0fbps "
                     "download=%.0fbps total=%.0fbps "
@@ -492,6 +537,7 @@ int um_run_live_light(const um_live_light_options *options,
                                                : "DISCOVERY",
                     decoded_frames, decode_misses,
                     peer_status.retransmissions, peer_status.reconnects,
+                    peer_status.packet_generation_resets,
                     peer_status.outgoing_packets_queued,
                     peer_status.outgoing_cells_in_flight,
                     peer_status.incoming_packets_received,

@@ -7,6 +7,7 @@ test_light_session
 test_light_packet
 test_light_network
 test_light_video
+test_network_trace
 test_tcp_relay
 universal-modem
 calibration.config

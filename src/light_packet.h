@@ -22,6 +22,7 @@ typedef struct {
     size_t packet_bytes_received;
     size_t duplicate_cells;
     size_t retransmissions;
+    size_t generation_resets;
 } light_packet_transport_status;
 
 int light_packet_transport_create(light_packet_transport **transport,
@@ -47,6 +48,10 @@ int light_packet_transport_process(light_packet_transport *transport,
                                    size_t payload_length, int has_data);
 unsigned light_packet_transport_max_packet(
     const light_packet_transport *transport);
+uint32_t light_packet_transport_instance_id(
+    const light_packet_transport *transport);
+void light_packet_transport_reset_generation(
+    light_packet_transport *transport);
 void light_packet_transport_get_status(
     const light_packet_transport *transport,
     light_packet_transport_status *status);

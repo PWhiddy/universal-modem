@@ -46,6 +46,7 @@ LIB_SOURCES := \
 	src/live_wire.c \
 	src/modem.c \
 	src/network.c \
+	src/network_trace.c \
 	src/qam.c
 
 LIB_SOURCES += src/session.c src/tcp_relay.c src/traffic_policy.c \
@@ -92,15 +93,19 @@ test_light_video: tests/test_light_video.o src/light_video.o \
 	$(LIGHT_VIDEO_PLATFORM_OBJECTS)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
+test_network_trace: tests/test_network_trace.o src/network_trace.o
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
 test check: test_modem test_light test_light_session test_light_packet \
 	test_light_network \
-	test_light_video test_live_audio test_tcp_relay
+	test_light_video test_network_trace test_live_audio test_tcp_relay
 	./test_modem
 	./test_light
 	./test_light_session
 	./test_light_packet
 	./test_light_network
 	./test_light_video
+	./test_network_trace
 	./test_live_audio
 	./test_tcp_relay
 
@@ -114,13 +119,15 @@ test check: test_modem test_light test_light_session test_light_packet \
 src/audio.o src/live.o: src/audio.h
 src/live.o src/network.o tests/test_live_audio.o tests/test_tcp_relay.o: \
 	src/network.h
+src/live.o: src/network_trace.h
 src/network.o src/tcp_relay.o tests/test_tcp_relay.o: src/tcp_relay.h
 src/live.o src/live_wire.o tests/test_modem.o tests/test_live_audio.o: src/live_wire.h
 src/live.o src/traffic_policy.o tests/test_modem.o: src/traffic_policy.h
 tests/test_live_audio.o: src/audio.h
 src/main.o src/light_live.o src/light_video.o tests/test_light_video.o: \
 	src/light_video.h
-src/light_live.o: src/network.h src/traffic_policy.h
+src/light_live.o: src/network.h src/network_trace.h src/traffic_policy.h
+src/network_trace.o tests/test_network_trace.o: src/network_trace.h
 src/light_packet.o src/light_session.o tests/test_light_packet.o: \
 	src/light_packet.h
 
@@ -129,8 +136,10 @@ clean:
 		tests/test_light.o tests/test_light_session.o \
 		tests/test_light_packet.o \
 		tests/test_light_network.o tests/test_light_video.o \
+		tests/test_network_trace.o \
 		tests/test_tcp_relay.o $(LIGHT_VIDEO_PLATFORM_OBJECTS) universal-modem \
 		test_modem test_light test_light_session test_light_packet \
 		test_light_network \
 		test_light_video \
+		test_network_trace \
 		test_live_audio test_tcp_relay

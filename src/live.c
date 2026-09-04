@@ -3,6 +3,7 @@
 #include "audio.h"
 #include "live_wire.h"
 #include "network.h"
+#include "network_trace.h"
 #include "traffic_policy.h"
 #include "um_internal.h"
 
@@ -44,8 +45,6 @@
 #define LIVE_PROXY_QUEUE_PACKETS 64u
 #define LIVE_PROXY_RECENT_DNS 64u
 #define LIVE_PROXY_INFLIGHT_DNS 64u
-#define LIVE_PROXY_DNS_ADDRESS_CACHE 128u
-#define LIVE_PROXY_DNS_NAME_BYTES 96u
 #define LIVE_PROXY_DNS_RETRY_SUPPRESS_MS 30000u
 #define LIVE_PROXY_DNS_INFLIGHT_SUPPRESS_MS 15000u
 #define LIVE_PROXY_DNS_QUEUE_LIMIT 48u
@@ -115,13 +114,6 @@ typedef struct {
 } live_proxy_inflight_dns;
 
 typedef struct {
-    uint8_t address[16];
-    uint8_t address_length;
-    char name[LIVE_PROXY_DNS_NAME_BYTES];
-    uint64_t expires_ms;
-} live_proxy_dns_address;
-
-typedef struct {
     um_live_audio_options options;
     um_audio *audio;
     um_network *network;
@@ -165,9 +157,8 @@ typedef struct {
     live_proxy_queued_packet queue[LIVE_PROXY_QUEUE_PACKETS];
     live_proxy_recent_dns recent_dns[LIVE_PROXY_RECENT_DNS];
     live_proxy_inflight_dns inflight_dns[LIVE_PROXY_INFLIGHT_DNS];
-    live_proxy_dns_address dns_addresses[LIVE_PROXY_DNS_ADDRESS_CACHE];
+    um_network_trace network_trace;
     live_proxy_queued_packet preferred_reply_flow;
-    size_t next_dns_address;
     size_t queue_count;
     size_t queue_dropped;
     size_t queue_duplicates;
@@ -2411,101 +2402,6 @@ static unsigned proxy_packet_priority(const uint8_t *packet, size_t length)
     return LIVE_PROXY_PRIORITY_BULK;
 }
 
-static const char *dns_record_type(uint16_t type, char text[16])
-{
-    switch (type) {
-    case 1u:
-        return "A";
-    case 5u:
-        return "CNAME";
-    case 12u:
-        return "PTR";
-    case 16u:
-        return "TXT";
-    case 28u:
-        return "AAAA";
-    case 64u:
-        return "SVCB";
-    case 65u:
-        return "HTTPS";
-    default:
-        (void)snprintf(text, 16u, "TYPE%u", (unsigned)type);
-        return text;
-    }
-}
-
-static int read_dns_name(const uint8_t *dns, size_t dns_length,
-                         size_t start, char *name, size_t name_capacity,
-                         size_t *next)
-{
-    size_t position = start;
-    size_t output = 0u;
-    size_t jump_count = 0u;
-    int jumped = 0;
-    if (name == NULL || name_capacity == 0u || next == NULL) {
-        return 0;
-    }
-    while (position < dns_length && jump_count <= 16u) {
-        size_t label_length = dns[position];
-        if ((label_length & 0xc0u) == 0xc0u) {
-            size_t target;
-            if (position + 1u >= dns_length) {
-                return 0;
-            }
-            target = ((label_length & 0x3fu) << 8u) | dns[position + 1u];
-            if (target >= dns_length) {
-                return 0;
-            }
-            if (jumped == 0) {
-                *next = position + 2u;
-            }
-            position = target;
-            jumped = 1;
-            ++jump_count;
-            continue;
-        }
-        if (label_length == 0u) {
-            if (jumped == 0) {
-                *next = position + 1u;
-            }
-            if (output == 0u) {
-                if (name_capacity < 2u) {
-                    return 0;
-                }
-                name[output++] = '.';
-            }
-            name[output] = '\0';
-            return 1;
-        }
-        if (label_length > 63u ||
-            position + 1u + label_length > dns_length) {
-            return 0;
-        }
-        if (output != 0u) {
-            if (output + 1u >= name_capacity) {
-                return 0;
-            }
-            name[output++] = '.';
-        }
-        ++position;
-        while (label_length-- != 0u) {
-            unsigned char character = dns[position++];
-            if (output + 1u >= name_capacity) {
-                return 0;
-            }
-            name[output++] =
-                (char)(isalnum(character) != 0 || character == '-' ||
-                               character == '_'
-                           ? character
-                           : '?');
-        }
-        if (jumped == 0) {
-            *next = position;
-        }
-    }
-    return 0;
-}
-
 static uint32_t dns_name_hash(const char *name)
 {
     uint32_t hash = UINT32_C(2166136261);
@@ -2550,8 +2446,9 @@ static int dns_packet_key(const uint8_t *packet, size_t length,
     flags = read_u16(&dns[2]);
     if (((flags & UINT16_C(0x8000)) != 0u) != (response != 0) ||
         read_u16(&dns[4]) == 0u ||
-        read_dns_name(dns, dns_length, 12u, name, sizeof(name),
-                      &question_end) == 0 ||
+        um_network_trace_read_dns_name(
+            dns, dns_length, 12u, name, sizeof(name),
+            &question_end) == 0 ||
         question_end + 4u > dns_length) {
         return 0;
     }
@@ -2580,332 +2477,6 @@ static int dns_keys_equal(const live_proxy_dns_key *left,
            left->transaction_id == right->transaction_id &&
            left->question_type == right->question_type &&
            left->question_class == right->question_class;
-}
-
-static int describe_dns(const uint8_t *packet, size_t length,
-                        size_t transport_offset, char *description,
-                        size_t description_capacity)
-{
-    const uint8_t *dns;
-    size_t dns_length;
-    size_t question_end = 0u;
-    uint16_t udp_length;
-    uint16_t flags;
-    uint16_t type;
-    char name[96];
-    char type_text[16];
-    if (transport_offset + 8u > length) {
-        return 0;
-    }
-    udp_length = read_u16(&packet[transport_offset + 4u]);
-    if (udp_length < 20u || transport_offset + udp_length > length) {
-        return 0;
-    }
-    dns = &packet[transport_offset + 8u];
-    dns_length = udp_length - 8u;
-    if (read_u16(&dns[4]) == 0u ||
-        read_dns_name(dns, dns_length, 12u, name, sizeof(name),
-                      &question_end) == 0 ||
-        question_end + 4u > dns_length) {
-        return 0;
-    }
-    flags = read_u16(&dns[2]);
-    type = read_u16(&dns[question_end]);
-    if ((flags & UINT16_C(0x8000)) == 0u) {
-        (void)snprintf(description, description_capacity,
-                       "query %s %s id=%u", name,
-                       dns_record_type(type, type_text),
-                       (unsigned)read_u16(dns));
-    } else {
-        (void)snprintf(description, description_capacity,
-                       "response %s %s id=%u rcode=%u answers=%u", name,
-                       dns_record_type(type, type_text),
-                       (unsigned)read_u16(dns), (unsigned)(flags & 0x0fu),
-                       (unsigned)read_u16(&dns[6]));
-    }
-    return 1;
-}
-
-static void remember_dns_address(live_proxy_state *state,
-                                 const uint8_t *address,
-                                 size_t address_length, const char *name,
-                                 uint32_t ttl)
-{
-    uint64_t now = monotonic_milliseconds();
-    uint64_t ttl_seconds = ttl == 0u ? 1u : ttl;
-    size_t selected = SIZE_MAX;
-    size_t index;
-    if (state == NULL || address == NULL || name == NULL ||
-        (address_length != 4u && address_length != 16u)) {
-        return;
-    }
-    if (ttl_seconds > 86400u) {
-        ttl_seconds = 86400u;
-    }
-    for (index = 0u; index < LIVE_PROXY_DNS_ADDRESS_CACHE; ++index) {
-        live_proxy_dns_address *entry = &state->dns_addresses[index];
-        if (entry->address_length == address_length &&
-            memcmp(entry->address, address, address_length) == 0) {
-            selected = index;
-            break;
-        }
-        if (selected == SIZE_MAX &&
-            (entry->address_length == 0u || entry->expires_ms <= now)) {
-            selected = index;
-        }
-    }
-    if (selected == SIZE_MAX) {
-        selected = state->next_dns_address++ % LIVE_PROXY_DNS_ADDRESS_CACHE;
-    }
-    state->dns_addresses[selected].address_length = (uint8_t)address_length;
-    memcpy(state->dns_addresses[selected].address, address, address_length);
-    (void)snprintf(state->dns_addresses[selected].name,
-                   sizeof(state->dns_addresses[selected].name), "%s", name);
-    state->dns_addresses[selected].expires_ms = now + ttl_seconds * 1000u;
-}
-
-static void remember_dns_response_addresses(live_proxy_state *state,
-                                            const uint8_t *packet,
-                                            size_t length)
-{
-    const uint8_t *dns;
-    size_t transport_offset;
-    size_t dns_length;
-    size_t offset = 12u;
-    uint16_t udp_length;
-    uint16_t question_count;
-    uint16_t answer_count;
-    size_t index;
-    char question[LIVE_PROXY_DNS_NAME_BYTES];
-    if (state == NULL || validate_ip_packet(packet, length) != UM_OK ||
-        (packet[0] >> 4u) != 4u || packet[9] != 17u ||
-        (read_u16(&packet[6]) & UINT16_C(0x3fff)) != 0u) {
-        return;
-    }
-    transport_offset = (size_t)(packet[0] & 0x0fu) * 4u;
-    if (transport_offset + 20u > length ||
-        read_u16(&packet[transport_offset]) != 53u) {
-        return;
-    }
-    udp_length = read_u16(&packet[transport_offset + 4u]);
-    if (udp_length < 20u || transport_offset + udp_length != length) {
-        return;
-    }
-    dns = &packet[transport_offset + 8u];
-    dns_length = udp_length - 8u;
-    if ((read_u16(&dns[2]) & UINT16_C(0x8000)) == 0u) {
-        return;
-    }
-    question_count = read_u16(&dns[4]);
-    answer_count = read_u16(&dns[6]);
-    if (question_count == 0u || answer_count == 0u) {
-        return;
-    }
-    for (index = 0u; index < question_count; ++index) {
-        char name[LIVE_PROXY_DNS_NAME_BYTES];
-        size_t next = 0u;
-        if (read_dns_name(dns, dns_length, offset, name, sizeof(name),
-                          &next) == 0 ||
-            next + 4u > dns_length) {
-            return;
-        }
-        if (index == 0u) {
-            (void)snprintf(question, sizeof(question), "%s", name);
-        }
-        offset = next + 4u;
-    }
-    for (index = 0u; index < answer_count; ++index) {
-        char owner[LIVE_PROXY_DNS_NAME_BYTES];
-        size_t next = 0u;
-        uint16_t type;
-        uint16_t record_class;
-        uint32_t ttl;
-        uint16_t data_length;
-        if (read_dns_name(dns, dns_length, offset, owner, sizeof(owner),
-                          &next) == 0 ||
-            next + 10u > dns_length) {
-            return;
-        }
-        type = read_u16(&dns[next]);
-        record_class = read_u16(&dns[next + 2u]);
-        ttl = read_u32(&dns[next + 4u]);
-        data_length = read_u16(&dns[next + 8u]);
-        offset = next + 10u;
-        if ((size_t)data_length > dns_length - offset) {
-            return;
-        }
-        if (record_class == 1u && type == 1u && data_length == 4u) {
-            remember_dns_address(state, &dns[offset], 4u, question, ttl);
-        } else if (record_class == 1u && type == 28u &&
-                   data_length == 16u) {
-            remember_dns_address(state, &dns[offset], 16u, question, ttl);
-        }
-        offset += data_length;
-    }
-}
-
-static const char *dns_name_for_address(const live_proxy_state *state,
-                                        const uint8_t *address,
-                                        size_t address_length)
-{
-    uint64_t now = monotonic_milliseconds();
-    size_t index;
-    if (state == NULL || address == NULL) {
-        return NULL;
-    }
-    for (index = 0u; index < LIVE_PROXY_DNS_ADDRESS_CACHE; ++index) {
-        const live_proxy_dns_address *entry = &state->dns_addresses[index];
-        if (entry->expires_ms > now &&
-            entry->address_length == address_length &&
-            memcmp(entry->address, address, address_length) == 0) {
-            return entry->name;
-        }
-    }
-    return NULL;
-}
-
-static void describe_ipv4_host(const live_proxy_state *state,
-                               const uint8_t address[4], char *description,
-                               size_t description_capacity)
-{
-    const char *name = dns_name_for_address(state, address, 4u);
-    if (name != NULL) {
-        (void)snprintf(description, description_capacity,
-                       "%u.%u.%u.%u(%.60s)", address[0], address[1],
-                       address[2], address[3], name);
-    } else {
-        (void)snprintf(description, description_capacity, "%u.%u.%u.%u",
-                       address[0], address[1], address[2], address[3]);
-    }
-}
-
-static void describe_icmp_packet(const uint8_t *packet, size_t length,
-                                 size_t transport_offset, unsigned version,
-                                 const char *family, char *description,
-                                 size_t description_capacity)
-{
-    unsigned type;
-    unsigned code;
-    if (transport_offset + 2u > length) {
-        (void)snprintf(description, description_capacity, "%s/ICMP", family);
-        return;
-    }
-    type = packet[transport_offset];
-    code = packet[transport_offset + 1u];
-    if (version == 4u) {
-        const uint8_t *quoted;
-        size_t quoted_length;
-        size_t quoted_header_length;
-        unsigned quoted_protocol;
-        if (type == 3u && transport_offset + 8u + 20u <= length) {
-            quoted = &packet[transport_offset + 8u];
-            quoted_length = length - transport_offset - 8u;
-            quoted_header_length = (size_t)(quoted[0] & 0x0fu) * 4u;
-            quoted_protocol = quoted[9];
-            if ((quoted[0] >> 4u) == 4u &&
-                quoted_header_length >= 20u &&
-                quoted_header_length + 4u <= quoted_length &&
-                (quoted_protocol == 6u || quoted_protocol == 17u)) {
-                (void)snprintf(
-                    description, description_capacity,
-                    "%s/ICMP %u.%u.%u.%u->%u.%u.%u.%u type=%u code=%u "
-                    "quoted=%s %u.%u.%u.%u:%u->%u.%u.%u.%u:%u",
-                    family, packet[12], packet[13], packet[14], packet[15],
-                    packet[16], packet[17], packet[18], packet[19], type,
-                    code, quoted_protocol == 6u ? "TCP" : "UDP", quoted[12],
-                    quoted[13], quoted[14], quoted[15],
-                    (unsigned)read_u16(&quoted[quoted_header_length]),
-                    quoted[16], quoted[17], quoted[18], quoted[19],
-                    (unsigned)read_u16(&quoted[quoted_header_length + 2u]));
-                return;
-            }
-        }
-        (void)snprintf(description, description_capacity,
-                       "%s/ICMP %u.%u.%u.%u->%u.%u.%u.%u type=%u code=%u",
-                       family, packet[12], packet[13], packet[14], packet[15],
-                       packet[16], packet[17], packet[18], packet[19], type,
-                       code);
-        return;
-    }
-    (void)snprintf(description, description_capacity,
-                   "%s/ICMP type=%u code=%u", family, type, code);
-}
-
-static void describe_proxy_packet(const live_proxy_state *state,
-                                  const uint8_t *packet, size_t length,
-                                  char *description,
-                                  size_t description_capacity)
-{
-    size_t transport_offset = 0u;
-    unsigned protocol = 0u;
-    unsigned version = length != 0u ? packet[0] >> 4u : 0u;
-    const char *family = version == 4u ? "IPv4" : version == 6u ? "IPv6" :
-                                                                  "IP";
-    if (version == 4u && length >= 20u) {
-        transport_offset = (size_t)(packet[0] & 0x0fu) * 4u;
-        protocol = packet[9];
-    } else if (version == 6u && length >= 40u) {
-        transport_offset = 40u;
-        protocol = packet[6];
-    }
-    if ((protocol == 6u || protocol == 17u) &&
-        transport_offset + 4u <= length) {
-        char dns_description[160];
-        int is_dns = proxy_packet_priority(packet, length) ==
-                     LIVE_PROXY_PRIORITY_DNS;
-        int have_dns_description =
-            is_dns != 0 && protocol == 17u &&
-            describe_dns(packet, length, transport_offset,
-                         dns_description, sizeof(dns_description)) != 0;
-        if (version == 4u) {
-            char source[80];
-            char destination[80];
-            describe_ipv4_host(state, &packet[12], source, sizeof(source));
-            describe_ipv4_host(state, &packet[16], destination,
-                               sizeof(destination));
-            (void)snprintf(
-                description, description_capacity,
-                "%s/%s %s:%u->%s:%u%s%s%s",
-                family, protocol == 6u ? "TCP" : "UDP",
-                source, (unsigned)read_u16(&packet[transport_offset]),
-                destination,
-                (unsigned)read_u16(&packet[transport_offset + 2u]),
-                is_dns != 0 ? " DNS" : "",
-                have_dns_description != 0 ? " " : "",
-                have_dns_description != 0 ? dns_description : "");
-        } else {
-            (void)snprintf(
-                description, description_capacity, "%s/%s %u->%u%s%s%s",
-                family, protocol == 6u ? "TCP" : "UDP",
-                (unsigned)read_u16(&packet[transport_offset]),
-                (unsigned)read_u16(&packet[transport_offset + 2u]),
-                is_dns != 0 ? " DNS" : "",
-                have_dns_description != 0 ? " " : "",
-                have_dns_description != 0 ? dns_description : "");
-        }
-        if (protocol == 6u && transport_offset + 20u <= length) {
-            size_t tcp_header =
-                (size_t)(packet[transport_offset + 12u] >> 4u) * 4u;
-            size_t used = strlen(description);
-            if (tcp_header >= 20u &&
-                transport_offset + tcp_header <= length &&
-                used < description_capacity) {
-                (void)snprintf(
-                    &description[used], description_capacity - used,
-                    " flags=0x%02x seq=%u ack=%u payload=%zu",
-                    (unsigned)packet[transport_offset + 13u],
-                    (unsigned)read_u32(&packet[transport_offset + 4u]),
-                    (unsigned)read_u32(&packet[transport_offset + 8u]),
-                    length - transport_offset - tcp_header);
-            }
-        }
-    } else if (protocol == 1u || protocol == 58u) {
-        describe_icmp_packet(packet, length, transport_offset, version,
-                             family, description, description_capacity);
-    } else {
-        (void)snprintf(description, description_capacity, "%s/proto-%u",
-                       family, protocol);
-    }
 }
 
 static void remove_proxy_queue_entry(live_proxy_state *state, size_t index)
@@ -3770,8 +3341,9 @@ static void log_proxy_packet(live_context *context,
                                     : state->bytes_received;
     size_t dns_bytes = transmitted != 0 ? state->dns_bytes_sent
                                         : state->dns_bytes_received;
-    describe_proxy_packet(state, packet, packet_length, description,
-                          sizeof(description));
+    (void)um_network_trace_describe(
+        &state->network_trace, packet, packet_length, description,
+        sizeof(description));
     live_log(context,
              "proxy %s packet=%u traffic=%s bytes=%zu fragments=%zu "
              "total-packets=%zu total-bytes=%zu rate=%.0fbps "
@@ -3933,7 +3505,8 @@ static void account_proxy_packet_bytes(live_proxy_state *state,
                                        size_t packet_length)
 {
     int dns = proxy_packet_is_dns_traffic(packet, packet_length);
-    remember_dns_response_addresses(state, packet, packet_length);
+    um_network_trace_observe(&state->network_trace, packet,
+                             packet_length);
     if (transmitted != 0) {
         ++state->packets_sent;
         state->bytes_sent += packet_length;
