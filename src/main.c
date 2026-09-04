@@ -16,6 +16,10 @@ static void usage(FILE *stream)
             "[--fec 1/2|2/3|3/4] [--noise LEVEL]\n"
             "  universal-modem --light --simulate [--noise LEVEL]\n"
             "  universal-modem --light --io-test [video options]\n"
+            "  universal-modem --light --gateway --link-test "
+            "[light options]\n"
+            "  universal-modem --light --client --link-test "
+            "[light options]\n"
             "  universal-modem --calibrate [--calib-high]\n"
             "  universal-modem --session-sim [--calib-high]\n"
             "  universal-modem --list-audio\n"
@@ -26,14 +30,15 @@ static void usage(FILE *stream)
             "  --audio              Explicitly select the default audio medium\n"
             "  --input-device ID    Capture device ID shown at startup\n"
             "  --output-device ID   Playback device ID shown at startup\n"
-            "  --link-test          Finite bidirectional data test; no TUN/routes\n"
-            "  --test-bytes N       Link-test bytes each direction (default 1024)\n"
             "  --chunk-bytes N      Maximum calibrated frame body (default 2048)\n"
             "  --retries N          Attempts per acknowledged frame (default 4)\n"
             "  --calib-high         Use the extended real-audio calibration\n"
             "  --allow-background   Disable the default quiet-link firewall\n"
             "  --allow-messages     Allow Messages/APNs through that firewall\n"
             "  calibration.config  Auto-loaded/saved; delete it to recalibrate\n"
+            "\nLink-test options (audio or light):\n"
+            "  --link-test          Finite bidirectional exact-byte test; no TUN\n"
+            "  --test-bytes N       Bytes each way (default 1024; match light peers)\n"
             "\nLight options:\n"
             "  --light              Select the optical medium\n"
             "  --simulate           Run impaired full-duplex IPv4 simulation\n"
@@ -42,7 +47,8 @@ static void usage(FILE *stream)
             "  --camera-device ID   V4L2 path or AVFoundation ID/name\n"
             "  --frames N           Frames to display (default 300)\n"
             "  --window-size N      Square output size (default 720 pixels)\n"
-            "  close the window or press q/Esc to stop the I/O test\n");
+            "  peers may start at any time; close the window or press q/Esc "
+            "to stop\n");
 }
 
 static void print_log(void *context, const char *message)
@@ -50,6 +56,15 @@ static void print_log(void *context, const char *message)
     FILE *stream = (FILE *)context;
     fprintf(stream, "%s\n", message);
     fflush(stream);
+}
+
+static double current_wall_seconds(void)
+{
+    struct timespec now;
+    if (timespec_get(&now, TIME_UTC) != TIME_UTC) {
+        return 0.0;
+    }
+    return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
 }
 
 static int run_calibration(int high_quality)
@@ -269,6 +284,8 @@ static int run_light_io_test(const char *camera_device, size_t frame_limit,
     size_t foreign_frames = 0u;
     uint32_t last_sequence = 0u;
     int have_sequence = 0;
+    double started_at;
+    double elapsed;
     int status;
 
     config.camera_device = camera_device;
@@ -288,6 +305,7 @@ static int run_light_io_test(const char *camera_device, size_t frame_limit,
     printf("Light I/O beacon running for at most %zu frames; point the "
            "camera at the peer window\n",
            frame_limit);
+    started_at = current_wall_seconds();
 
     while (displayed < frame_limit &&
            um_light_video_should_close(video) == 0) {
@@ -362,6 +380,7 @@ static int run_light_io_test(const char *camera_device, size_t frame_limit,
         }
     }
 
+    elapsed = current_wall_seconds() - started_at;
     um_light_video_close(video);
     free(pixels);
     if (status != UM_OK) {
@@ -370,9 +389,11 @@ static int run_light_io_test(const char *camera_device, size_t frame_limit,
         return 1;
     }
     printf("light I/O complete displayed=%zu captured=%zu decoded=%zu "
-           "unique=%zu misses=%zu foreign=%zu\n",
+           "unique=%zu misses=%zu foreign=%zu elapsed=%.2fs "
+           "effective-rate=%.2ffps\n",
            displayed, captured, decoded_frames, unique_frames, misses,
-           foreign_frames);
+           foreign_frames, elapsed,
+           elapsed > 0.0 ? (double)captured / elapsed : 0.0);
     if (decoded_frames == 0u) {
         fprintf(stderr,
                 "no valid peer beacon was decoded; check camera aim, focus, "
@@ -402,6 +423,9 @@ int main(int argc, char **argv)
     int noise_was_set = 0;
     int modem_option_was_set = 0;
     int video_option_was_set = 0;
+    int frames_was_set = 0;
+    int audio_device_option_was_set = 0;
+    int audio_link_option_was_set = 0;
     const char *input_device = "default";
     const char *output_device = "default";
     const char *camera_device = "default";
@@ -459,8 +483,10 @@ int main(int argc, char **argv)
             endpoint = 2;
         } else if (strcmp(argv[i], "--input-device") == 0 && i + 1 < argc) {
             input_device = argv[++i];
+            audio_device_option_was_set = 1;
         } else if (strcmp(argv[i], "--output-device") == 0 && i + 1 < argc) {
             output_device = argv[++i];
+            audio_device_option_was_set = 1;
         } else if (strcmp(argv[i], "--camera-device") == 0 &&
                    i + 1 < argc) {
             camera_device = argv[++i];
@@ -476,6 +502,7 @@ int main(int argc, char **argv)
             }
             light_io_frames = (size_t)value;
             video_option_was_set = 1;
+            frames_was_set = 1;
         } else if (strcmp(argv[i], "--window-size") == 0 &&
                    i + 1 < argc) {
             char *end = NULL;
@@ -508,6 +535,7 @@ int main(int argc, char **argv)
                 return 2;
             }
             chunk_bytes = (size_t)value;
+            audio_link_option_was_set = 1;
         } else if (strcmp(argv[i], "--retries") == 0 && i + 1 < argc) {
             char *end = NULL;
             unsigned long value = strtoul(argv[++i], &end, 10);
@@ -517,6 +545,7 @@ int main(int argc, char **argv)
                 return 2;
             }
             retries = (unsigned)value;
+            audio_link_option_was_set = 1;
         } else if (strcmp(argv[i], "--qam") == 0 && i + 1 < argc) {
             if (!parse_qam(argv[++i], &config.qam_bits)) {
                 fprintf(stderr, "invalid QAM order\n");
@@ -621,48 +650,86 @@ int main(int argc, char **argv)
     }
     if (endpoint != 0 && simulate == 0 && calibrate == 0 &&
         session_simulation == 0) {
-        um_live_audio_options options = um_live_audio_default_options(
-            endpoint == 1 ? UM_LIVE_GATEWAY : UM_LIVE_CLIENT);
+        um_live_role role =
+            endpoint == 1 ? UM_LIVE_GATEWAY : UM_LIVE_CLIENT;
         int status;
         if (light != 0) {
-            fprintf(stderr,
-                    "live light camera/window mode is not implemented yet; "
-                    "use --light --simulate\n");
-            return 1;
+            um_live_light_options options =
+                um_live_light_default_options(role);
+            if (link_test == 0) {
+                fprintf(stderr,
+                        "live light currently requires --link-test; "
+                        "optical TUN/network mode is the next stage\n");
+                return 2;
+            }
+            if (frames_was_set != 0 || noise_was_set != 0 ||
+                modem_option_was_set != 0 || high_quality != 0 ||
+                audio_device_option_was_set != 0 ||
+                audio_link_option_was_set != 0 || allow_background != 0 ||
+                allow_messages != 0) {
+                fprintf(stderr,
+                        "--frames is for --io-test; audio device, modem, "
+                        "calibration, firewall, and noise options do not "
+                        "apply to a light link test\n");
+                return 2;
+            }
+            if (test_bytes > 16u * 1024u * 1024u) {
+                fprintf(stderr,
+                        "light link-test bytes must not exceed 16777216\n");
+                return 2;
+            }
+            options.camera_device = camera_device;
+            options.test_bytes = test_bytes;
+            options.window_size = light_window_size;
+            status = um_run_live_light(&options, print_log, stdout);
+            if (status == UM_ERR_INTERRUPTED) {
+                return 130;
+            }
+            if (status != UM_OK) {
+                fprintf(stderr, "real-light link test failed: %s\n",
+                        um_status_string(status));
+                return 1;
+            }
+            return 0;
         }
         if (video_option_was_set != 0) {
             fprintf(stderr,
                     "camera options apply to --light --io-test only\n");
             return 2;
         }
-        status = um_network_prepare_audio_user(print_log, stdout);
-        if (status != UM_OK) {
-            fprintf(stderr, "could not select the invoking user for audio\n");
-            return 1;
+        {
+            um_live_audio_options options =
+                um_live_audio_default_options(role);
+            status = um_network_prepare_audio_user(print_log, stdout);
+            if (status != UM_OK) {
+                fprintf(stderr,
+                        "could not select the invoking user for audio\n");
+                return 1;
+            }
+            if (noise_was_set != 0) {
+                fprintf(stderr, "--noise only applies to --simulate\n");
+                return 2;
+            }
+            options.input_device = input_device;
+            options.output_device = output_device;
+            options.link_test = link_test;
+            options.test_bytes = test_bytes;
+            options.chunk_bytes = chunk_bytes;
+            options.retry_limit = retries;
+            options.calibrate_high_quality = high_quality;
+            options.filter_background_traffic = allow_background == 0;
+            options.allow_messages_traffic = allow_messages;
+            status = um_run_live_audio(&options, print_log, stdout);
+            if (status == UM_ERR_INTERRUPTED) {
+                return 130;
+            }
+            if (status != UM_OK) {
+                fprintf(stderr, "real-audio session failed: %s\n",
+                        um_status_string(status));
+                return 1;
+            }
+            return 0;
         }
-        if (noise_was_set != 0) {
-            fprintf(stderr, "--noise only applies to --simulate\n");
-            return 2;
-        }
-        options.input_device = input_device;
-        options.output_device = output_device;
-        options.link_test = link_test;
-        options.test_bytes = test_bytes;
-        options.chunk_bytes = chunk_bytes;
-        options.retry_limit = retries;
-        options.calibrate_high_quality = high_quality;
-        options.filter_background_traffic = allow_background == 0;
-        options.allow_messages_traffic = allow_messages;
-        status = um_run_live_audio(&options, print_log, stdout);
-        if (status == UM_ERR_INTERRUPTED) {
-            return 130;
-        }
-        if (status != UM_OK) {
-            fprintf(stderr, "real-audio session failed: %s\n",
-                    um_status_string(status));
-            return 1;
-        }
-        return 0;
     }
     usage(stderr);
     return 2;

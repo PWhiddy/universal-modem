@@ -12,6 +12,15 @@ Start Client: `sudo ./universal-modem --audio --client`
 
 (--audio can be replaced with --light for video medium, but we are going to completely build and test audio first before starting work on light/video)
 
+Current finite optical hardware validation (no sudo or network routes):
+
+Gateway: `./universal-modem --light --gateway --link-test`
+
+Client: `./universal-modem --light --client --link-test`
+
+Either endpoint may start first. Both wait indefinitely for discovery and
+exchange and verify 1,024 bytes in each direction before exiting.
+
 ### Audio System logic:  
 When the gateway is started, it listens for a client.
 When the client is started, it broadcasts a connection request once every several seconds.

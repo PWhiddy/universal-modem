@@ -213,6 +213,8 @@ typedef struct {
     size_t client_payload_bytes;
     size_t gateway_payload_bytes;
     size_t max_frames;
+    size_t client_start_frame;
+    size_t gateway_start_frame;
     unsigned frames_per_second;
     unsigned transmit_window;
     unsigned retransmit_after_frames;
@@ -282,6 +284,46 @@ typedef enum {
     UM_LIVE_GATEWAY = 1,
     UM_LIVE_CLIENT = 2
 } um_live_role;
+
+typedef struct um_light_peer um_light_peer;
+
+typedef struct {
+    unsigned transmit_window;
+    unsigned retransmit_after_frames;
+    unsigned link_timeout_frames;
+    uint32_t random_seed;
+} um_light_peer_config;
+
+typedef struct {
+    int present;
+    uint8_t type;
+    uint32_t session_id;
+    uint32_t sequence;
+    uint8_t payload[UM_LIGHT_MAX_PAYLOAD];
+    size_t payload_length;
+} um_light_peer_frame;
+
+typedef struct {
+    size_t handshake_frames;
+    size_t data_frames;
+    size_t acknowledgement_frames;
+    size_t retransmissions;
+    size_t duplicate_data_frames;
+    size_t protocol_rejections;
+    size_t reconnects;
+    size_t link_timeouts;
+    size_t outgoing_bytes_acked;
+    size_t incoming_bytes_received;
+    int connected;
+} um_light_peer_status;
+
+typedef struct {
+    um_live_role role;
+    const char *camera_device;
+    size_t test_bytes;
+    unsigned window_size;
+    unsigned completion_linger_frames;
+} um_live_light_options;
 
 typedef struct {
     um_live_role role;
@@ -376,6 +418,21 @@ int um_simulate_light_session(
     um_light_session_simulation_result *result, um_log_callback logger,
     void *logger_context);
 
+um_light_peer_config um_light_peer_default_config(void);
+int um_light_peer_create(um_light_peer **peer, um_live_role role,
+                         const um_light_peer_config *config,
+                         const uint8_t *outgoing, size_t outgoing_length,
+                         uint8_t *incoming, size_t incoming_length,
+                         um_log_callback logger, void *logger_context);
+void um_light_peer_destroy(um_light_peer *peer);
+int um_light_peer_build(um_light_peer *peer, size_t local_frame,
+                        um_light_peer_frame *frame);
+int um_light_peer_process(um_light_peer *peer, size_t local_frame,
+                          const um_light_peer_frame *frame);
+int um_light_peer_complete(const um_light_peer *peer);
+void um_light_peer_get_status(const um_light_peer *peer,
+                              um_light_peer_status *status);
+
 um_light_network_simulation_config
 um_light_network_simulation_default_config(void);
 int um_simulate_light_network(
@@ -386,6 +443,9 @@ int um_simulate_light_network(
 int um_audio_list_devices(um_log_callback logger, void *logger_context);
 um_live_audio_options um_live_audio_default_options(um_live_role role);
 int um_run_live_audio(const um_live_audio_options *options,
+                      um_log_callback logger, void *logger_context);
+um_live_light_options um_live_light_default_options(um_live_role role);
+int um_run_live_light(const um_live_light_options *options,
                       um_log_callback logger, void *logger_context);
 
 const char *um_status_string(int status);

@@ -37,6 +37,7 @@ LIB_SOURCES := \
 	src/fft.c \
 	src/interleave.c \
 	src/light.c \
+	src/light_live.c \
 	src/light_network.c \
 	src/light_session.c \
 	src/light_video.c \
@@ -109,7 +110,8 @@ src/network.o src/tcp_relay.o tests/test_tcp_relay.o: src/tcp_relay.h
 src/live.o src/live_wire.o tests/test_modem.o tests/test_live_audio.o: src/live_wire.h
 src/live.o src/traffic_policy.o tests/test_modem.o: src/traffic_policy.h
 tests/test_live_audio.o: src/audio.h
-src/main.o src/light_video.o tests/test_light_video.o: src/light_video.h
+src/main.o src/light_live.o src/light_video.o tests/test_light_video.o: \
+	src/light_video.h
 
 clean:
 	rm -f $(LIB_OBJECTS) src/main.o tests/test_modem.o tests/test_live_audio.o \
