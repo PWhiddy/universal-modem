@@ -144,8 +144,8 @@ um_light_video_config um_light_video_default_config(void)
 {
     um_light_video_config config;
     config.camera_device = "default";
-    config.camera_width = 640u;
-    config.camera_height = 480u;
+    config.camera_width = 1280u;
+    config.camera_height = 720u;
     config.frames_per_second = 15u;
     config.window_size = 720u;
     return config;

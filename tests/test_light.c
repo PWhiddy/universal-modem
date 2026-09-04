@@ -303,6 +303,60 @@ static void test_light_rejects_damage_and_bad_arguments(void)
               &pixels, &pixel_count) == UM_ERR_CONFIG);
 }
 
+static void test_light_cluttered_dark_scene(void)
+{
+    uint8_t payload[34];
+    uint8_t decoded[UM_LIGHT_MAX_PAYLOAD];
+    uint8_t modules[UM_LIGHT_GRID_SIZE * UM_LIGHT_GRID_SIZE];
+    uint8_t *pixels = NULL;
+    um_light_channel_config config = um_light_channel_default_config();
+    um_light_rx_metrics metrics;
+    size_t pixel_count = 0u;
+    size_t decoded_length = 0u;
+    uint8_t type = 0u;
+    uint32_t session = 0u;
+    uint32_t sequence = 0u;
+    size_t x;
+    size_t y;
+    ++tests_run;
+
+    fill_payload(payload, sizeof(payload), UINT32_C(0x94a71c23));
+    CHECK(um_light_encode_frame(0x70u, UINT32_C(0x554d5649), 271u,
+                                payload, sizeof(payload), modules,
+                                sizeof(modules)) == UM_OK);
+    config.image_width = 640u;
+    config.image_height = 480u;
+    config.corners[0] = (um_light_point){180.0f, 100.0f};
+    config.corners[1] = (um_light_point){460.0f, 85.0f};
+    config.corners[2] = (um_light_point){475.0f, 365.0f};
+    config.corners[3] = (um_light_point){165.0f, 380.0f};
+    config.noise_stddev = 0.01f;
+    config.blur_radius = 1u;
+    CHECK(um_light_render_frame(modules, sizeof(modules), &config, &pixels,
+                                &pixel_count) == UM_OK);
+
+    /* A real camera sees dark bezels, furniture, and the rest of the room.
+     * This boundary-connected region is intentionally much larger than the
+     * locator, matching the recorded webcam failure that this test guards. */
+    for (y = 0u; y < config.image_height; ++y) {
+        for (x = 0u; x < config.image_width; ++x) {
+            if (x < 95u || x >= 545u || y < 35u || y >= 435u) {
+                pixels[y * config.image_width + x] = 20u;
+            }
+        }
+    }
+    CHECK(um_light_decode_frame(
+              pixels, config.image_width, config.image_height,
+              config.image_width, &type, &session, &sequence, decoded,
+              sizeof(decoded), &decoded_length, &metrics) == UM_OK);
+    CHECK(type == 0x70u);
+    CHECK(session == UINT32_C(0x554d5649));
+    CHECK(sequence == 271u);
+    CHECK(decoded_length == sizeof(payload));
+    CHECK(memcmp(decoded, payload, sizeof(payload)) == 0);
+    free(pixels);
+}
+
 static void test_light_channel_failure_boundaries(void)
 {
     uint8_t payload[UM_LIGHT_MAX_PAYLOAD];
@@ -320,7 +374,7 @@ static void test_light_channel_failure_boundaries(void)
 
     /* Sweep through the decoder cliff instead of testing only hand-picked
      * successful channels.  With a fixed image and noise seed, every level
-     * through 0.45 decodes and 0.50 is the first rejected frame. */
+     * through 0.55 decodes and 0.60 is the first rejected frame. */
     for (level = 0u; level <= 12u; ++level) {
         um_light_rx_metrics metrics;
         int status;
@@ -334,7 +388,7 @@ static void test_light_channel_failure_boundaries(void)
             CHECK(status != UM_OK);
         }
     }
-    CHECK(first_failure == 10u);
+    CHECK(first_failure == 12u);
 
     config = um_light_channel_default_config();
     config.noise_stddev = 0.0f;
@@ -392,6 +446,7 @@ int main(void)
     test_light_scale_envelope();
     test_light_rotation_and_occlusion();
     test_light_rejects_damage_and_bad_arguments();
+    test_light_cluttered_dark_scene();
     test_light_channel_failure_boundaries();
 
     if (failures != 0) {

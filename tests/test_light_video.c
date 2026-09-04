@@ -30,8 +30,8 @@ static void test_default_video_configuration(void)
     ++tests_run;
 
     CHECK(strcmp(config.camera_device, "default") == 0);
-    CHECK(config.camera_width == 640u);
-    CHECK(config.camera_height == 480u);
+    CHECK(config.camera_width == 1280u);
+    CHECK(config.camera_height == 720u);
     CHECK(config.frames_per_second == 15u);
     CHECK(config.window_size == 720u);
 }

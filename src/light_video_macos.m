@@ -316,6 +316,7 @@ light_mac_create_state(const um_light_video_config *config,
     AVCaptureDeviceInput *input;
     UMLightVideoState *state;
     NSRect rectangle;
+    NSString *sessionPreset;
     const char *identifier;
     const char *name;
 
@@ -359,8 +360,21 @@ light_mac_create_state(const um_light_video_config *config,
     [state.output setSampleBufferDelegate:state.captureSink
                                     queue:state.captureQueue];
     [state.session beginConfiguration];
-    if ([state.session canSetSessionPreset:AVCaptureSessionPreset640x480]) {
-        state.session.sessionPreset = AVCaptureSessionPreset640x480;
+    if (config->camera_width >= 1920u && config->camera_height >= 1080u) {
+        sessionPreset = AVCaptureSessionPreset1920x1080;
+    } else if (config->camera_width >= 1280u &&
+               config->camera_height >= 720u) {
+        sessionPreset = AVCaptureSessionPreset1280x720;
+    } else {
+        sessionPreset = AVCaptureSessionPreset640x480;
+    }
+    if (![state.session canSetSessionPreset:sessionPreset]) {
+        sessionPreset = AVCaptureSessionPresetHigh;
+    }
+    if ([state.session canSetSessionPreset:sessionPreset]) {
+        state.session.sessionPreset = sessionPreset;
+    } else {
+        sessionPreset = nil;
     }
     if (![state.session canAddInput:input] ||
         ![state.session canAddOutput:state.output]) {
@@ -408,11 +422,14 @@ light_mac_create_state(const um_light_video_config *config,
     identifier = device.uniqueID.UTF8String;
     name = device.localizedName.UTF8String;
     light_mac_log(logger, loggerContext,
-                  "Opened camera %s (%s): requested %ux%u BGRA at %u fps",
+                  "Opened camera %s (%s): requested %ux%u BGRA at %u fps "
+                  "preset=%s",
                   identifier != NULL ? identifier : "unknown",
                   name != NULL ? name : "AVFoundation camera",
                   config->camera_width, config->camera_height,
-                  config->frames_per_second);
+                  config->frames_per_second,
+                  sessionPreset != nil ? sessionPreset.UTF8String
+                                       : "device-default");
     *status = UM_OK;
     return state;
 }

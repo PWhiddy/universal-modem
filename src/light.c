@@ -662,7 +662,10 @@ static int light_find_locator(const uint8_t *pixels, size_t width,
         }
         area = (component.max_x - component.min_x + 1u) *
                (component.max_y - component.min_y + 1u);
-        if (component.max_x - component.min_x + 1u <
+        if (component.min_x == 0u || component.min_y == 0u ||
+            component.max_x == width - 1u ||
+            component.max_y == height - 1u ||
+            component.max_x - component.min_x + 1u <
                 UM_LIGHT_GRID_SIZE / 2u ||
             component.max_y - component.min_y + 1u <
                 UM_LIGHT_GRID_SIZE / 2u ||
@@ -730,7 +733,8 @@ static float light_sample_pixel(const uint8_t *pixels, size_t width,
 
 static int light_sample_grid(const uint8_t *pixels, size_t width,
                              size_t height, size_t stride,
-                             const light_matrix *forward, float *samples)
+                             const light_matrix *forward, double phase_x,
+                             double phase_y, float *samples)
 {
     static const double offsets[] = {-0.18, 0.0, 0.18};
     size_t row;
@@ -743,9 +747,11 @@ static int light_sample_grid(const uint8_t *pixels, size_t width,
             for (oy = 0u; oy < 3u; ++oy) {
                 unsigned ox;
                 for (ox = 0u; ox < 3u; ++ox) {
-                    double u = ((double)column + 0.5 + offsets[ox]) /
+                    double u = ((double)column + 0.5 + offsets[ox] +
+                                phase_x) /
                                UM_LIGHT_GRID_SIZE;
-                    double v = ((double)row + 0.5 + offsets[oy]) /
+                    double v = ((double)row + 0.5 + offsets[oy] +
+                                phase_y) /
                                UM_LIGHT_GRID_SIZE;
                     double x;
                     double y;
@@ -908,21 +914,22 @@ int um_light_decode_frame(const uint8_t *pixels, size_t width, size_t height,
                           size_t *payload_length,
                           um_light_rx_metrics *metrics)
 {
+    static const struct {
+        double x;
+        double y;
+    } phases[] = {
+        /* Connected-component corners are quantized to whole camera pixels.
+         * Try the adjacent sub-module alignments only when CRC requires it. */
+        {0.0, 0.0},  {0.2, 0.0},  {-0.2, 0.0}, {0.0, 0.2},
+        {0.0, -0.2}, {0.2, 0.2},  {0.2, -0.2}, {-0.2, 0.2},
+        {-0.2, -0.2},
+    };
     um_light_point corners[4];
     light_matrix forward;
     float grid[UM_LIGHT_GRID_SIZE * UM_LIGHT_GRID_SIZE];
-    double black_sum = 0.0;
-    double white_sum = 0.0;
-    size_t black_count = 0u;
-    size_t white_count = 0u;
-    float black_mean;
-    float white_mean;
-    float threshold;
-    float contrast;
     uint8_t locator_threshold;
-    unsigned orientation;
-    size_t row;
-    size_t column;
+    size_t phase;
+    int found_locator_contrast = 0;
     int status;
 
     if (pixels == NULL || width < UM_LIGHT_GRID_SIZE ||
@@ -943,57 +950,73 @@ int um_light_decode_frame(const uint8_t *pixels, size_t width, size_t height,
     if (status != UM_OK) {
         return UM_ERR_SYNC;
     }
-    status = light_sample_grid(pixels, width, height, stride, &forward, grid);
-    if (status != UM_OK) {
-        return status;
-    }
+    for (phase = 0u; phase < sizeof(phases) / sizeof(phases[0]); ++phase) {
+        double black_sum = 0.0;
+        double white_sum = 0.0;
+        size_t black_count = 0u;
+        size_t white_count = 0u;
+        float black_mean;
+        float white_mean;
+        float threshold;
+        float contrast;
+        size_t row;
+        size_t column;
+        unsigned orientation;
 
-    for (row = 0u; row < UM_LIGHT_GRID_SIZE; ++row) {
-        for (column = 0u; column < UM_LIGHT_GRID_SIZE; ++column) {
-            float value = grid[row * UM_LIGHT_GRID_SIZE + column];
-            if (row < LIGHT_BORDER_MODULES ||
-                row >= UM_LIGHT_GRID_SIZE - LIGHT_BORDER_MODULES ||
-                column < LIGHT_BORDER_MODULES ||
-                column >= UM_LIGHT_GRID_SIZE - LIGHT_BORDER_MODULES) {
-                black_sum += value;
-                ++black_count;
-            } else if (row == LIGHT_BORDER_MODULES ||
-                       row == UM_LIGHT_GRID_SIZE - LIGHT_BORDER_MODULES - 1u ||
-                       column == LIGHT_BORDER_MODULES ||
-                       column ==
-                           UM_LIGHT_GRID_SIZE - LIGHT_BORDER_MODULES - 1u) {
-                white_sum += value;
-                ++white_count;
+        status = light_sample_grid(pixels, width, height, stride, &forward,
+                                   phases[phase].x, phases[phase].y, grid);
+        if (status != UM_OK) {
+            continue;
+        }
+        for (row = 0u; row < UM_LIGHT_GRID_SIZE; ++row) {
+            for (column = 0u; column < UM_LIGHT_GRID_SIZE; ++column) {
+                float value = grid[row * UM_LIGHT_GRID_SIZE + column];
+                if (row < LIGHT_BORDER_MODULES ||
+                    row >= UM_LIGHT_GRID_SIZE - LIGHT_BORDER_MODULES ||
+                    column < LIGHT_BORDER_MODULES ||
+                    column >= UM_LIGHT_GRID_SIZE - LIGHT_BORDER_MODULES) {
+                    black_sum += value;
+                    ++black_count;
+                } else if (
+                    row == LIGHT_BORDER_MODULES ||
+                    row == UM_LIGHT_GRID_SIZE - LIGHT_BORDER_MODULES - 1u ||
+                    column == LIGHT_BORDER_MODULES ||
+                    column ==
+                        UM_LIGHT_GRID_SIZE - LIGHT_BORDER_MODULES - 1u) {
+                    white_sum += value;
+                    ++white_count;
+                }
+            }
+        }
+        black_mean = (float)(black_sum / black_count);
+        white_mean = (float)(white_sum / white_count);
+        contrast = white_mean - black_mean;
+        if (contrast < 24.0f) {
+            continue;
+        }
+        found_locator_contrast = 1;
+        threshold = 0.5f * (black_mean + white_mean);
+
+        for (orientation = 0u; orientation < 8u; ++orientation) {
+            float corrected_fraction = 0.0f;
+            status = light_decode_orientation(
+                grid, threshold, contrast, orientation, frame_type,
+                session_id, sequence, payload, payload_capacity,
+                payload_length, &corrected_fraction);
+            if (status == UM_OK || status == UM_ERR_CAPACITY) {
+                unsigned i;
+                for (i = 0u; i < 4u; ++i) {
+                    metrics->corners[i] = corners[i];
+                }
+                metrics->threshold = threshold / 255.0f;
+                metrics->contrast = contrast / 255.0f;
+                metrics->image_coverage = (float)(
+                    light_quad_area(corners) / ((double)width * height));
+                metrics->corrected_bit_fraction = corrected_fraction;
+                metrics->orientation = orientation;
+                return status;
             }
         }
     }
-    black_mean = (float)(black_sum / black_count);
-    white_mean = (float)(white_sum / white_count);
-    contrast = white_mean - black_mean;
-    if (contrast < 24.0f) {
-        return UM_ERR_SYNC;
-    }
-    threshold = 0.5f * (black_mean + white_mean);
-
-    for (orientation = 0u; orientation < 8u; ++orientation) {
-        float corrected_fraction = 0.0f;
-        status = light_decode_orientation(
-            grid, threshold, contrast, orientation, frame_type, session_id,
-            sequence, payload, payload_capacity, payload_length,
-            &corrected_fraction);
-        if (status == UM_OK || status == UM_ERR_CAPACITY) {
-            unsigned i;
-            for (i = 0u; i < 4u; ++i) {
-                metrics->corners[i] = corners[i];
-            }
-            metrics->threshold = threshold / 255.0f;
-            metrics->contrast = contrast / 255.0f;
-            metrics->image_coverage =
-                (float)(light_quad_area(corners) / ((double)width * height));
-            metrics->corrected_bit_fraction = corrected_fraction;
-            metrics->orientation = orientation;
-            return status;
-        }
-    }
-    return UM_ERR_CRC;
+    return found_locator_contrast != 0 ? UM_ERR_CRC : UM_ERR_SYNC;
 }
