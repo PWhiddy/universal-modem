@@ -6,8 +6,6 @@ CSTD := -std=c11
 LDLIBS := -lm
 SYSTEM_NAME := $(shell uname -s)
 LIGHT_VIDEO_PLATFORM_OBJECTS :=
-MACOS_INFO_PLIST :=
-EXECUTABLE_LDFLAGS :=
 
 ifeq ($(SYSTEM_NAME),Linux)
 LDLIBS += -lasound -pthread
@@ -26,9 +24,6 @@ LDLIBS += -framework AVFoundation -framework CoreMedia -framework CoreVideo
 LDLIBS += -framework Cocoa
 CFLAGS += -pthread
 LIGHT_VIDEO_PLATFORM_OBJECTS += src/light_video_macos.o
-MACOS_INFO_PLIST := resources/macos-info.plist
-EXECUTABLE_LDFLAGS += \
-	-Wl,-sectcreate,__TEXT,__info_plist,$(MACOS_INFO_PLIST)
 endif
 
 LIB_SOURCES := \
@@ -62,9 +57,8 @@ SIM_LIB_OBJECTS := $(filter-out src/audio.o src/network.o src/tcp_relay.o,\
 
 all: universal-modem
 
-universal-modem: src/main.o $(LIB_OBJECTS) $(MACOS_INFO_PLIST)
-	$(CC) $(CFLAGS) src/main.o $(LIB_OBJECTS) $(EXECUTABLE_LDFLAGS) \
-		$(LDLIBS) -o $@
+universal-modem: src/main.o $(LIB_OBJECTS)
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
 
 test_modem: tests/test_modem.o $(LIB_OBJECTS)
 	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@

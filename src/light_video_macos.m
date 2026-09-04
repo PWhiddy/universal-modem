@@ -11,6 +11,24 @@
 
 #define LIGHT_MAC_QUIET_MODULES 2u
 
+/* TCC reads this Mach-O section before allowing AVFoundation camera access.
+ * Keeping it here makes the command-line build self-contained. */
+__attribute__((used, section("__TEXT,__info_plist")))
+static const char light_mac_info_plist[] =
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+    "<plist version=\"1.0\"><dict>"
+    "<key>CFBundleIdentifier</key>"
+    "<string>org.universal-modem.cli</string>"
+    "<key>CFBundleName</key><string>Universal Modem</string>"
+    "<key>CFBundlePackageType</key><string>APPL</string>"
+    "<key>CFBundleShortVersionString</key><string>0.1</string>"
+    "<key>CFBundleVersion</key><string>1</string>"
+    "<key>NSCameraUsageDescription</key>"
+    "<string>Universal Modem uses the camera to receive optical data from "
+    "the peer display.</string>"
+    "<key>NSHighResolutionCapable</key><true/>"
+    "</dict></plist>";
+
 @interface UMLightCaptureSink
     : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate> {
     NSCondition *_condition;
@@ -105,7 +123,9 @@
 {
     const uint8_t *modules = self.moduleData.bytes;
     NSRect bounds = self.bounds;
-    CGFloat side = MIN(NSWidth(bounds), NSHeight(bounds));
+    CGFloat boundsWidth = NSWidth(bounds);
+    CGFloat boundsHeight = NSHeight(bounds);
+    CGFloat side = boundsWidth < boundsHeight ? boundsWidth : boundsHeight;
     CGFloat originX = NSMinX(bounds) + (NSWidth(bounds) - side) / 2.0;
     CGFloat originY = NSMinY(bounds) + (NSHeight(bounds) - side) / 2.0;
     const CGFloat symbolSide =
