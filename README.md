@@ -1,4 +1,4 @@
-## Universal Modem
+## Universal Modem - Optical & Acoustic Wifi
 
 This tool creates a virtual network that can proxy all internet traffic on a machine through an unconventional mediums, like audio or visible light. By implementing a shared API, all mediums can be connected via a shared underlying tun/utun binding, gateway/client discovery and connection management, and 2 way data transfer to share the gateways real internet connection and give the client real functional internet access.
 
